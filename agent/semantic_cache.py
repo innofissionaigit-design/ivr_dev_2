@@ -97,7 +97,18 @@ DEFAULT_THRESHOLD = 0.78
 # cause of "doctors by department alias" intermittently returning nothing
 # or the wrong department: a cache hit on a similarly-framed department
 # query was never checked for whether it named the SAME department.
-_ENTITY_SLOTS = ("test_name", "doctor_name", "department")
+# ADDED BY SOURAV -- "Caller asks about a health package" story.
+# "package_name" belongs here for the exact same reason "department" was
+# added above it: a semantic hit on "health_package" must not cross from
+# one package to a differently-named one just because the sentence frame
+# rhymes (e.g. "diabetes package e ki ki ache" vs "full body package e ki
+# ki ache"). Deliberately NOT added to _REQUIRED_ENTITY_FOR_INTENT below --
+# unlike test_name/doctor_name/department, a MISSING package_name is not
+# an incomplete extraction here (it means "list every package", a
+# complete, safe-to-cache answer on its own -- see llm.py's own comment on
+# why "health_package" is the one single-entity-shaped intent that does
+# not re-prompt when its entity slot is empty).
+_ENTITY_SLOTS = ("test_name", "doctor_name", "department", "package_name", "insurance_provider_name")
 
 # Bengali-vs-Bengali character similarity, so ASR garble ("ইউরিক এসিদ" vs
 # "ইউরিক অ্যাসিড") still matches while a genuinely different test does not.
@@ -145,8 +156,40 @@ _PII_SLOTS = ("phone", "patient_name")
 # at all, so nothing can ever be reused FROM it.
 _REQUIRED_ENTITY_FOR_INTENT = {
     "test_rate": "test_name",
+    "test_sample": "test_name",
+    # ADDED BY SOURAV -- "Caller asks how long results take" bug fix. Same
+    # missing-slot cache-poisoning guard as test_rate/test_sample above.
+    "test_duration": "test_name",
     "doctor_availability": "doctor_name",
+    # ADDED BY SOURAV -- "Caller asks when a doctor sits" story. Same
+    # defining-slot guard as doctor_availability just above, for the same
+    # reason: an extraction that classified "doctor_schedule" but missed
+    # doctor_name must never enter the L2 index, or a later, differently-
+    # worded "which days does he sit" for a DIFFERENT doctor could
+    # fuzzy-match onto it and silently reuse the wrong (missing) slot.
+    "doctor_schedule": "doctor_name",
     "doctors_by_department": "department",
+    # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+    # Same guard as test_rate/test_sample/test_duration above, and for the
+    # same reason: unlike "health_package" (deliberately EXCLUDED from
+    # this dict -- see the comment on _ENTITY_SLOTS above), a missing
+    # test_name here has no "list every test's preparation instructions"
+    # analog -- it is always an incomplete extraction that main.py
+    # re-prompts for, so it must never enter the L2 index.
+    "test_preparation": "test_name",
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables.
+    # Walk-in Eligibility / Prescription Requirements stories. Same
+    # single-required-slot guard as test_rate/test_sample/test_duration/
+    # test_preparation above -- neither has a "list every test's
+    # walk-in/prescription policy" analog for a bare question with
+    # nothing named, so a missing test_name is always an incomplete
+    # extraction that must never enter the L2 index.
+    "walkin_eligibility": "test_name",
+    "prescription_requirements": "test_name",
+    # "insurance_coverage" and "billing_balance" are deliberately NOT
+    # listed here -- see _is_l2_eligible()'s own intent-exclusion list
+    # below for why each is excluded from L2 entirely instead of via a
+    # single required slot.
 }
 
 _RE_WS = re.compile(r"\s+")
@@ -220,6 +263,22 @@ class SemanticCache:
 
     @staticmethod
     def _is_l2_eligible(value: dict) -> bool:
+        # ADDED BY SOURAV -- "Caller asks two questions in one breath"
+        # story. A multi-question turn's `value["intents"]` array has more
+        # than one entry -- a fuzzy (L2) hit matches on OVERALL wording
+        # similarity, not on "the caller asked exactly these N questions
+        # in exactly this order," so reusing one multi-intent extraction
+        # for a differently-phrased-but-similar-sounding later turn risks
+        # silently answering the wrong SET of questions, or in the wrong
+        # order, for that caller. Purely additive and backward-safe: a
+        # single-intent `value` (everything before this story, and every
+        # ordinary one-question turn after it) has no "intents" key at
+        # all, so `.get("intents") or []` is `[]`, `len([]) == 0`, and
+        # this check falls through unchanged for those. L1 (exact-match)
+        # caching is untouched by this -- only fuzzy reuse is excluded.
+        if len((value or {}).get("intents") or []) > 1:
+            return False
+
         slots = (value or {}).get("slots") or {}
         if any(slots.get(field) for field in _PII_SLOTS):
             return False
@@ -251,6 +310,32 @@ class SemanticCache:
 
         intent = (value or {}).get("intent")
 
+        # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined
+        # story. report_status/report_send resolve identity by PHONE
+        # (already an excluded _PII_SLOTS field above whenever the caller
+        # states it in the same utterance), but a caller can also just say
+        # "is my report ready" with no phone at all -- main_pcm.py's new
+        # "phone" pending state asks for it on a LATER turn, outside this
+        # extraction entirely. That means an L2 (fuzzy) hit on THIS turn's
+        # bare "is my report ready" utterance could reuse a cached
+        # extraction that carries no phone, is fine on its own, but a fuzzy
+        # match is "similar wording", not "same caller, same report" -- and
+        # unlike a test's price (the same fact for every caller who asks),
+        # report status is caller-specific data behind an identity check.
+        # Excluded entirely, same treatment as book_appointment just below,
+        # rather than trying to reason about which report_status/report_send
+        # phrasing IS safe to fuzzy-match.
+        # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables.
+        # Outstanding Balance / Billing story. "do I have any pending
+        # dues" is caller-specific identity-bound data, same as
+        # report_status/report_send just above (not a fact that's the
+        # same for every caller who asks, unlike a test's price) -- a
+        # bare "amar kono bill baki ache" with no phone stated yet is
+        # exactly as unsafe to fuzzy-reuse across callers as "is my
+        # report ready" is.
+        if intent in ("report_status", "report_send", "billing_balance"):
+            return False
+
         # book_appointment carries up to three entity-shaped slots at once
         # (doctor_name, date, time_slot), any subset of which can be
         # missing on a given turn -- unlike the single-entity intents
@@ -258,7 +343,24 @@ class SemanticCache:
         # rest of the extraction trustworthy to reuse. fast_path.py already
         # refuses to handle this intent at all for the same reason (see its
         # docstring); the semantic cache defers to the LLM here too.
-        if intent == "book_appointment":
+        #
+        # ADDED BY SOURAV -- Phase 1: Insurance Coverage Policy story.
+        # "insurance_coverage" has the same shape problem: it needs BOTH
+        # test_name and insurance_provider_name, either of which can be
+        # missing on a given turn, so there is no single required field
+        # the way test_rate/test_preparation/etc. have one. Same
+        # treatment as book_appointment, for the same reason.
+        #
+        # ADDED BY SOURAV -- "Caller asks the agent to compare two
+        # options" story. "compare_options" has the identical two-
+        # required-slots shape (compare_option_a / compare_option_b),
+        # either of which can be missing on a given turn -- same
+        # treatment as book_appointment/insurance_coverage above, for the
+        # same reason. (_ENTITY_SLOTS below is untouched by this story on
+        # purpose: _entity_guard() only ever runs on an L2 hit -- see its
+        # own call site in get() -- so an intent excluded from L2 entirely
+        # never needs entries added there; they would be dead code.)
+        if intent in ("book_appointment", "insurance_coverage", "compare_options"):
             return False
 
         required = _REQUIRED_ENTITY_FOR_INTENT.get(intent)

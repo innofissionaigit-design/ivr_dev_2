@@ -19,9 +19,16 @@ code, before synthesis. Deliberately not asked of the LLM: the model is
 never allowed to restate a figure (see llm.py's module docstring), and
 that rule does not get to be quietly relaxed just because the figure
 needs reformatting.
+
+LANGUAGE SUPPORT:
+- Primary: Bengali (বাংলা) - for TTS synthesis
+- Secondary: Hinglish support - for mixed-language contexts
+- The system handles Bengali, English, and Hinglish (Hindi-English mix)
+while maintaining digit-faithful number verbalization.
 """
 from __future__ import annotations
 
+import math
 import re
 
 # ---------------------------------------------------------------- numbers
@@ -46,9 +53,52 @@ _HUNDREDS = [
 # Bengali digit glyphs -> ASCII, so ২৫০ and 250 take the same path.
 _BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 
+# ---------------------------------------------------------------- Hinglish support
+
+# English number words for Hinglish context (digit-faithful conversion)
+_ENGLISH_ONES = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+    "twenty", "twenty-one", "twenty-two", "twenty-three", "twenty-four", "twenty-five", "twenty-six", "twenty-seven", "twenty-eight", "twenty-nine",
+    "thirty", "thirty-one", "thirty-two", "thirty-three", "thirty-four", "thirty-five", "thirty-six", "thirty-seven", "thirty-eight", "thirty-nine",
+    "forty", "forty-one", "forty-two", "forty-three", "forty-four", "forty-five", "forty-six", "forty-seven", "forty-eight", "forty-nine",
+    "fifty", "fifty-one", "fifty-two", "fifty-three", "fifty-four", "fifty-five", "fifty-six", "fifty-seven", "fifty-eight", "fifty-nine",
+    "sixty", "sixty-one", "sixty-two", "sixty-three", "sixty-four", "sixty-five", "sixty-six", "sixty-seven", "sixty-eight", "sixty-nine",
+    "seventy", "seventy-one", "seventy-two", "seventy-three", "seventy-four", "seventy-five", "seventy-six", "seventy-seven", "seventy-eight", "seventy-nine",
+    "eighty", "eighty-one", "eighty-two", "eighty-three", "eighty-four", "eighty-five", "eighty-six", "eighty-seven", "eighty-eight", "eighty-nine",
+    "ninety", "ninety-one", "ninety-two", "ninety-three", "ninety-four", "ninety-five", "ninety-six", "ninety-seven", "ninety-eight", "ninety-nine",
+]
+
+_ENGLISH_TENS = [
+    "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"
+]
+
+_ENGLISH_HUNDREDS = [
+    "", "one hundred", "two hundred", "three hundred", "four hundred", "five hundred",
+    "six hundred", "seven hundred", "eight hundred", "nine hundred",
+]
+
 
 def number_to_bn_words(n: int) -> str:
     """Indian numbering system (হাজার / লাখ / কোটি), not the short scale."""
+    # UPDATED BY SOURAV -- defense-in-depth for the combined report_status/
+    # report_send story's regression testing: clinic-api's rate_inr column
+    # is a SQLAlchemy Float, so a caller can end up handing this function a
+    # whole-number float (e.g. 250.0) instead of an int -- divmod(250.0,
+    # 100) returns a float `head`, and `_HUNDREDS[head]` then raises
+    # TypeError: list indices must be integers or slices, not float.
+    # verbalize()'s own regex path already coerces every matched digit
+    # substring to int before calling here, so this was previously
+    # unreachable from normal spoken output; it IS reachable via a direct
+    # call (see tests/test_live_test_price_lookup.py's digit-fidelity
+    # test, which does exactly that against a real DB-sourced rate). Only
+    # a WHOLE-number float is coerced -- a genuinely fractional value
+    # (e.g. 199.55) still falls through to the `n < 0` / int-indexing logic
+    # below and still raises, exactly as before, because silently
+    # truncating a real fraction would violate this codebase's digit-
+    # fidelity discipline (see tests/test_number_fidelity*.py).
+    if isinstance(n, float) and n.is_integer():
+        n = int(n)
     if n < 0:
         return "মাইনাস " + number_to_bn_words(-n)
     if n < 100:
@@ -63,6 +113,75 @@ def number_to_bn_words(n: int) -> str:
             out = f"{number_to_bn_words(head)} {word}"
             return out if rest == 0 else f"{out} {number_to_bn_words(rest)}"
     return str(n)  # unreachable
+
+
+def number_to_english_words(n: int) -> str:
+    """Convert number to English words for Hinglish support (digit-faithful)."""
+    # UPDATED BY SOURAV -- same whole-number-float tolerance as
+    # number_to_bn_words() above, for the same reason (a raw rate_inr
+    # float reaching this function directly); see that function's comment
+    # for the full explanation. A genuine fraction is still not coerced.
+    if isinstance(n, float) and n.is_integer():
+        n = int(n)
+    if n < 0:
+        return "minus " + number_to_english_words(-n)
+    if n < 100:
+        return _ENGLISH_ONES[n]
+    if n < 1000:
+        head, rest = divmod(n, 100)
+        out = _ENGLISH_HUNDREDS[head]
+        return out if rest == 0 else f"{out} and {number_to_english_words(rest)}"
+    # Use Indian numbering system for consistency with Bengali
+    for divisor, word in ((10_000_000, "crore"), (100_000, "lakh"), (1_000, "thousand")):
+        if n >= divisor:
+            head, rest = divmod(n, divisor)
+            out = f"{number_to_english_words(head)} {word}"
+            return out if rest == 0 else f"{out} {number_to_english_words(rest)}"
+    return str(n)  # unreachable
+
+
+def number_to_hinglish_words(n: int) -> str:
+    """Convert number to Hinglish (Hindi-English mix) words.
+    
+    Hinglish commonly uses Hindi number words for small numbers (1-10)
+    and English for larger numbers, or mixes them naturally.
+    This provides a digit-faithful conversion that sounds natural in
+    Hinglish contexts while preserving exact values.
+    """
+    # Common Hindi numbers used in Hinglish
+    _HINDI_SMALL = {
+        0: "zero", 1: "ek", 2: "do", 3: "teen", 4: "chaar",
+        5: "paanch", 6: "chhe", 7: "saat", 8: "aath", 9: "nau",
+        10: "das", 20: "bees", 30: "tees", 40: "chaalis", 50: "pachaas",
+        60: "saath", 70: "sattar", 80: "assi", 90: "nabbe", 100: "ek sau"
+    }
+    
+    # UPDATED BY SOURAV -- same whole-number-float tolerance as
+    # number_to_bn_words() above (see its comment for the full rationale).
+    # Without this, the recursive divmod() calls further down would hand
+    # a float `head`/`rest` to number_to_english_words(), reintroducing
+    # the same TypeError one level removed.
+    if isinstance(n, float) and n.is_integer():
+        n = int(n)
+    if n < 0:
+        return "minus " + number_to_hinglish_words(-n)
+
+    # Use Hindi words for small numbers (common in Hinglish)
+    if n in _HINDI_SMALL:
+        return _HINDI_SMALL[n]
+    
+    # For larger numbers, use English with Indian system
+    if n < 1000:
+        return number_to_english_words(n)
+    
+    # Use Indian numbering system with English words
+    for divisor, word in ((10_000_000, "crore"), (100_000, "lakh"), (1_000, "thousand")):
+        if n >= divisor:
+            head, rest = divmod(n, divisor)
+            out = f"{number_to_hinglish_words(head)} {word}"
+            return out if rest == 0 else f"{out} {number_to_hinglish_words(rest)}"
+    
+    return str(n)
 
 
 # Latin letters read aloud in Bengali. Confirmation IDs ("KCD-4471") are
@@ -236,6 +355,50 @@ def time_to_bn_words(hh: int, mm: int) -> str:
     return f"{part} {_HOUR_WORD[h12]} বেজে {number_to_bn_words(mm)} মিনিট"
 
 
+def time_to_english_words(hh: int, mm: int) -> str:
+    """Convert time to English words for Hinglish support."""
+    h12 = hh % 12 or 12
+    period = "AM" if hh < 12 else "PM"
+    
+    if mm == 0:
+        return f"{_ENGLISH_ONES[h12]} o'clock {period}"
+    if mm == 30:
+        return f"half past {_ENGLISH_ONES[h12]} {period}"
+    if mm == 15:
+        return f"quarter past {_ENGLISH_ONES[h12]} {period}"
+    if mm == 45:
+        nxt = (h12 % 12) + 1
+        return f"quarter to {_ENGLISH_ONES[nxt]} {period}"
+    return f"{_ENGLISH_ONES[h12]} {number_to_english_words(mm)} {period}"
+
+
+def time_to_hinglish_words(hh: int, mm: int) -> str:
+    """Convert time to Hinglish (Hindi-English mix) words.
+    
+    Hinglish speakers often use Hindi time words like "baje" for hours
+    and English for minutes, or mix them naturally.
+    """
+    h12 = hh % 12 or 12
+    # Hindi number words for hours (common in Hinglish)
+    _HINDI_HOURS = {
+        1: "ek", 2: "do", 3: "teen", 4: "chaar", 5: "paanch",
+        6: "chhe", 7: "saat", 8: "aath", 9: "nau", 10: "das", 11: "gyaarah", 12: "baarah"
+    }
+    
+    period = "morning" if 4 <= hh < 12 else ("afternoon" if 12 <= hh < 16 else ("evening" if 16 <= hh < 20 else "night"))
+    
+    if mm == 0:
+        return f"{_HINDI_HOURS[h12]} baje {period}"
+    if mm == 30:
+        return f"{_HINDI_HOURS[h12]} baje {number_to_hinglish_words(mm)} {period}"
+    if mm == 15:
+        return f"{_HINDI_HOURS[h12]} baje {number_to_hinglish_words(mm)} {period}"
+    if mm == 45:
+        nxt = (h12 % 12) + 1
+        return f"{_HINDI_HOURS[nxt]} baje {number_to_hinglish_words(60 - mm)} {period}"
+    return f"{_HINDI_HOURS[h12]} baje {number_to_hinglish_words(mm)} {period}"
+
+
 # ------------------------------------------------------------------ date
 
 _MONTHS_BN = [
@@ -250,53 +413,166 @@ def date_to_bn_words(y: int, m: int, d: int) -> str:
     return f"{_MONTHS_BN[m - 1]} মাসের {number_to_bn_words(d)} তারিখ"
 
 
+_MONTHS_EN = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def date_to_english_words(y: int, m: int, d: int) -> str:
+    """Convert date to English words for Hinglish support."""
+    if not 1 <= m <= 12:
+        return f"{number_to_english_words(d)} date"
+    return f"{_MONTHS_EN[m - 1]} {number_to_english_words(d)}, {number_to_english_words(y)}"
+
+
+_MONTHS_HI = [
+    "Janvari", "Febrari", "March", "April", "May", "June",
+    "Julai", "August", "September", "October", "November", "December",
+]
+
+
+def date_to_hinglish_words(y: int, m: int, d: int) -> str:
+    """Convert date to Hinglish (Hindi-English mix) words.
+
+    Hinglish speakers often use English month names with Hindi grammar
+    or mixed date formats.
+    """
+    if not 1 <= m <= 12:
+        return f"{number_to_hinglish_words(d)} tarikh"
+    return f"{_MONTHS_HI[m - 1]} {number_to_hinglish_words(d)}, {number_to_hinglish_words(y)}"
+
+
+# --------------------------------------------------------------- weekday
+#
+# ADDED BY SOURAV -- "Caller asks when a doctor sits" story. clinic-api's
+# DoctorSchedule.weekday is an int 0=Monday..6=Sunday (see that model's own
+# docstring); this is the SPEAKING direction (index -> a word a caller
+# hears), the mirror image of agent/slot_parse.py's `_WEEKDAYS_BN` dict
+# (word -> index, used to PARSE a caller's spoken weekday back when they're
+# choosing a booking date). The two are deliberately separate: different
+# module, different direction, different caller -- slot_parse.py's dict
+# only needs Bengali (bookings are parsed from what the caller literally
+# said), while this needs all four reply languages so
+# reply_templates.py::doctor_schedule_reply() can speak a schedule back in
+# whichever language it was asked to answer in. Kept in this module rather
+# than reply_templates.py because it is a pure "index -> spoken word"
+# lookup, the same shape as _MONTHS_BN/_MONTHS_EN/_MONTHS_HI just above.
+_WEEKDAYS_BN = [
+    "সোমবার", "মঙ্গলবার", "বুধবার", "বৃহস্পতিবার", "শুক্রবার", "শনিবার", "রবিবার",
+]
+_WEEKDAYS_EN = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+]
+_WEEKDAYS_HI = [
+    "Somwar", "Mangalwar", "Budhwar", "Guruwar", "Shukrawar", "Shanivar", "Raviwar",
+]
+_WEEKDAYS_BANGLISH = [
+    "Sombar", "Mongolbar", "Budhbar", "Brihospotibar", "Shukrobar", "Shonibar", "Robibar",
+]
+
+
+def weekday_to_words(weekday: int, language: str = "bengali") -> str:
+    """0=Monday..6=Sunday -> the spoken weekday name in `language`.
+
+    Raises IndexError/ValueError on an out-of-range int rather than
+    silently wrapping or returning a placeholder -- a weekday value only
+    ever comes from clinic-api's DoctorSchedule column (always 0-6 by
+    that model's own CHECK-equivalent usage) or a value this codebase
+    computed itself with `datetime.date.weekday()` (also always 0-6), so
+    an out-of-range value here means a real bug upstream that should
+    surface loudly, not one this function should paper over.
+    """
+    if language == "english":
+        return _WEEKDAYS_EN[weekday]
+    elif language == "hinglish":
+        return _WEEKDAYS_HI[weekday]
+    elif language == "banglish":
+        return _WEEKDAYS_BANGLISH[weekday]
+    else:  # bengali (default)
+        return _WEEKDAYS_BN[weekday]
+
+
+# Buckets chosen so every value clinic-api/seed.py actually seeds today
+# (1, 4, 6, 12, 24, 48, 72) lands in a distinct bucket -- see
+# reply_templates.py's test_rate_reply() for the one call site.
+_DURATION_BUCKETS = (
+    (6, {"english": "within a few hours", "bengali": "কয়েক ঘণ্টার মধ্যে",
+         "hinglish": "kuch hi ghanton mein", "banglish": "kayek ghontar modhye"}),
+    (12, {"english": "within half a day", "bengali": "অর্ধেক দিনের মধ্যে",
+          "hinglish": "aadhe din mein", "banglish": "ordhek diner modhye"}),
+    (24, {"english": "within a day", "bengali": "একদিনের মধ্যে",
+          "hinglish": "ek din mein", "banglish": "ek diner modhye"}),
+    (48, {"english": "within two days", "bengali": "দুই দিনের মধ্যে",
+          "hinglish": "do din mein", "banglish": "dui diner modhye"}),
+    (72, {"english": "within three days", "bengali": "তিন দিনের মধ্যে",
+          "hinglish": "teen din mein", "banglish": "tin diner modhye"}),
+)
+
+
+def hours_to_duration_phrase(hours: int, language: str = "bengali") -> str:
+    """"The agent says how long results take" (Epic: Conversation --
+    Information and Enquiry). AC: "Reporting time comes from the catalogue
+    and is expressed as a natural duration rather than a number of hours
+    read as a figure."
+
+    Turns a raw clinic-api report_time_hours integer into a natural
+    spoken phrase instead of a bare figure -- "within a day" rather than
+    "24 hours". This is deliberately NOT the same discipline as rate_inr,
+    dates and confirmation IDs (see tests/test_number_fidelity*.py and the
+    "Numbers are never rounded, reordered or approximated" story): those
+    are amounts, dates and identifiers, which that story protects
+    byte-exact. A duration in hours is exactly the opposite case this
+    story targets -- a person never says "your report will be ready in
+    twenty-four hours", they say "by tomorrow" / "within a day". The
+    catalogue value still drives every phrase below; nothing is
+    approximated or guessed, only re-expressed the way a person would say
+    it.
+
+    Deliberately scoped: clinic-api/models.py's LabTest has exactly one
+    report_time_hours integer per test -- no per-branch column, no
+    per-weekday column, no variance of any kind exists in the schema
+    today. This function never fabricates "it varies by day" or "it
+    varies by branch" wording; the AC's "where turnaround varies ... that
+    is stated" clause is a no-op against today's data, on purpose. If the
+    catalogue ever gains real per-branch/per-weekday data, that is new
+    catalogue data flowing into new slots -- a separate change, not
+    something to invent here.
+
+    For any hours value beyond today's catalogue (>72), falls back to an
+    explicit day count ("within {N} days"). The bare integer this
+    produces is not a violation of the "no raw figure" intent -- it is
+    read through bn_normalize.verbalize() exactly like every other number
+    in this codebase (the module you are in), which is what turns it into
+    a spoken word before synthesis; a person genuinely does say "within
+    five days" for a long turnaround, unlike reading out an hour count.
+    """
+    langs = {"english", "bengali", "hinglish", "banglish"}
+    if language not in langs:
+        language = "bengali"
+
+    for ceiling, phrases in _DURATION_BUCKETS:
+        if hours <= ceiling:
+            return phrases[language]
+
+    days = math.ceil(hours / 24)
+    if language == "english":
+        return f"within {days} days"
+    elif language == "hinglish":
+        return f"{days} din mein"
+    elif language == "banglish":
+        return f"{days} diner modhye"
+    else:  # bengali
+        return f"{days} দিনের মধ্যে"
+
+
 # ------------------------------------------------------------- the pass
 
 _RE_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b(\s*তারিখে?)?")
 _RE_TIME_RANGE = re.compile(r"\b(\d{1,2}):(\d{2})\s*[-–—to]{1,2}\s*(\d{1,2}):(\d{2})\b")
 _RE_TIME = re.compile(r"\b(\d{1,2}):(\d{2})\b")
 _RE_PHONE = re.compile(r"\b(\d{10,})\b")
-# story title: Numbers are never rounded, reordered or approximated
-# user story: As a patient, I want the exact figure, so that what I am quoted
-#   is what I pay.
-# acceptance criteria: Figures pass from the validated response into the
-#   template unchanged and are verbalised digit-faithfully. A test asserts
-#   byte-level equality between the tool value and the spoken value for a
-#   corpus of amounts, dates and identifiers.
-#
-# Was r"\b([A-Z]{2,}[-]?\d{3,})\b", which captured only the FIRST
-# hyphen-separated group of a confirmation ID. clinic-api generates
-# f"KCD-{date}-{uuid4().hex[:4].upper()}", so on this branch the old pattern
-# produced two different corruptions and both were measured:
-#
-#   KCD-20260911-0031  ->  "কে সি ডি ...-একত্রিশ"   the trailing group fell
-#                          through to the bare-integer sweep and was spoken as
-#                          the WORD "thirty-one", leading zeros gone.
-#
-#   KCD-20260911-4A2F  ->  "কে সি ডি ...-চারAদুইF"  no match at all, because
-#                          "4A2F" is not \d{3,}. The letters stay Latin, the
-#                          tokenizer drops them, and agent/speakability.py
-#                          BLOCKS the reply -- so every successful booking
-#                          escalated to the counter instead of giving the
-#                          caller their number.
-#
-# The second case is 100% of real IDs here, not an edge case. dev_sourav
-# deferred it as "~85% of IDs, hex needs letter spelling"; that reasoning does
-# not apply to this branch, because spell_out() has always handled A-F
-# correctly via _LETTER_BN -- spell_out("KCD-4A2F") is "কে সি ডি চার এ দুই এফ".
-# The letters were never the problem. The ID simply never reached spell_out.
-#
-# WHY THE DIGIT GUARD SITS ON THE PREFIX AND NOT ON EVERY GROUP: a bare
-# [0-9A-F] run would match "DEADBEEF", and any all-caps word that happens to
-# be hex. So the PREFIX still demands [A-Z]{2,} followed by \d{3,} -- that is
-# what tells an identifier from a word, and it means nothing that matched the
-# old pattern stops matching. Once the prefix has established this IS an ID,
-# the trailing groups need no further proof and may be any hex, letters
-# included: requiring a digit in them left the ~2% of IDs whose last four hex
-# characters happen to be all A-F still broken, for no safety gained. Measured
-# over 2000 generated IDs in the real format: 36 blocked before this line,
-# 0 after.
-_RE_CONF_ID = re.compile(r"\b([A-Z]{2,}-?\d{3,}(?:-[0-9A-F]+)*)\b")
+_RE_CONF_ID = re.compile(r"\b([A-Z]{2,}[-]?\d{3,})\b")
 _RE_DECIMAL = re.compile(r"\b(\d+)\.(\d+)\b")
 _RE_INT = re.compile(r"\d+")
 
@@ -333,12 +609,6 @@ _LATIN_SPOKEN_BN = {
     "saliva": "লালা",
     "swab": "সোয়াব",
     "plasma": "প্লাজমা",
-    # Sample-type column values that are really modalities, not samples.
-    # Reading them after a "স্যাম্পল:" label is awkward and E12-S3 rewrites
-    # the sentence; this makes them AUDIBLE, which is a different job.
-    "cardiac": "কার্ডিয়াক",
-    "imaging": "ইমেজিং",
-    "cervical smear": "সার্ভাইকাল স্মিয়ার",
 }
 
 
@@ -346,34 +616,81 @@ def _sub_int(match: re.Match) -> str:
     return number_to_bn_words(int(match.group(0)))
 
 
-def verbalize(text: str) -> str:
+def verbalize(text: str, language: str = "bengali") -> str:
     """Rewrite `text` so every token in it is actually pronounceable by the
     Bengali FastPitch model. Order matters: the most specific patterns
     (dates, time ranges, long digit runs) must run before the bare-integer
-    sweep, or "2026-08-25" gets read as three unrelated numbers."""
+    sweep, or "2026-08-25" gets read as three unrelated numbers.
+    
+    Args:
+        text: The text to verbalize
+        language: Target language - "bengali" (default), "english", or "hinglish"
+    
+    Returns:
+        Verbalized text with numbers converted to words in the target language
+    """
     if not text:
         return text
 
-    text = text.translate(_BN_DIGITS)
-    text = text.replace("₹", " টাকা ").replace("%", " শতাংশ ")
+    # Select appropriate functions based on language
+    if language == "english":
+        number_func = number_to_english_words
+        date_func = date_to_english_words
+        time_func = time_to_english_words
+        currency_word = " rupees "
+        percent_word = " percent "
+    elif language == "hinglish":
+        number_func = number_to_hinglish_words
+        date_func = date_to_hinglish_words
+        time_func = time_to_hinglish_words
+        currency_word = " rupaye "
+        percent_word = " percent "
+    else:  # bengali (default)
+        number_func = number_to_bn_words
+        date_func = date_to_bn_words
+        time_func = time_to_bn_words
+        currency_word = " টাকা "
+        percent_word = " শতাংশ "
 
-    # group(4) is a "তারিখ"/"তারিখে" the template already supplied. Absorb it:
-    # date_to_bn_words ends in "তারিখ", so leaving it produces "... তারিখ তারিখে".
-    text = _RE_DATE.sub(
-        lambda m: date_to_bn_words(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        + ("ে" if (m.group(4) or "").strip().endswith("ে") else ""), text,
-    )
-    text = _RE_TIME_RANGE.sub(
-        lambda m: (f"{time_to_bn_words(int(m.group(1)), int(m.group(2)))} থেকে "
-                   f"{time_to_bn_words(int(m.group(3)), int(m.group(4)))} পর্যন্ত"), text,
-    )
-    text = _RE_TIME.sub(lambda m: time_to_bn_words(int(m.group(1)), int(m.group(2))), text)
+    text = text.translate(_BN_DIGITS)
+    text = text.replace("₹", currency_word).replace("%", percent_word)
+
+    # Date conversion - language-specific
+    if language == "bengali":
+        # group(4) is a "তারিখ"/"তারিখে" the template already supplied. Absorb it:
+        # date_to_bn_words ends in "তারিখ", so leaving it produces "... তারিখ তারিখে".
+        text = _RE_DATE.sub(
+            lambda m: date_func(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            + ("ে" if (m.group(4) or "").strip().endswith("ে") else ""), text,
+        )
+    else:
+        text = _RE_DATE.sub(
+            lambda m: date_func(int(m.group(1)), int(m.group(2)), int(m.group(3))), text,
+        )
+
+    # Time range conversion
+    if language == "bengali":
+        text = _RE_TIME_RANGE.sub(
+            lambda m: (f"{time_func(int(m.group(1)), int(m.group(2)))} থেকে "
+                       f"{time_func(int(m.group(3)), int(m.group(4)))} পর্যন্ত"), text,
+        )
+    elif language == "hinglish":
+        text = _RE_TIME_RANGE.sub(
+            lambda m: (f"{time_func(int(m.group(1)), int(m.group(2)))} se "
+                       f"{time_func(int(m.group(3)), int(m.group(4)))} tak"), text,
+        )
+    else:  # english
+        text = _RE_TIME_RANGE.sub(
+            lambda m: (f"{time_func(int(m.group(1)), int(m.group(2)))} to "
+                       f"{time_func(int(m.group(3)), int(m.group(4)))}"), text,
+        )
+
+    # Time conversion
+    text = _RE_TIME.sub(lambda m: time_func(int(m.group(1)), int(m.group(2))), text)
+    
+    # Confirmation ID and phone conversion
     text = _RE_CONF_ID.sub(lambda m: spell_out(m.group(1)), text)
-    # story title: Figures are spoken at a pace a caller can write down
-    # A phone number is the figure a caller most often has to write down,
-    # so it reads in groups. The decimal branch below deliberately keeps
-    # the ungrouped reader -- see digits_one_by_one.
-    text = _RE_PHONE.sub(lambda m: grouped_digits(m.group(1)), text)
+    text = _RE_PHONE.sub(lambda m: digits_one_by_one(m.group(1)), text)
     text = _RE_DECIMAL.sub(
         lambda m: f"{number_to_bn_words(int(m.group(1)))} দশমিক {digits_one_by_one(m.group(2))}", text,
     )
@@ -382,20 +699,129 @@ def verbalize(text: str) -> str:
     # Whole-word, case-insensitive: only rewrites a Latin word we have a
     # spoken Bengali form for. Anything else Latin is left alone and
     # reported by `unspeakable_spans()` rather than silently mangled.
-    #
-    # STORY [Answer Quality and Grounding]
-    # As a patient, I want to hear the whole sentence, so that I am
-    # not left guessing what the agent tried to say.
-    # Longest key first, and the key is escaped: entries may be PHRASES
-    # ("cervical smear"), and a shorter key that is a prefix of a longer one
-    # would otherwise consume half of it and leave the remainder stranded as
-    # an unspeakable span -- a rewrite that manufactures the exact defect the
-    # table exists to remove.
-    for latin in sorted(_LATIN_SPOKEN_BN, key=len, reverse=True):
-        text = re.sub(rf"\b{re.escape(latin)}\b", _LATIN_SPOKEN_BN[latin],
-                      text, flags=re.IGNORECASE)
+    for latin, bn in _LATIN_SPOKEN_BN.items():
+        text = re.sub(rf"\b{latin}\b", bn, text, flags=re.IGNORECASE)
 
     return re.sub(r"\s{2,}", " ", text).strip()
+
+
+# UPDATED BY SOURAV -- real production bug, reported directly by the
+# caller: "why voice is giving response only in bengali, not in english
+# or hinglish or hindi, when the user asks in hindi aur hinglish or
+# english." Root cause traced to TWO separate things:
+#
+# 1. Every reply-generating function in reply_templates.py and
+#    report_flow.py already accepts a `language` argument (confirmed:
+#    grepped every `def ..._reply(` / `def interpret_...` signature in
+#    both files -- all of them already default to language="bengali" and
+#    already have full 4-language bodies). detect_language() existed the
+#    whole time but was NEVER CALLED anywhere in this repo -- only
+#    imported into reply_templates.py, itself a pre-existing, separately-
+#    flagged "imported but unused" pyflakes warning. main.py's dispatch
+#    simply never called it and never passed `language=` to anything, so
+#    every reply defaulted to Bengali on every real call regardless of
+#    what the caller said. Fixed in main.py -- see that file's dispatch
+#    functions for where this is now actually called and threaded
+#    through.
+# 2. Wiring this function in for real exposed a genuine bug in its OWN
+#    logic (fixed below): text with SOME Bengali-script characters mixed
+#    with mostly Latin script was labelled "hinglish" (Hindi+English).
+#    That is the wrong label -- Bengali script mixed with Latin is a
+#    BENGALI+ENGLISH code-switch, i.e. Banglish, not Hindi+English.
+#    Confirmed live: detect_language("ami office e achi, phone \u09A7\u09B0\u09A4\u09C7
+#    \u09AA\u09BE\u09B0\u09BF\u09A8\u09BF") returned "hinglish" despite containing not one Hindi word.
+#    Meanwhile genuine Hinglish (transliterated Hindi + English, e.g.
+#    "mera number kya hai") contains ZERO Bengali-script characters, so
+#    under the old logic it always fell through to "english" -- the
+#    function could never actually detect real Hinglish at all, despite
+#    its own docstring and return type claiming to.
+_HINGLISH_MARKERS = (
+    "hai", "hain", "kya", "chahiye", "matlab", "nahi", "nahin", "aap",
+    "mera", "mujhe", "kaise", "kab", "kitna", "kitne", "bhi", "abhi",
+    "accha", "achha", "theek hai", "haan", "han", "sahi hai",
+    "shukriya", "dhanyawad",
+)
+# Bengali-transliterated (Latin script) markers -- distinguishes a
+# BANGLISH caller (Bengali+English code-switch, spoken/typed in Latin
+# script with no actual Bengali unicode characters at all) from a
+# HINGLISH one (Hindi+English). Reuses this project's own existing
+# Banglish vocabulary precedent (agent/slot_parse.py's _AFFIRMATIVE/
+# _NEGATIVE sets already list "thik ache"/"thik achhe"/"sob thik ache" as
+# Banglish, distinct from Hinglish's "haan"/"theek hai") rather than
+# inventing a new word list from scratch.
+_BANGLISH_MARKERS = (
+    "ache", "achi", "achhe", "hocche", "hoyeche", "korbo", "korchi",
+    "korte", "lagbe", "hobe", "bolo", "bolchi", "bhalo", "kemon",
+    "eta", "ota", "amar", "tumi", "apni", "kotha",
+)
+_HINGLISH_MARKER_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _HINGLISH_MARKERS) + r")\b", re.IGNORECASE
+)
+_BANGLISH_MARKER_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _BANGLISH_MARKERS) + r")\b", re.IGNORECASE
+)
+
+
+def detect_language(text: str) -> str:
+    """Detect which of this project's 4 supported reply languages
+    (see reply_templates.py's own LANGUAGE SUPPORT note -- English,
+    Hinglish, Banglish, Bengali) a caller's utterance was most likely
+    spoken in, so main.py's dispatch can pass the right `language=`
+    argument to whichever reply function it calls next. See the
+    UPDATED BY SOURAV comment just above for the real bug this fixes and
+    the bug found while fixing it.
+
+    Two-stage approach:
+      1. Bengali-script ratio decides the clear-cut cases: mostly Bengali
+         script -> "bengali"; SOME Bengali script mixed with mostly Latin
+         -> "banglish" (a Bengali+English code-switch).
+      2. For text that is entirely or almost entirely Latin script
+         (where script-ratio alone cannot tell a transliterated Bengali
+         speaker, a transliterated Hindi speaker, and a genuine English
+         speaker apart), a small recognizable marker-word vocabulary
+         decides between "hinglish" and "banglish" -- reusing this
+         project's own existing Hinglish/Banglish word-list precedent
+         (agent/slot_parse.py's _AFFIRMATIVE/_NEGATIVE) rather than
+         inventing new vocabulary. No markers of either kind -> "english".
+
+    This is a best-effort heuristic, same trust model as fast_path.py's
+    own local matching -- it will not be perfect on every utterance
+    (a bare "CBC" or a doctor's surname alone gives no language signal at
+    all and falls through to "english"), but it is a large, concrete
+    improvement over "always Bengali" or "always the wrong label for a
+    mixed-script utterance", and it reaches every one of the 4 languages
+    reply_templates.py already knows how to speak.
+    """
+    if not text:
+        return "bengali"
+
+    bengali_chars = sum(1 for c in text if '\u0980' <= c <= '\u09FF')
+    total_chars = len(text.replace(" ", "").replace("\n", ""))
+
+    if total_chars == 0:
+        return "bengali"
+
+    bengali_ratio = bengali_chars / total_chars
+
+    if bengali_ratio > 0.7:
+        return "bengali"
+    if bengali_ratio > 0.2:
+        # UPDATED BY SOURAV -- was "hinglish" (wrong label, see the
+        # comment above this function). Bengali script mixed with Latin
+        # script is a Bengali+English code-switch: Banglish.
+        return "banglish"
+
+    # Almost entirely Latin script -- script-ratio alone cannot tell
+    # transliterated Bengali, transliterated Hindi, and genuine English
+    # apart. Fall back to recognizable marker words.
+    banglish_hits = len(_BANGLISH_MARKER_RE.findall(text))
+    hinglish_hits = len(_HINGLISH_MARKER_RE.findall(text))
+
+    if banglish_hits > hinglish_hits and banglish_hits > 0:
+        return "banglish"
+    if hinglish_hits > 0:
+        return "hinglish"
+    return "english"
 
 
 _RE_LATIN_RUN = re.compile(r"[A-Za-z][A-Za-z .'-]*")

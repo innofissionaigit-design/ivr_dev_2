@@ -9,22 +9,73 @@ none. It is still simple (difflib plus a containment tier) rather than the
 phonetic-fold gazetteer that production callers slurring "লিপিড প্রোফাইল"
 through a phone mic deserve. What changed is that it no longer resolves an
 ambiguity by picking a row: several plausible rows come back as several, and
-the agent asks.
+the agent asks. The single-test lookups below (search, preparation, sample,
+duration, walk-in eligibility, prescription requirements) share a simpler
+exact/Bengali-alias-then-fuzzy ladder (_find_lab_test() /
+_lab_test_fuzzy_suggestions()) -- see search_test()'s own docstring for why
+that endpoint alone goes through match_band instead.
+
+======================================================================
+UPDATED BY SOURAV -- "Lab Report Status & Secure Delivery" combined
+story (previously two separate stories: "is my report ready" and "send
+my report"), per the VOICE CARE AGENT FINAL TESTING / STORY / RULES /
+EDGE-CASE ATTACK PLAN doc.
+
+Added below (search "SOURAV" for every changed/new block):
+  - GET  /api/v1/reports/status           (Rule 1-3, 13, 14; Section 4)
+  - POST /api/v1/reports/delivery/request (Rule 3, 4, 15, 16)
+  - POST /api/v1/reports/otp/verify       (Rule 4-9, 17; the whole OTP
+                                            attack surface in Section 6)
+  - GET  /api/v1/reports/link/{token}     (Rule 11, 12; Section 8 link
+                                            attacks)
+
+FAIL SAFE, NOT FAIL OPEN (plan Section 23) is the guiding principle for
+every one of these: every endpoint below returns a NAMED reason instead
+of a generic error/boolean whenever it refuses to act, precisely so the
+voice agent (main.py / main_pcm.py) never has to guess why something
+didn't happen, and never defaults to acting just because a check was
+inconclusive.
+======================================================================
 """
 from __future__ import annotations
 
 import logging
 
 import datetime
+import difflib
+import secrets
 import uuid
 
 from fastapi import FastAPI, Depends, Query
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 import match_band
 from db import get_db, SessionLocal
-from models import Department, Doctor, DoctorSchedule, LabTest, Appointment
+from models import (
+    Department, Doctor, DoctorSchedule, LabTest, Appointment,
+    # SOURAV: needed for the report-status/delivery/OTP endpoints below.
+    Patient, LabReport, ReportOTP, ReportDelivery,
+    # ADDED BY SOURAV -- "Caller asks about a health package" and "Caller
+    # asks opening hours, address or directions" stories, below.
+    ClinicInfo, HealthPackage, HealthPackageTest,
+    # ADDED BY SOURAV -- "otp will not be hardcoded" -- the single shared
+    # random-OTP generator every ReportOTP row now goes through (see
+    # models.py's own comment on generate_otp_code() for why this lives
+    # there and not duplicated here and in seed.py).
+    generate_otp_code,
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Walk-in
+    # Eligibility / Prescription Requirements / Insurance Coverage Policy /
+    # Outstanding Balance stories, below.
+    InsuranceProvider, InsurancePolicy, PatientBilling,
+    # ADDED BY SOURAV -- "Caller asks to be called back" story, below.
+    CallbackRequest,
+)
+# ADDED BY SOURAV -- "otp will not be hardcoded": how the freshly
+# generated code actually reaches the patient is a separate, pluggable
+# concern -- see this module's own docstring on the file below.
+from otp_messaging_config import send_otp_via_provider
 
 app = FastAPI(title="Kolkata Care Diagnostics -- Clinic Data API (dummy)")
 
@@ -169,6 +220,54 @@ def catalogue(db: Session = Depends(get_db)):
     }
 
 
+def _find_lab_test(db: Session, name: str) -> LabTest | None:
+    """Factored out so /api/v1/tests/preparation and the other single-test
+    lookups below (sample, duration, walk-in eligibility, prescription
+    requirements, ...) can reuse the exact same exact/Bengali-alias matching
+    ladder rather than duplicating it. Returns None when neither stage finds
+    anything; each caller decides its own not-found shape.
+
+    NOTE: search_test() below deliberately does NOT call this -- see its own
+    docstring. It goes through the match_band ranker instead so a near-miss is
+    OFFERED rather than silently resolved to the first substring hit, which
+    is exactly the bug this function's simpler ladder would reintroduce for
+    the one endpoint whose whole story is about not doing that. Every other
+    lookup here still wants the plain exact-then-fuzzy shape, so both ladders
+    coexist on purpose."""
+    # English substring match -- covers callers who say the test name in
+    # English/transliterated form.
+    exact = db.query(LabTest).filter(func.lower(LabTest.name).contains(name.lower())).first()
+    if exact:
+        return exact
+
+    # Bengali-script match -- covers the actual common case. A caller
+    # saying "ইউরিক এসিড" was matched against nothing before this existed:
+    # the DB only stored the English name "Uric Acid", and Bengali script
+    # shares zero characters with Latin script, so substring AND fuzzy
+    # matching against the English column alone can NEVER succeed on
+    # Bengali input, regardless of how close the pronunciation is.
+    for t in db.query(LabTest).all():
+        aliases = [a for a in t.aliases_bn.split("|") if a]
+        if any(name in alias or alias in name for alias in aliases):
+            return t
+
+    return None
+
+
+def _lab_test_fuzzy_suggestions(db: Session, name: str) -> list[str]:
+    """Fuzzy-fallback logic paired with _find_lab_test() above, shared by
+    /api/v1/tests/preparation and the other single-test lookups."""
+    all_tests = db.query(LabTest).all()
+    candidates = []
+    for t in all_tests:
+        candidates.append(t.name)
+        candidates.extend(a for a in t.aliases_bn.split("|") if a)
+    suggestions = difflib.get_close_matches(name, candidates, n=3, cutoff=0.5)
+    # Map suggested aliases back to their canonical English name for display.
+    alias_to_name = {a: t.name for t in all_tests for a in t.aliases_bn.split("|") if a}
+    return list(dict.fromkeys(alias_to_name.get(s, s) for s in suggestions))
+
+
 @app.get("/api/v1/tests/search")
 def search_test(name: str = Query(...), db: Session = Depends(get_db)):
     # story title: Near matches are offered rather than guessed or refused
@@ -212,6 +311,193 @@ def search_test(name: str = Query(...), db: Session = Depends(get_db)):
     # total-failure consolation and becomes the same mechanism that handles
     # two rows tying at 0.90.
     return {"found": False, "query": name, "did_you_mean": [], "did_you_mean_bn": []}
+
+
+# =============================================================================
+# Tool 12: GET /api/v1/tests/preparation?name=...
+#
+# ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+# Reuses /api/v1/tests/search's own exact/Bengali-alias/fuzzy matching
+# ladder unchanged (see _find_lab_test()/_lab_test_fuzzy_suggestions()
+# above) so a test that can already be priced or looked up can also be
+# asked about by name here -- this endpoint only differs in what it
+# returns once the row is found.
+# =============================================================================
+
+def _test_preparation_reply_dict(t: LabTest) -> dict:
+    """`advisory_available=False` is a real, honest, DIFFERENT outcome
+    from `found=False` (test_preparation()'s own not-found branch below):
+    the test itself exists and can be looked up fine, but nobody has
+    ever supplied real preparation content for it (see models.py's own
+    comment on why LabTest's advisory columns are nullable with no
+    default). The voice agent must tell these two apart -- suggesting
+    "did you mean" alternatives for a test that WAS found correctly
+    would be nonsensical, and guessing "no special preparation" for one
+    with no advisory row would be fabricating a medical instruction."""
+    if t.fasting_required is None:
+        return {
+            "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+            "advisory_available": False,
+        }
+    return {
+        "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+        "advisory_available": True,
+        "fasting_required": t.fasting_required,
+        "fasting_hours": t.fasting_hours,
+        "water_allowance": t.water_allowance,
+        "medication_hold": t.medication_hold,
+        "timing_rule": t.timing_rule,
+        "advisory_script_en": t.advisory_script_en,
+        "advisory_script_hinglish": t.advisory_script_hinglish,
+        "advisory_script_banglish": t.advisory_script_banglish,
+        "advisory_script_bn": t.advisory_script_bn,
+    }
+
+
+@app.get("/api/v1/tests/preparation")
+def test_preparation(name: str = Query(...), db: Session = Depends(get_db)):
+    t = _find_lab_test(db, name)
+    if t:
+        return _test_preparation_reply_dict(t)
+    suggestions = _lab_test_fuzzy_suggestions(db, name)
+    return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 13: GET /api/v1/tests/walkin-policy?name=...
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Walk-in
+# Eligibility story. Reuses /api/v1/tests/search's own exact/Bengali-alias/
+# fuzzy matching ladder unchanged (see _find_lab_test()/
+# _lab_test_fuzzy_suggestions() above), same as /api/v1/tests/preparation
+# just above -- only what gets returned once the row is found differs.
+# =============================================================================
+
+def _walkin_policy_reply_dict(t: LabTest) -> dict:
+    """`policy_available=False` is a real, honest, DIFFERENT outcome from
+    `found=False` below -- same "found vs. has-real-content" split as
+    test_preparation's own advisory_available (see that function's own
+    docstring for the full reasoning): the test exists and can be looked
+    up fine, but nobody has confirmed its walk-in policy yet. Never
+    guess "walk-ins welcome" for a test with no reviewed answer."""
+    if t.walkin_eligible is None:
+        return {
+            "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+            "policy_available": False,
+        }
+    return {
+        "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+        "policy_available": True,
+        "walkin_eligible": t.walkin_eligible,
+        "walkin_hours": t.walkin_hours,
+    }
+
+
+@app.get("/api/v1/tests/walkin-policy")
+def test_walkin_policy(name: str = Query(...), db: Session = Depends(get_db)):
+    t = _find_lab_test(db, name)
+    if t:
+        return _walkin_policy_reply_dict(t)
+    suggestions = _lab_test_fuzzy_suggestions(db, name)
+    return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 14: GET /api/v1/tests/prescription-policy?name=...
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Prescription
+# Requirements story. Same matching ladder and found/policy_available
+# split as walkin-policy just above.
+# =============================================================================
+
+def _prescription_policy_reply_dict(t: LabTest) -> dict:
+    if t.prescription_required is None:
+        return {
+            "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+            "policy_available": False,
+        }
+    # prescription_channels is stored "|"-joined (same convention as
+    # aliases_bn) -- split it into a real list for the caller-facing
+    # layer here, same as aliases_bn is split wherever it's read.
+    channels = [c for c in (t.prescription_channels or "").split("|") if c]
+    return {
+        "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+        "policy_available": True,
+        "prescription_required": t.prescription_required,
+        "prescription_channels": channels,
+    }
+
+
+@app.get("/api/v1/tests/prescription-policy")
+def test_prescription_policy(name: str = Query(...), db: Session = Depends(get_db)):
+    t = _find_lab_test(db, name)
+    if t:
+        return _prescription_policy_reply_dict(t)
+    suggestions = _lab_test_fuzzy_suggestions(db, name)
+    return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 15: GET /api/v1/insurance/coverage?test_name=...&provider_name=...
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Insurance
+# Coverage Policy story. Two names to resolve, not one: the test (same
+# ladder as every other LabTest lookup above) AND the insurer (its own
+# exact/alias ladder below, same shape as _find_lab_test's, over
+# InsuranceProvider.aliases instead of LabTest.aliases_bn).
+# =============================================================================
+
+def _find_insurance_provider(db: Session, name: str) -> InsuranceProvider | None:
+    """Same two-stage ladder as _find_lab_test() above: substring match on
+    the canonical name first, then a "|"-joined alias match -- covers a
+    caller naming their insurer in English, Hinglish/Banglish, or Bengali
+    script, the same way LabTest.aliases_bn covers a test name."""
+    exact = db.query(InsuranceProvider).filter(
+        func.lower(InsuranceProvider.name).contains(name.lower())
+    ).first()
+    if exact:
+        return exact
+    for p in db.query(InsuranceProvider).all():
+        aliases = [a for a in p.aliases.split("|") if a]
+        if any(name in alias or alias in name for alias in aliases):
+            return p
+    return None
+
+
+@app.get("/api/v1/insurance/coverage")
+def insurance_coverage(test_name: str = Query(...), provider_name: str = Query(...),
+                        db: Session = Depends(get_db)):
+    t = _find_lab_test(db, test_name)
+    if not t:
+        suggestions = _lab_test_fuzzy_suggestions(db, test_name)
+        return {"test_found": False, "query": test_name, "did_you_mean": suggestions}
+
+    provider = _find_insurance_provider(db, provider_name)
+    if not provider:
+        # Honest "we don't recognise that insurer", never silently
+        # matched to the wrong one and never assumed "not covered".
+        return {
+            "test_found": True, "test_name": t.name, "provider_found": False,
+            "query_provider": provider_name,
+        }
+
+    policy = db.query(InsurancePolicy).filter_by(test_id=t.id, provider_id=provider.id).first()
+    if policy is None or policy.coverage_status is None:
+        # No reviewed (test, provider) row -- honest "we don't know yet",
+        # never a guessed COVERED/NOT_COVERED (see models.py's own
+        # comment on InsurancePolicy.coverage_status).
+        return {
+            "test_found": True, "test_name": t.name,
+            "provider_found": True, "provider_name": provider.name,
+            "policy_available": False,
+        }
+    return {
+        "test_found": True, "test_name": t.name,
+        "provider_found": True, "provider_name": provider.name,
+        "policy_available": True,
+        "coverage_status": policy.coverage_status,
+        "pre_auth_required": policy.pre_auth_required,
+    }
 
 
 # =============================================================================
@@ -353,6 +639,52 @@ def doctor_availability(name: str = Query(...), date: str | None = Query(None),
                 "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": next_date,
         "available": True, "chamber_hours": f"{sched.start_time}-{sched.end_time}",
         "next_available_date": None,
+    }
+
+
+@app.get("/api/v1/doctors/schedule")
+def doctor_schedule(name: str = Query(...), db: Session = Depends(get_db)):
+    """ADDED BY SOURAV -- "Caller asks when a doctor sits" story.
+
+    Deliberately DATE-FREE, unlike doctor_availability() just above. That
+    endpoint always resolves to one particular day (today, an explicit
+    date, or the computed "next available" day) because it answers "is
+    the doctor in THEN". This endpoint answers a different, more general
+    question a caller actually asks in practice -- "which days does Dr X
+    usually sit?" -- with no date involved at all: it returns the
+    doctor's FULL recurring weekly schedule, every DoctorSchedule row
+    they have, in weekday order (0=Monday .. 6=Sunday, matching
+    DoctorSchedule's own docstring). The caller-facing wording is built
+    from this list in agent/reply_templates.py::doctor_schedule_reply().
+
+    Response shapes:
+      found=false: {"found": false, "query": "..."}
+      found=true, doctor has 1+ scheduled weekdays:
+        {"found": true, "doctor_name": "...", "doctor_name_bn": "...",
+         "schedule": [{"weekday": 0, "start_time": "10:00", "end_time": "12:00"}, ...]}
+      found=true, doctor exists but has ZERO DoctorSchedule rows (a real,
+      honest edge case -- e.g. a doctor on indefinite leave with no
+      chamber days configured at all): "schedule": [] -- the caller-facing
+      reply function must say so plainly rather than fabricating a day.
+    """
+    doctor = _find_doctor(db, name)
+    if not doctor:
+        return {"found": False, "query": name}
+
+    rows = (
+        db.query(DoctorSchedule)
+        .filter_by(doctor_id=doctor.id)
+        .order_by(DoctorSchedule.weekday.asc())
+        .all()
+    )
+    return {
+        "found": True,
+        "doctor_name": doctor.name,
+        "doctor_name_bn": _first_alias_bn(doctor.aliases_bn),
+        "schedule": [
+            {"weekday": r.weekday, "start_time": r.start_time, "end_time": r.end_time}
+            for r in rows
+        ],
     }
 
 
@@ -500,4 +832,636 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
         "success": True, "confirmation_id": confirmation_id,
         "doctor_name": doctor.name,
         "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": req.date, "time_slot": req.time_slot,
+    }
+
+
+# =============================================================================
+# Tool 5: GET /api/v1/reports/status?phone=...&test_name=... (optional)
+# Tool 6: POST /api/v1/reports/delivery/request
+# Tool 7: POST /api/v1/reports/otp/verify
+# Tool 8: GET /api/v1/reports/link/{token}
+#
+# ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story.
+# See this file's module docstring for the rule references. Every helper
+# and endpoint below is new; nothing above this line was touched except
+# the import block.
+# =============================================================================
+
+OTP_VALIDITY_MINUTES = 10
+SIGNED_LINK_VALIDITY_MINUTES = 15
+# UPDATED BY SOURAV -- "otp will not be hardcoded" (the user's own
+# explicit instruction, superseding the earlier prototype decision this
+# comment used to document: "the otp [is] hardcoded, for now user will
+# tell the otp and the matching will be done"). A report with no
+# pre-seeded ReportOTP row (or whose only rows are used/expired/maxed)
+# now gets a genuinely random code from models.generate_otp_code() every
+# time delivery is requested live, exactly like every other ReportOTP
+# row (seeded or live) already does -- see that function's own docstring.
+# Seeded patients that already carry their own ReportOTP row (Arjun/
+# Sohini/Amit -- see seed.py SECTION 9) still take priority via the
+# `reusable` check just below; this path only fires for reports with no
+# usable row yet (e.g. Mita's and the two Rahul Das reports).
+#
+# Whoever actually needs the code now (a real caller, or a tester with no
+# provider connected) gets it via send_otp_via_provider() -- best-effort,
+# see clinic-api/otp_messaging_config.py -- or, with no provider
+# connected, by reading the freshly-created ReportOTP row directly from
+# the database, the same way this file's own test suite already does.
+
+
+def _mask_phone_last4(phone: str) -> str:
+    """Rule 10: never say the full registered number back to the caller.
+    Used only in this file's own response payloads (masked_phone) --
+    reply_templates.py has its own copy for anything it composes
+    directly from a phone slot the caller spoke, since that module must
+    not import from clinic-api (they are separate deployables)."""
+    digits = "".join(c for c in phone if c.isdigit())
+    return digits[-4:] if len(digits) >= 4 else digits
+
+
+def _find_patient_by_phone(db: Session, phone: str) -> Patient | None:
+    return db.query(Patient).filter_by(phone=phone).first()
+
+
+def _report_summary(report: LabReport, test_name: str) -> dict:
+    return {
+        "report_number": report.report_number,
+        "test_name": test_name,
+        "status": report.status,
+        "delivery_enabled": report.delivery_enabled,
+        "expected_ready_at": report.expected_ready_at.isoformat() if report.expected_ready_at else None,
+        "ready_at": report.ready_at.isoformat() if report.ready_at else None,
+    }
+
+
+@app.get("/api/v1/reports/status")
+def report_status(phone: str = Query(...), test_name: str | None = Query(None),
+                   db: Session = Depends(get_db)):
+    """RULE 1 (never invent a report), RULE 13 (multiple reports require
+    clarification), RULE 14 (same-name patients must not be merged).
+
+    Identity is resolved by PHONE, never by name -- this is what makes
+    RULE 14 hold structurally rather than by convention: Patient.phone is
+    a unique column (see models.py), so two "Rahul Das" rows can never
+    collide here regardless of how the caller pronounces the name. A
+    caller who states only a name and no phone is a slot the voice agent
+    must ask for BEFORE calling this endpoint at all (see main_pcm.py's
+    new "phone" pending state) -- this endpoint has no name-based lookup
+    path to accidentally fall back to.
+    """
+    patient = _find_patient_by_phone(db, phone)
+    if not patient:
+        return {"patient_found": False}
+
+    reports = db.query(LabReport).filter_by(patient_id=patient.id).all()
+    if not reports:
+        # RULE 1: an honest NOT_FOUND, never a fabricated report.
+        return {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+
+    lab_test_ids = {r.lab_test_id for r in reports}
+    tests_by_id = {t.id: t for t in db.query(LabTest).filter(LabTest.id.in_(lab_test_ids)).all()}
+
+    if test_name:
+        matches = [r for r in reports if test_name.lower() in tests_by_id[r.lab_test_id].name.lower()]
+    else:
+        matches = reports
+
+    if not matches:
+        # A test_name was given but nothing this patient has matches it --
+        # honest NOT_FOUND rather than silently falling back to "all
+        # reports" (which would let a misheard test name return an
+        # unrelated report).
+        return {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+
+    if len(matches) > 1:
+        # RULE 13: multiple candidates -> ask, never guess.
+        return {
+            "patient_found": True, "found": False, "reason": "AMBIGUOUS",
+            "candidates": [_report_summary(r, tests_by_id[r.lab_test_id].name) for r in matches],
+        }
+
+    report = matches[0]
+    return {"patient_found": True, "found": True, **_report_summary(report, tests_by_id[report.lab_test_id].name)}
+
+
+def _blocking_reason_for(report: LabReport) -> str | None:
+    """RULE 3 / RULE 16: only a READY, delivery-enabled report may enter
+    the delivery flow. Returns the specific reason delivery is blocked,
+    or None if it is allowed to proceed -- used identically by both the
+    delivery-request and otp-verify endpoints below, so a report that
+    changes state between those two calls (e.g. cancelled in between) is
+    re-checked, not trusted from the first call."""
+    if report.status != "READY":
+        return report.status  # NOT_READY / PROCESSING / CANCELLED
+    if not report.delivery_enabled:
+        return "DELIVERY_DISABLED"
+    return None
+
+
+def _resolve_patient_and_report(db: Session, phone: str, report_number: str):
+    """Shared identity+report resolution for delivery/request and
+    otp/verify. Returns (patient, report, error_reason). error_reason is
+    None on success.
+
+    RULE 15: the report must belong to the PHONE-resolved patient, not
+    merely exist. A real report_number for a DIFFERENT patient (ATTACK
+    15) and a nonexistent one both return the same "NOT_FOUND" -- never a
+    distinct "wrong patient" reason, which would let an attacker probe
+    which report numbers are real by watching the error change.
+    """
+    patient = _find_patient_by_phone(db, phone)
+    if not patient:
+        return None, None, "PATIENT_NOT_FOUND"
+
+    report = db.query(LabReport).filter_by(report_number=report_number).first()
+    if not report or report.patient_id != patient.id:
+        return patient, None, "NOT_FOUND"
+
+    return patient, report, None
+
+
+class DeliveryRequest(BaseModel):
+    phone: str
+    report_number: str
+
+
+@app.post("/api/v1/reports/delivery/request")
+def request_report_delivery(req: DeliveryRequest, db: Session = Depends(get_db)):
+    """RULE 4 (OTP required before delivery), RULE 6/7/8 (an exhausted,
+    expired or already-used OTP is never silently reused -- a fresh
+    request always gets a fresh, USABLE OTP row instead)."""
+    patient, report, error = _resolve_patient_and_report(db, req.phone, req.report_number)
+    if error:
+        return {"success": False, "reason": error}
+
+    blocked = _blocking_reason_for(report)
+    if blocked:
+        return {"success": False, "reason": blocked}
+
+    now = datetime.datetime.now()
+
+    # Reuse the most recent OTP row for this (report, patient) ONLY if it
+    # is still usable. RULE 8's "require a new verification flow" is what
+    # this is: a maxed-out, expired or already-used row is treated as
+    # dead, and a brand-new row is minted instead of ever handing the
+    # same exhausted OTP back out.
+    active = (
+        db.query(ReportOTP)
+        .filter_by(report_id=report.id, patient_id=patient.id)
+        # UPDATED BY SOURAV -- tie-break on id, not just created_at.
+        # Two OTP rows for the same (report, patient) can share an
+        # identical created_at timestamp (Python's datetime.now() and
+        # SQLite's storage resolution both make this a real possibility,
+        # not just a seed-data artifact -- clinic-api/seed.py's own
+        # Patient E rows originally did exactly this before being fixed
+        # to use distinct timestamps). Without a secondary sort key,
+        # "most recent" was undefined on a tie -- caught by
+        # tests/test_clinic_api_reports.py::TestOtpVerify::
+        # test_max_attempts_already_reached returning OTP_EXPIRED instead
+        # of OTP_MAX_ATTEMPTS. `id` is autoincrement, so it is a reliable
+        # insertion-order tie-breaker regardless of what the clock reads.
+        .order_by(ReportOTP.created_at.desc(), ReportOTP.id.desc())
+        .first()
+    )
+    reusable = (
+        active is not None
+        and not active.used
+        and active.expires_at > now
+        and active.attempt_count < active.max_attempts
+    )
+
+    if not reusable:
+        active = ReportOTP(
+            report_id=report.id,
+            patient_id=patient.id,
+            phone=patient.phone,
+            otp_code=generate_otp_code(),
+            created_at=now,
+            expires_at=now + datetime.timedelta(minutes=OTP_VALIDITY_MINUTES),
+            used=False,
+            attempt_count=0,
+        )
+        db.add(active)
+        db.commit()
+
+    # ADDED BY SOURAV -- "otp will not be hardcoded". Every delivery
+    # request -- whether it just minted a fresh row above or is reusing
+    # an existing valid one -- attempts to actually push the current
+    # active code out through whatever provider a deploying company has
+    # configured (see otp_messaging_config.py, the one file they need to
+    # touch). Best-effort and never blocking: `active`'s row is already
+    # committed to the database by this point regardless of whether this
+    # send succeeds, matching this whole file's "fail safe, not fail
+    # open" posture (module docstring) -- a provider hiccup must never be
+    # the reason a patient can't proceed. send_otp_via_provider() already
+    # promises never to raise on its own, but this endpoint's own success
+    # response is still wrapped in a try/except here too -- defense in
+    # depth, the same posture every other tie-break/edge case in this
+    # file already takes, rather than resting entirely on another file's
+    # contract holding forever.
+    try:
+        send_otp_via_provider(patient.phone, active.otp_code)
+    except Exception as e:
+        logging.getLogger("clinic-api").error(
+            "send_otp_via_provider() raised unexpectedly for report %s: %s",
+            report.report_number, e,
+        )
+
+    return {
+        "success": True, "reason": "OTP_REQUIRED",
+        "masked_phone": _mask_phone_last4(patient.phone),
+    }
+
+
+class OtpVerifyRequest(BaseModel):
+    phone: str
+    report_number: str
+    otp_code: str
+    # SOURAV: test-only hook for CASE 2 ("Delivery failure tests" /
+    # provider failure) in the attack plan's Section 9. The voice agent
+    # itself never sets this -- there is no real SMS/e-mail provider in
+    # this prototype to fail on its own, so this is how the automated
+    # test suite deterministically exercises "OTP was right, but the
+    # provider failed" (RULE 17) without needing real delivery infra.
+    simulate_delivery_failure: bool = False
+
+
+@app.post("/api/v1/reports/otp/verify")
+def verify_report_otp(req: OtpVerifyRequest, db: Session = Depends(get_db)):
+    """The entire OTP attack surface (plan Section 6) lives in this one
+    function, in a fixed order, on purpose -- RULE 9 says never reveal
+    the correct OTP, so the code is compared LAST, after every other
+    reason to refuse has already been ruled out; an attacker never
+    learns anything about the correct value from which check fired."""
+    patient, report, error = _resolve_patient_and_report(db, req.phone, req.report_number)
+    if error:
+        return {"success": False, "reason": error}
+
+    blocked = _blocking_reason_for(report)
+    if blocked:
+        return {"success": False, "reason": blocked}
+
+    now = datetime.datetime.now()
+
+    active = (
+        db.query(ReportOTP)
+        .filter_by(report_id=report.id, patient_id=patient.id)
+        # UPDATED BY SOURAV -- tie-break on id, not just created_at.
+        # Two OTP rows for the same (report, patient) can share an
+        # identical created_at timestamp (Python's datetime.now() and
+        # SQLite's storage resolution both make this a real possibility,
+        # not just a seed-data artifact -- clinic-api/seed.py's own
+        # Patient E rows originally did exactly this before being fixed
+        # to use distinct timestamps). Without a secondary sort key,
+        # "most recent" was undefined on a tie -- caught by
+        # tests/test_clinic_api_reports.py::TestOtpVerify::
+        # test_max_attempts_already_reached returning OTP_EXPIRED instead
+        # of OTP_MAX_ATTEMPTS. `id` is autoincrement, so it is a reliable
+        # insertion-order tie-breaker regardless of what the clock reads.
+        .order_by(ReportOTP.created_at.desc(), ReportOTP.id.desc())
+        .first()
+    )
+    if active is None:
+        return {"success": False, "reason": "OTP_NOT_REQUESTED"}
+
+    if active.used:
+        # RULE 7: an OTP is single-use, full stop -- even if the caller
+        # types the exact right value again.
+        return {"success": False, "reason": "OTP_ALREADY_USED"}
+
+    if active.expires_at <= now:
+        # RULE 6.
+        return {"success": False, "reason": "OTP_EXPIRED"}
+
+    if active.attempt_count >= active.max_attempts:
+        # RULE 8 -- checked BEFORE the code comparison, so a caller who
+        # is already locked out never gets another "wrong"/"right"
+        # signal about a code that no longer matters.
+        return {"success": False, "reason": "OTP_MAX_ATTEMPTS"}
+
+    if active.otp_code != req.otp_code:
+        # RULE 9: the response says only that it was wrong, never what
+        # the right one is.
+        active.attempt_count += 1
+        db.commit()
+        if active.attempt_count >= active.max_attempts:
+            return {"success": False, "reason": "OTP_MAX_ATTEMPTS"}
+        return {"success": False, "reason": "OTP_INVALID"}
+
+    # Correct code, and every gate above passed -- RULE 5 held throughout
+    # because `active` was scoped to (report.id, patient.id) from the
+    # very first query above: an OTP that is valid for a DIFFERENT report
+    # or patient is simply never the row being compared against here, so
+    # ATTACK 5/6 (cross-report / cross-patient OTP reuse) fail not
+    # because of a special case, but because the right row was never
+    # found in the first place.
+    active.used = True
+    active.verified_at = now
+    db.commit()
+
+    if req.simulate_delivery_failure:
+        # RULE 17: OTP success must NOT be conflated with delivery
+        # success -- the two are recorded and reported separately.
+        delivery = ReportDelivery(
+            report_id=report.id, patient_id=patient.id,
+            recipient=f"registered contact for {patient.phone}",
+            delivery_channel="EMAIL", verification_status="VERIFIED",
+            delivery_status="FAILED", created_at=now, verified_at=now,
+            failed_at=now, failure_reason="DELIVERY_PROVIDER_FAILURE",
+            audit_note="OTP verified successfully; delivery provider failed on send.",
+        )
+        db.add(delivery)
+        db.commit()
+        return {"success": False, "reason": "DELIVERY_FAILED"}
+
+    token = secrets.token_urlsafe(16)
+    expires_at = now + datetime.timedelta(minutes=SIGNED_LINK_VALIDITY_MINUTES)
+    delivery = ReportDelivery(
+        report_id=report.id, patient_id=patient.id,
+        recipient=f"registered contact for {patient.phone}",
+        delivery_channel="EMAIL", verification_status="VERIFIED",
+        delivery_status="SENT", signed_link_token=token,
+        signed_link_expires_at=expires_at, created_at=now,
+        verified_at=now, sent_at=now,
+        audit_note="OTP verified; report delivered successfully.",
+    )
+    db.add(delivery)
+    db.commit()
+
+    return {
+        "success": True, "reason": "DELIVERY_SENT",
+        "masked_phone": _mask_phone_last4(patient.phone),
+        "signed_link_expires_minutes": SIGNED_LINK_VALIDITY_MINUTES,
+    }
+
+
+@app.get("/api/v1/reports/link/{token}")
+def validate_report_link(token: str, db: Session = Depends(get_db)):
+    """RULE 11 (links must expire), RULE 12 (no direct access without
+    authorization). This is an HTTP-level endpoint, not something the
+    voice agent itself calls -- the caller never speaks a token back
+    over the phone. It exists so the plan's Section 8 link/token attacks
+    (23-28: expired, reused, modified, empty, random, cross-report) have
+    something real to attack, matching a real "click the link we sent
+    you" step in the actual delivery channel."""
+    if not token:
+        return {"valid": False, "reason": "LINK_INVALID"}
+
+    delivery = db.query(ReportDelivery).filter_by(signed_link_token=token).first()
+    if not delivery:
+        # Covers a genuinely random token, an empty one, AND a modified
+        # one (flipping one character of a real token overwhelmingly
+        # lands on a value nothing in signed_link_token equals) --
+        # ATTACK 25/26/27 all resolve to this same branch, which is the
+        # point: a corrupted token carries no partial credit.
+        return {"valid": False, "reason": "LINK_INVALID"}
+
+    if not delivery.signed_link_expires_at or delivery.signed_link_expires_at <= datetime.datetime.now():
+        return {"valid": False, "reason": "LINK_EXPIRED"}
+
+    linked_report = db.query(LabReport).filter_by(id=delivery.report_id).first()
+    return {
+        "valid": True,
+        "report_number": linked_report.report_number if linked_report else None,
+    }
+
+
+# =============================================================================
+# Tool 16: GET /api/v1/patient/billing?phone=...
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Outstanding
+# Balance / Billing story. Identity resolved by PHONE (RULE 14/15), same
+# as /api/v1/reports/status above, reusing the same _find_patient_by_phone
+# helper -- deliberately NOT gated behind OTP verification the way report
+# delivery is (see models.py's PatientBilling docstring for that scoping
+# decision).
+# =============================================================================
+
+@app.get("/api/v1/patient/billing")
+def patient_billing(phone: str = Query(...), db: Session = Depends(get_db)):
+    patient = _find_patient_by_phone(db, phone)
+    if not patient:
+        return {"patient_found": False}
+
+    billing = db.query(PatientBilling).filter_by(patient_id=patient.id).first()
+    if billing is None or billing.outstanding_amount is None:
+        # No billing record for this patient at all -- honest NOT_FOUND,
+        # never a guessed/defaulted zero balance (see models.py's
+        # PatientBilling docstring: no row and a real 0.0 are different,
+        # both real, outcomes).
+        return {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+
+    return {
+        "patient_found": True, "found": True,
+        "outstanding_amount": billing.outstanding_amount,
+        "due_date": billing.due_date.isoformat() if billing.due_date else None,
+    }
+
+
+# =============================================================================
+# Tool 9: GET /api/v1/clinic/info
+#
+# ADDED BY SOURAV -- "Caller asks opening hours, address or directions"
+# story. models.py's own ClinicInfo docstring lists the exact caller
+# phrasings this backs ("When do you open?" / "Clinic kab khulta hai?" /
+# "ঠিকানাটা কী?") -- the DB already stored everything needed (see that
+# model's own comment: "The actual voice response language should ideally
+# be handled by the agent/template layer... The DB stores the factual
+# information"); this endpoint is simply the missing HTTP surface over it.
+# A singleton table (seed.py inserts exactly one row) -- no query params.
+# =============================================================================
+
+# Ordered Monday-first to match DoctorSchedule's own weekday convention
+# (0=Monday .. 6=Sunday) used throughout this file, so any future caller
+# of this endpoint can zip the two together without a re-mapping step.
+_CLINIC_WEEKDAYS = (
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+)
+
+
+@app.get("/api/v1/clinic/info")
+def clinic_info(db: Session = Depends(get_db)):
+    """found=false is a real, honest edge case (an unseeded/emptied
+    ClinicInfo table), not something the voice agent should ever silently
+    paper over with a guessed address -- same fail-safe posture as every
+    other endpoint in this file. Normally there is exactly one row."""
+    info = db.query(ClinicInfo).first()
+    if not info:
+        return {"found": False}
+
+    hours = {}
+    for day in _CLINIC_WEEKDAYS:
+        closed = bool(getattr(info, f"{day}_closed", False))
+        hours[day] = {
+            "closed": closed,
+            "open": None if closed else getattr(info, f"{day}_open"),
+            "close": None if closed else getattr(info, f"{day}_close"),
+        }
+
+    return {
+        "found": True,
+        "clinic_name": info.clinic_name,
+        "phone": info.phone,
+        "address": info.address,
+        "directions": info.directions,
+        "hours": hours,
+    }
+
+
+# =============================================================================
+# Tool 10: GET /api/v1/health-packages
+# Tool 11: GET /api/v1/health-packages/search?name=...
+#
+# ADDED BY SOURAV -- "Caller asks about a health package" story. Mirrors
+# /api/v1/tests/search's own English -> Bengali-alias -> fuzzy matching
+# ladder exactly (see that endpoint's comments for why each stage exists),
+# now that seed.py actually seeds HealthPackage.aliases -- see this file's
+# own "ADDED BY SOURAV" comment in seed.py's HEALTH_PACKAGES list for that
+# half of this story.
+# =============================================================================
+
+def _package_tests(db: Session, pkg: HealthPackage) -> list[LabTest]:
+    return (
+        db.query(LabTest)
+        .join(HealthPackageTest, HealthPackageTest.lab_test_id == LabTest.id)
+        .filter(HealthPackageTest.package_id == pkg.id)
+        .all()
+    )
+
+
+def _package_reply_dict(db: Session, pkg: HealthPackage) -> dict:
+    tests = _package_tests(db, pkg)
+    return {
+        "found": True,
+        "package_name": pkg.name,
+        # _first_alias_bn() is named for its original (LabTest/Doctor)
+        # callers, but its behaviour -- "first non-empty '|'-separated
+        # entry" -- has nothing Bengali-specific about it; HealthPackage's
+        # own alias list (seed.py) deliberately mixes English/Hinglish/
+        # Banglish/Bengali-script entries the same way, so it is reused
+        # here as-is rather than duplicated under a new name.
+        "package_name_bn": _first_alias_bn(pkg.aliases),
+        "description": pkg.description,
+        "price_inr": pkg.price_inr,
+        "tests": [t.name for t in tests],
+        "tests_bn": [_first_alias_bn(t.aliases_bn) for t in tests],
+    }
+
+
+def _find_health_package(db: Session, name: str) -> HealthPackage | None:
+    active = db.query(HealthPackage).filter_by(active=True)
+
+    # English substring match.
+    exact = active.filter(func.lower(HealthPackage.name).contains(name.lower())).first()
+    if exact:
+        return exact
+
+    all_packages = active.all()
+
+    # Alias match (English/Hinglish/Banglish/Bengali-script -- see
+    # seed.py's HEALTH_PACKAGES aliases for exactly what this catches).
+    for p in all_packages:
+        aliases = [a for a in (p.aliases or "").split("|") if a]
+        if any(name.lower() in alias.lower() or alias.lower() in name.lower() for alias in aliases):
+            return p
+
+    # Fuzzy fallback -- same shape as _find_department()'s own fallback.
+    best_pkg, best_ratio = None, 0.0
+    for p in all_packages:
+        candidates = [p.name.lower()] + [a.lower() for a in (p.aliases or "").split("|") if a]
+        for c in candidates:
+            ratio = difflib.SequenceMatcher(None, name.lower(), c).ratio()
+            if ratio > best_ratio:
+                best_pkg, best_ratio = p, ratio
+
+    return best_pkg if best_ratio >= 0.6 else None
+
+
+@app.get("/api/v1/health-packages")
+def list_health_packages(db: Session = Depends(get_db)):
+    """A plain "what packages do you have?" listing -- every ACTIVE
+    package, unfiltered. Deliberately excludes inactive packages (same
+    posture as active-only lookups elsewhere): a caller should never be
+    offered, or able to ask follow-up questions about, a package the
+    clinic has withdrawn."""
+    packages = db.query(HealthPackage).filter_by(active=True).all()
+    return {
+        "packages": [_package_reply_dict(db, p) for p in packages],
+    }
+
+
+@app.get("/api/v1/health-packages/search")
+def search_health_package(name: str = Query(...), db: Session = Depends(get_db)):
+    pkg = _find_health_package(db, name)
+    if pkg:
+        return _package_reply_dict(db, pkg)
+
+    # Fuzzy "did you mean" suggestions -- same pattern as search_test()'s
+    # own fallback: try both the English name and every alias, then map
+    # suggested aliases back to their canonical English name for display.
+    active_packages = db.query(HealthPackage).filter_by(active=True).all()
+    candidates = []
+    for p in active_packages:
+        candidates.append(p.name)
+        candidates.extend(a for a in (p.aliases or "").split("|") if a)
+    suggestions = difflib.get_close_matches(name, candidates, n=3, cutoff=0.5)
+    alias_to_name = {
+        a: p.name for p in active_packages for a in (p.aliases or "").split("|") if a
+    }
+    suggestions = list(dict.fromkeys(alias_to_name.get(s, s) for s in suggestions))
+    return {"found": False, "query": name, "did_you_mean": suggestions}
+
+
+# =============================================================================
+# Tool 12: POST /api/v1/callbacks
+#
+# ADDED BY SOURAV -- "Caller asks to be called back" story. See
+# models.py's own CallbackRequest docstring for why this is its own table,
+# and agent/callback_flow.py's module docstring for why "operating hours"
+# is checked entirely on the VOICE AGENT side (main.py), before this
+# endpoint is ever called -- this endpoint's only job is to persist a
+# request that has already been decided to be acceptable; it does not
+# re-check availability itself, the same division of labour
+# book_appointment() above already has with the agent's own slot
+# collection (the agent decides WHEN to call this; this endpoint decides
+# only HOW to store what it's given).
+# =============================================================================
+class CallbackRequestIn(BaseModel):
+    phone: str
+    time_window: str
+    reason: str | None = None
+
+
+@app.post("/api/v1/callbacks")
+def request_callback(req: CallbackRequestIn, db: Session = Depends(get_db)):
+    """Always succeeds for a syntactically valid body (FastAPI/Pydantic
+    already reject a request missing `phone`/`time_window` with a 422
+    before this function body ever runs) -- unlike book_appointment()
+    above, there is no slot-taken/doctor-not-found domain check to fail:
+    a callback request has no capacity limit and needs nothing else to
+    already exist in the database. `success` is still returned, matching
+    every other write in this file's response shape, so main.py's existing
+    "check success, then check the fields that must be non-empty before
+    speaking them" pattern (see agent/outcomes.py's missing_booking_write_
+    fields(), mirrored for this endpoint as missing_callback_write_fields())
+    needs no special-casing for this endpoint."""
+    callback_id = f"CB-{datetime.date.today().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+    row = CallbackRequest(
+        callback_id=callback_id,
+        phone=req.phone,
+        time_window=req.time_window,
+        reason=req.reason,
+        status="pending",
+        created_at=datetime.datetime.now(),
+    )
+    db.add(row)
+    db.commit()
+
+    return {
+        "success": True,
+        "callback_id": callback_id,
+        "phone": req.phone,
+        "time_window": req.time_window,
+        "reason": req.reason,
+        "status": "pending",
     }

@@ -48,17 +48,50 @@ _RELATIVE_DAYS = {
 
 # Kept deliberately small and exact-match only (see is_affirmative /
 # is_negative below) -- these gate whole-utterance decisions like "abandon
-# the booking flow", so a false hit on a substring inside an unrelated
-# reply (e.g. a patient name that happens to contain "না") would be a much
-# worse failure than occasionally not recognising a yes/no.
-_AFFIRMATIVE = {"হ্যাঁ", "হ্যা", "হুম", "হুঁ", "ঠিক", "ঠিক আছে", "ওই দিন", "ওইদিন",
-                "সেদিন", "সেদিনই", "সেই দিন", "চলবে", "ওকে", "হবে"}
-_NEGATIVE = {"না", "নাহ", "না না", "লাগবে না", "থাক", "দরকার নেই", "ইচ্ছা নেই",
-             "না থাক", "লাগবে নাহ"}
+# the booking flow" and, since the booking-readback story, "confirm the
+# write", so a false hit on a substring inside an unrelated reply (e.g. a
+# patient name that happens to contain "না") would be a much worse failure
+# than occasionally not recognising a yes/no.
+#
+# This system's own docstrings (reply_templates.py's LANGUAGE SUPPORT
+# note) commit to three reply languages -- Bengali, English, Hinglish --
+# and Kolkata callers code-switch Bengali with English just as often as
+# Hindi with English ("Banglish"), so the affirmative/negative vocabulary
+# a caller might actually SAY is not Bengali-only regardless of which
+# language the AGENT chose to speak the prompt in. Previously this set
+# only recognised Bengali words, so an English "yes"/"no" or a
+# transliterated "haan"/"nahi" fell through to the unparseable-reply retry
+# path instead of being understood immediately.
+_AFFIRMATIVE = {
+    # Bengali
+    "হ্যাঁ", "হ্যা", "হুম", "হুঁ", "ঠিক", "ঠিক আছে", "ওই দিন", "ওইদিন",
+    "সেদিন", "সেদিনই", "সেই দিন", "চলবে", "ওকে", "হবে",
+    # English
+    "yes", "yeah", "yep", "yup", "correct", "right", "that's right",
+    "ok", "okay", "sure", "confirmed", "confirm",
+    # Hinglish / Banglish (Latin-script transliteration -- shared
+    # vocabulary between the two, since both are "regional language +
+    # English" code-switches)
+    "haan", "han", "haa", "thik ache", "thik achhe", "theek hai",
+    "sahi hai", "sob thik ache", "sob thik",
+}
+_NEGATIVE = {
+    # Bengali
+    "না", "নাহ", "না না", "লাগবে না", "থাক", "দরকার নেই", "ইচ্ছা নেই",
+    "না থাক", "লাগবে নাহ",
+    # English
+    "no", "nope", "not correct", "wrong", "incorrect", "not right",
+    # Hinglish / Banglish
+    "nahi", "nahin", "na", "galat", "thik na", "thik nei",
+}
 
 
 def _strip(text: str) -> str:
-    return text.strip().strip("।!?., ")
+    # .lower() is a no-op on Bengali script (it has no case), so this is
+    # safe for the existing Bengali entries and required for the English /
+    # Hinglish / Banglish ones added above ("Yes", "YES" and "yes" must
+    # all match).
+    return text.strip().strip("।!?., ").lower()
 
 
 def is_affirmative(text: str) -> bool:
@@ -87,12 +120,15 @@ def is_negative(text: str) -> bool:
 # doctor_name and phone are matched FIRST on their own unambiguous words. A
 # bare "নাম" then falls through to patient_name, which is the only reading
 # left once the others are excluded.
+#
+# English/Hinglish variants are matched alongside the Bengali words (merged
+# from dev_sourav) since callers code-switch mid-sentence.
 _CORRECTION_FIELD_WORDS = {
-    "doctor_name": ("ডাক্তার", "ডক্তার"),
-    "date": ("তারিখ", "দিন"),
-    "time_slot": ("সময়", "টাইম"),
-    "phone": ("ফোন", "নম্বর", "নাম্বার"),
-    "patient_name": ("নাম",),
+    "doctor_name": ("ডাক্তার", "ডক্তার", "doctor"),
+    "date": ("তারিখ", "দিন", "date"),
+    "time_slot": ("সময়", "টাইম", "time"),
+    "phone": ("ফোন", "নম্বর", "নাম্বার", "phone", "number"),
+    "patient_name": ("নাম", "name"),
 }
 _CORRECTION_FIELD_ORDER = ("doctor_name", "date", "time_slot", "phone", "patient_name")
 
@@ -316,10 +352,146 @@ def parse_time(text: str) -> str | None:
     return None
 
 
+# ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story.
+# main_pcm.py's new "otp_code" pending state (see _continue_pending) uses
+# this instead of running the caller's reply through agent/llm.py, for
+# the SAME reason every other field in this file is parsed locally (see
+# this module's docstring) -- PLUS a security reason unique to this one
+# field: an OTP must never be sent to the LLM or the semantic cache at
+# all. The LLM call is a real network hop to Ollama with its own request
+# log, and agent/semantic_cache.py persists normalized utterance text as
+# its cache key -- routing a 6-digit secret through either would be
+# exactly the "secret-shaped literal in a log line" DoD gate 6 warns
+# about, even though the OTP itself is a deliberately hardcoded prototype
+# value (see clinic-api/seed.py and main.py's FRESH_OTP_CODE). Handling
+# it here, alongside parse_phone, keeps it out of both.
+#
+# UPDATED BY SOURAV -- moved above parse_phone() (was originally defined
+# only just above parse_otp(), further down this file) because parse_phone()
+# now reuses this SAME word list for a real production bug fix -- see
+# parse_phone()'s own docstring immediately below for the full writeup.
+# Reused as-is, not duplicated or extended: still English digit words
+# only (see parse_phone()'s docstring for why Bengali/Hindi spoken digit
+# words are a separate, flagged, not-yet-closed gap, symmetric with the
+# same pre-existing limitation this already had for OTP entry).
+_DIGIT_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+_DIGIT_WORD_RE = re.compile(r"\b(" + "|".join(_DIGIT_WORDS) + r")\b", re.IGNORECASE)
+
+
 def parse_phone(text: str) -> str | None:
     """-> a 10-digit phone number, or None if the utterance doesn't
-    contain enough digits to be one."""
-    digits = re.sub(r"\D", "", text.translate(_BN_DIGITS))
+    contain enough digits to be one.
+
+    UPDATED BY SOURAV -- fixes a real production bug, reported directly
+    from a live call transcript. A caller was asked "Is my report ready?"
+    (report_status), the agent asked for their registered phone number
+    (RULE 14/15 -- identity is resolved by phone, never by name), and the
+    caller answered by SPEAKING THE DIGITS AS WORDS:
+
+        "Yes, write nine zero zero zero zero zero zero zero zero one."
+
+    This function used to only understand literal digit characters
+    (Bengali numerals, via _BN_DIGITS, or plain ASCII digits) -- spoken
+    English number words were never converted to digits at all, so
+    stripping every non-digit character from "nine zero zero zero zero
+    zero zero zero zero one" left an EMPTY string every single time,
+    which is always < 10 digits, which always returned None. The caller
+    could repeat themselves as many times and as clearly as they liked
+    (confirmed in the transcript -- they tried three different phrasings)
+    and would be stuck in an infinite "can you tell me your registered
+    phone number?" loop forever, because nothing about repeating the same
+    kind of answer could ever succeed.
+
+    Fixed by resolving spoken English digit words into digits FIRST,
+    using the exact same _DIGIT_WORDS/_DIGIT_WORD_RE word list parse_otp()
+    below already uses for the identical reason -- reused, not duplicated.
+    "nine zero zero zero zero zero zero zero zero one" now correctly
+    resolves to 9000000001.
+
+    Deliberately still returns None (fails closed) for a spoken REPETITION
+    shorthand like "eight zeros" (meaning the digit 0 repeated eight
+    times) -- seen in the same transcript ("Nine then eight zeros and
+    one") as the caller's own retry after the first phrasing wasn't
+    understood. This is NOT fixed here: telling "eight zeros" (0 repeated
+    8 times) apart from the caller instead meaning the two separate
+    digits "eight" then "zero" is genuinely ambiguous, and a phone number
+    gates a real caller's private report data -- guessing wrong here would
+    silently produce the WRONG number and risk exposing (or refusing)
+    the wrong person's report, which is a worse failure than asking the
+    caller to repeat themselves once more. Same fail-closed posture this
+    whole module already commits to everywhere else (see the module's own
+    docstring: "return None whenever not confident, and let main.py
+    re-prompt... rather than guess"). Flagged in this story's test report,
+    not silently absorbed.
+    """
+    translated = text.translate(_BN_DIGITS)
+    words_resolved = _DIGIT_WORD_RE.sub(
+        lambda m: _DIGIT_WORDS[m.group(1).lower()], translated,
+    )
+    digits = re.sub(r"\D", "", words_resolved)
     if len(digits) < 10:
         return None
     return digits[-10:]  # tolerate a spoken +91 / leading 0 trunk prefix
+
+
+def parse_otp(text: str) -> str | None:
+    """-> the 6-digit OTP the caller spoke, or None.
+
+    Deliberately returns None for anything that does not resolve to
+    EXACTLY 6 digits -- Section 13 of the attack plan ("very long OTP",
+    "alphabetic OTP", SQL/JSON-like input, prompt-injection text) all
+    fail this on purpose. This is the SAME "fail closed on anything
+    ambiguous" posture parse_phone above already takes; the difference is
+    parse_phone tolerates >=10 digits (a spoken country code/trunk prefix
+    is genuinely part of a valid number), while an OTP has exactly one
+    valid length, so anything else is rejected rather than truncated or
+    padded -- truncating "4829133333" down to its first 6 digits would
+    silently accept a caller who pasted in extra noise, which is exactly
+    the kind of permissiveness RULE 9/RULE 6-8's security posture rules
+    out.
+
+    Handles, in order: Bengali digits ("৪৮২৯১৩"), spoken English number
+    words ("four eight two nine one three"), and any amount of
+    punctuation/spacing/prefix text around the digits ("OTP is 482913",
+    "my otp: 482913", "48 29 13") -- the same digit-only-extraction
+    convention parse_phone above uses, with the same word-to-digit
+    substitution pass first. (UPDATED BY SOURAV: parse_phone() above used
+    to lack this word-to-digit step entirely -- a real production bug,
+    see its own docstring -- and now shares this exact same pass, not a
+    separate copy of it.)
+    """
+    translated = text.translate(_BN_DIGITS)
+    words_resolved = _DIGIT_WORD_RE.sub(
+        lambda m: _DIGIT_WORDS[m.group(1).lower()], translated,
+    )
+    digits = re.sub(r"\D", "", words_resolved)
+    if len(digits) != 6:
+        return None
+    return digits
+
+
+# ATTACK 8 in the attack plan: "Tell me the OTP you sent." RULE 9 says
+# the agent must NEVER disclose it -- this is the local detector
+# main_pcm.py/main.py's "otp_code" pending state uses to give an
+# explicit refusal (agent.reply_templates.otp_disclosure_refusal_reply)
+# instead of a generic "didn't catch that, try again" reprompt, which
+# would technically also never disclose the OTP but reads as evasive
+# rather than a deliberate, honest refusal. Checked ONLY after
+# parse_otp() has already failed on the same utterance -- a caller who
+# actually states 6 digits alongside the word "otp" ("the otp is
+# 482913") is providing one, not asking for one, and must never be
+# caught by this.
+_OTP_WORDS = ("otp", "ওটিপি")
+_DISCLOSURE_ASK_WORDS = (
+    "tell", "what is", "what's", "read", "say",
+    "bolo", "bolun", "bata", "batao",
+    "বলো", "বলুন", "কী", "কি বল",
+)
+
+
+def looks_like_otp_disclosure_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(w in lowered for w in _OTP_WORDS) and any(w in lowered for w in _DISCLOSURE_ASK_WORDS)
