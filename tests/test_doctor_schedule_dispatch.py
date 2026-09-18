@@ -34,6 +34,7 @@ import types
 import pytest
 
 import main_pcm
+from agent import answer_ledger
 from agent.bn_normalize import weekday_to_words
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -60,11 +61,31 @@ class _AsyncNoOp:
 
 
 def make_session():
+    # UPDATED BY SOURAV -- KCD-385: this stub had fallen behind the real
+    # Session object. _dispatch_turn_inner() reads session.utt_seq and
+    # session.call_state as direct (non-getattr) attribute access purely to
+    # log the turn, before any intent-specific code runs at all, and a
+    # separate confidence/confirm-transcript-zone path reads
+    # session.confirm_attempts -- a bare SimpleNamespace missing any of
+    # these crashed every test in this file with an AttributeError before
+    # the doctor_schedule branch itself was ever reached (masked as "turn
+    # crashed -- answering as unreachable" in the logs). Wiring this
+    # story's near-match fix through _speak_fact() (see main_pcm.py's own
+    # "UPDATED BY SOURAV -- KCD-385" comment on the doctor_schedule
+    # dispatch branch) additionally reads session.answer_ledger, which the
+    # real Session already sets in its __init__ but this hand-rolled stub
+    # never did. All four are added here so this file can finally exercise
+    # the doctor_schedule code it was written to test, instead of always
+    # crashing one layer above it.
     return types.SimpleNamespace(
         call_id="test-doctor-schedule-call",
         pending=None,
         dispatch_lock=asyncio.Lock(),
         send_json=_AsyncNoOp(),
+        utt_seq=1,
+        call_state=None,
+        confirm_attempts=0,
+        answer_ledger=answer_ledger.AnswerLedger(),
     )
 
 
@@ -78,6 +99,17 @@ class FakeASRResult:
     # the fake utterance is kept in Bengali to match -- language variation
     # itself is covered separately in tests/test_language_detection_dispatch.py.
     text = "ডাক্তারের সময়সূচী জানতে চাই"
+    # UPDATED BY SOURAV -- KCD-385: a bare result with no decoder-agreement
+    # fields reads to agent/confidence.py::zone() as "no comparison was
+    # made", which routes to the CONFIRM zone and speaks a "did you say X,
+    # is that right?" readback instead of ever reaching intent dispatch.
+    # These four fields put it squarely in the PROCEED zone, matching how
+    # every other dispatch-level fixture in this suite already does this
+    # (see e.g. tests/test_report_status_send_dispatch.py's own FakeASRResult).
+    decoder_used = "ctc"
+    decoder_agreement = 1.0
+    ctc_words = 5
+    rnnt_words = 5
 
 
 class FakeASR:

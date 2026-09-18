@@ -182,6 +182,12 @@ from agent.slot_parse import (
     # semantic cache (see agent/slot_parse.py's parse_otp() docstring and
     # RULE 9 -- the OTP must never appear in an Ollama prompt or a cache key).
     parse_otp, looks_like_otp_disclosure_request,
+    # ADDED BY SOURAV -- KCD-383 ("Caller asks whether their report is
+    # ready"): detects a caller naming the callback option in reply to
+    # the "confirm_delivery" offer, which now names both delivery and a
+    # callback (agent/reply_templates.py's report_status_reply()). See
+    # agent/slot_parse.py's own docstring for the ordering guarantee.
+    looks_like_callback_preference,
 )
 # story title: The model never originates a fact
 # user story: As a clinical lead, I want every price, date and identifier to
@@ -1302,6 +1308,72 @@ async def _handle_report_lookup(session: CallSession, phone: str, test_name: str
     await _finish_report_flow(session, phone, result, flow, language=language)
 
 
+# ADDED BY SOURAV -- KCD-383 ("Caller asks whether their report is
+# ready"). agent/reply_templates.py's report_status_reply() now offers
+# BOTH delivery and a callback when a report is READY+delivery_enabled;
+# this is the glue the "confirm_delivery" branch of _continue_pending
+# below calls when the caller's answer to that offer names the callback
+# option instead of a plain yes/no (agent/slot_parse.py's
+# looks_like_callback_preference()). It reuses the exact SAME
+# availability check and slot-filling pending states
+# ("callback_time_window"/"callback_phone"/"confirm_callback") the
+# "request_callback" intent's own dispatch branch further below already
+# owns (agent/callback_flow.py/agent/callback_config.py) -- this is
+# "routing to the existing request_callback intent", per the KCD-383 AC,
+# not a second, parallel callback pipeline. Deliberately does NOT prefill
+# a callback phone number from the report flow's already-resolved
+# `phone` (that number identified the PATIENT for RULE 15 purposes; the
+# number to actually call back on is a separate fact the caller has not
+# yet stated, and this module's "never invent a fact" discipline applies
+# here exactly as it does everywhere else) -- the caller is asked for it
+# normally, the same as any other fresh request_callback flow.
+async def _pivot_report_offer_to_callback(session: CallSession, report_pending: dict,
+                                           language: str = "bengali"):
+    if not CALLBACKS_ENABLED:
+        session.pending = None
+        await _speak(session, callback_unavailable_reply("disabled", language=language))
+        return
+
+    # Same already-cached get_clinic_info() call the "request_callback"
+    # intent branch below uses -- no new tool, no new network round-trip
+    # pattern (agent/reference_data_cache.py).
+    hours_result = await _tools.get_clinic_info()
+    hours = hours_result.get("hours") if hours_result.get("found") else None
+    availability = check_callback_availability(
+        hours, datetime.date.today().weekday(),
+        datetime.datetime.now().strftime("%H:%M"), CALLBACKS_ENABLED,
+    )
+    if not availability["available"]:
+        session.pending = None
+        await _speak(session, callback_unavailable_reply(availability["reason"], language=language))
+        return
+
+    # Acceptance Criterion 1's "preserving the conversation context and
+    # reason" -- grounded in the ONE real fact already in hand (which
+    # report the caller was just asking about), never a guessed or
+    # generic reason, same discipline build_callback_reason()'s own
+    # docstring holds the fresh-intent path to.
+    slots = {
+        "callback_reason": build_callback_reason(
+            None, active_test=report_pending.get("test_name"),
+        ),
+    }
+    missing = _next_missing_callback(slots)
+    if missing is None:
+        session.pending = {
+            "awaiting": "confirm_callback", "slots": slots, "candidates": None,
+            "offered_date": None, "retries": 0,
+        }
+        await _speak(session, callback_confirmation_prompt(slots, language=language))
+        return
+
+    session.pending = {
+        "awaiting": missing, "slots": slots, "candidates": None,
+        "offered_date": None, "retries": 0,
+    }
+    await _speak(session, missing_slot_prompt("request_callback", missing, language=language))
+
+
 async def _resolve_comparable_entity(name: str) -> dict:
     """ADDED BY SOURAV -- "Caller asks the agent to compare two options"
     story. agent/llm.py deliberately never classifies whether a caller-
@@ -1487,10 +1559,23 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         "which_report"     -- RULE 13, caller has more than one report and
                                was asked which; pending carries "flow" and
                                the remembered "candidates" list.
-        "confirm_delivery" -- the "shall I send it to your phone?" offer
-                               after a report_status lookup found a
-                               READY + delivery-enabled report (RULE 4);
-                               pending carries "report_number" and "phone".
+        "confirm_delivery" -- the "shall I send it to your phone, or would
+                               you prefer a callback?" offer after a
+                               report_status lookup found a READY +
+                               delivery-enabled report (RULE 4); pending
+                               carries "report_number", "test_name" and
+                               "phone". ADDED BY SOURAV -- KCD-383: a
+                               caller who answers with a callback
+                               preference instead of yes/no is routed into
+                               the request_callback flow by
+                               _pivot_report_offer_to_callback() (see that
+                               function's own docstring above), via
+                               looks_like_callback_preference(), checked
+                               the same way looks_like_otp_disclosure_
+                               request() is below -- only after
+                               is_affirmative()/is_negative() have already
+                               failed on the same utterance, so a plain
+                               "হ্যাঁ"/"না" is never misrouted.
         "otp_code"         -- RULE 4-9, waiting for the caller to speak
                                back the OTP just sent; pending carries
                                "report_number" and "phone". A caller who
@@ -1957,11 +2042,19 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             session.pending = None
             await _speak(session, delivery_declined_reply(language=language))
             return True
+        # ADDED BY SOURAV -- KCD-383: checked only AFTER is_affirmative()/
+        # is_negative() have already failed on this same utterance (same
+        # ordering guarantee looks_like_otp_disclosure_request() below
+        # follows), so an unambiguous "হ্যাঁ"/"না" is never misrouted by a
+        # stray word -- see agent/slot_parse.py's own docstring.
+        if looks_like_callback_preference(text):
+            await _pivot_report_offer_to_callback(session, pending, language=language)
+            return True
         pending["retries"] += 1
         if pending["retries"] > 2:
             session.pending = None
             return False
-        await _speak(session, "রিপোর্টটা কি আপনার ফোনে পাঠাব?")
+        await _speak(session, "রিপোর্টটা কি আপনার ফোনে পাঠাব, নাকি কল ব্যাক করব?")
         return True
 
     if awaiting == "otp_code":
@@ -2186,6 +2279,16 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             elif intent == "doctor_availability":
                 result = await _tools.get_doctor_availability(
                     chosen["name"], date_iso or datetime.date.today().isoformat())
+            elif intent == "doctor_schedule":
+                # ADDED BY SOURAV -- KCD-385. Without this explicit case,
+                # a caller who answers "did you mean Dr X or Dr Y?" for a
+                # doctor_schedule question fell into the trailing `else`
+                # below and got asked about DEPARTMENTS instead of their
+                # chosen doctor's schedule -- the `else` was written back
+                # when this state only ever served test_rate/doctor_
+                # availability/doctors_by_department, before doctor_
+                # schedule's own near-match wiring existed.
+                result = await _tools.get_doctor_schedule(chosen["name"])
             else:
                 result = await _tools.get_doctors_by_department(chosen["name"], date_iso)
         except ToolCallError as e:
@@ -2218,6 +2321,16 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             if await _speak_fact(session, intent, asked, result,
                                  doctor_availability_reply(asked, result),
                                  offered_date=date_iso):
+                return True
+        elif intent == "doctor_schedule":
+            # ADDED BY SOURAV -- KCD-385. No `offered_date` -- this
+            # intent is deliberately date-free (see doctor_schedule_
+            # reply()'s own docstring), so there is nothing to carry
+            # forward the way test_rate/doctor_availability carry a date
+            # into their own choice states.
+            asked = {"doctor_name": spoken_name}
+            if await _speak_fact(session, intent, asked, result,
+                                 doctor_schedule_reply(asked, result)):
                 return True
         else:
             asked = {"department": spoken_name}
@@ -3025,12 +3138,31 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
         # "n/a" rather than a number when the decoders were not compared --
         # %.2f would raise on None, and printing 0.00 there would be the same
         # lie the sentinel used to tell.
-        _agree = asr_result.decoder_agreement
+        #
+        # FIXED BY SOURAV -- pre-existing bug, unrelated to KCD-379, found
+        # while verifying that story: these four fields were read with a
+        # direct attribute access, unlike agent/confidence.py's own
+        # zone() (called just above), which reads decoder_used and
+        # decoder_agreement off the same asr_result with getattr(...,
+        # None). Any ASR result object that doesn't carry the full
+        # decoder-agreement dataclass shape -- every dispatch-level test's
+        # FakeASRResult in this suite predates that shape and defines only
+        # `.text` -- raised AttributeError here on every real turn,
+        # crashing the turn as "unreachable" (see main_pcm.py's own
+        # try/except around _dispatch_turn_inner) before a single reply
+        # template was ever reached. Defaults mirror agent/asr.py's real
+        # ASRResult dataclass field defaults exactly (decoder_agreement:
+        # None, ctc_words/rnnt_words: 0) so a value actually produced by
+        # the real ASR pipeline is completely unaffected by this change --
+        # only a fixture/object missing the field now degrades gracefully
+        # instead of crashing.
+        _agree = getattr(asr_result, "decoder_agreement", None)
         logger.info("[%s] asr agreement=%s decoder=%s words=%d/%d zone=%s",
                     session.call_id,
                     "n/a" if _agree is None else f"{_agree:.2f}",
-                    asr_result.decoder_used,
-                    asr_result.ctc_words, asr_result.rnnt_words, turn_zone)
+                    getattr(asr_result, "decoder_used", None),
+                    getattr(asr_result, "ctc_words", 0),
+                    getattr(asr_result, "rnnt_words", 0), turn_zone)
         # Structured export for the correlation study. Signal and join key
         # only -- never the transcript. See agent/turn_log.py.
         turn_log.record(session.call_id, session.utt_seq, asr_result, turn_zone,
@@ -3509,7 +3641,28 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                     await _speak(session, missing_slot_prompt(intent, "doctor_name", language=language))
                     return
                 result = await _tools.get_doctor_schedule(slots["doctor_name"])
-                await _speak(session, doctor_schedule_reply(slots, result, language=language))
+                # UPDATED BY SOURAV -- KCD-385 near-match fix. clinic-api's
+                # doctor_schedule() endpoint now resolves the name through
+                # the same _resolve_doctor() ranker doctor_availability
+                # uses (see that endpoint's own docstring), so a loosely
+                # named/misspelled doctor can come back
+                # {"ambiguous": true, "candidates": [...]} instead of a
+                # flat not-found. Before this fix this branch always spoke
+                # straight from `result` (same still-unfixed gap
+                # doctor_availability's own first-turn dispatch just above
+                # has -- flagged there, out of this story's scope): an
+                # ambiguous response has no "found" key at all, so
+                # doctor_schedule_reply() read it as a plain not-found and
+                # told the caller "we don't have a doctor named X" about a
+                # doctor we clearly have candidates for. Routing through
+                # _speak_fact() is what actually speaks the "did you
+                # mean...?" offer and opens the entity_choice pending
+                # state instead -- see _continue_pending's own
+                # "doctor_schedule" case for what happens when the caller
+                # answers it.
+                if await _speak_fact(session, intent, slots, result,
+                                     doctor_schedule_reply(slots, result, language=language)):
+                    return
                 _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "doctors_by_department":

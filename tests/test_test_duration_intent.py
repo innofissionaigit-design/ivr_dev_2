@@ -160,11 +160,30 @@ class _AsyncNoOp:
 
 
 def make_session(pending=None):
+    # UPDATED BY SOURAV -- KCD-391 test cleanup: this stub had fallen
+    # behind the real Session object, the same gap found and documented in
+    # tests/test_doctor_schedule_dispatch.py's own make_session(). main_
+    # pcm.py's _dispatch_turn_inner() reads session.utt_seq and
+    # session.call_state as direct (non-getattr) attribute access purely
+    # to log the turn, before any intent-specific code runs at all, and a
+    # separate confidence/confirm-transcript-zone path reads session.
+    # confirm_attempts -- a bare SimpleNamespace missing any of these
+    # crashed every test in this file with an AttributeError before the
+    # test_duration branch itself was ever reached (masked as "turn
+    # crashed -- answering as unreachable" in the logs). Added here so
+    # this file can finally exercise the dispatch code it was written to
+    # test, instead of always crashing one layer above it. (No
+    # answer_ledger needed here, unlike that doctor_schedule fixture --
+    # this intent's dispatch branch still calls _speak() directly, not
+    # _speak_fact(), so nothing here reads it.)
     return types.SimpleNamespace(
         call_id="test-call-1",
         pending=pending,
         dispatch_lock=asyncio.Lock(),
         send_json=_AsyncNoOp(),
+        utt_seq=1,
+        call_state=None,
+        confirm_attempts=0,
     )
 
 
@@ -178,6 +197,17 @@ class FakeASRResult:
     # the fake utterance is kept in Bengali to match -- language variation
     # itself is covered separately in tests/test_language_detection_dispatch.py.
     text = "টেস্টের সময় জানতে চাই"
+    # UPDATED BY SOURAV -- KCD-391 test cleanup: a bare result with no
+    # decoder-agreement fields reads to agent/confidence.py::zone() as "no
+    # comparison was made", which routes to the CONFIRM zone and speaks a
+    # "did you say X, is that right?" readback instead of ever reaching
+    # intent dispatch. These four fields put it squarely in the PROCEED
+    # zone, matching every other dispatch-level fixture in this suite
+    # (see e.g. tests/test_doctor_schedule_dispatch.py's own FakeASRResult).
+    decoder_used = "ctc"
+    decoder_agreement = 1.0
+    ctc_words = 5
+    rnnt_words = 5
 
 
 class FakeASR:

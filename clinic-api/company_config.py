@@ -63,6 +63,20 @@ OTP_MESSAGING_WEBHOOK_URL = os.environ.get(
     "OTP_MESSAGING_WEBHOOK_URL", "<put your messaging url here>",
 )
 
+# ADDED BY SOURAV -- KCD-384 ("Caller asks for their report to be
+# sent"). Already read directly by clinic-api/report_delivery_config.py,
+# and already called unconditionally by verify_report_otp() every time
+# OTP verification succeeds and a fresh signed link is minted. See that
+# file's own module docstring for why this is a separate setting from
+# OTP_MESSAGING_WEBHOOK_URL above (different credential, different
+# payload shape, possibly a different channel).
+REPORT_LINK_BASE_URL = os.environ.get(
+    "REPORT_LINK_BASE_URL", "<put your public-facing report link domain here>",
+)
+REPORT_DELIVERY_WEBHOOK_URL = os.environ.get(
+    "REPORT_DELIVERY_WEBHOOK_URL", "<put your report delivery provider url here>",
+)
+
 # ---------------------------------------------------------------------
 # NOT YET CALLED ANYWHERE -- Phase 1 reads from the local clinic-api DB
 # only (see module docstring above). Set these, and add the actual call

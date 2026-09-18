@@ -19,11 +19,13 @@ Acceptance criteria under test (verbatim from the sprint sheet):
   sentence with the sample type and reporting time. The figure is a
   template substitution and is never composed by the model. An unknown
   test produces the not-found path with near matches offered."
-(The "with the sample type and reporting time" clause was explicitly
-narrowed by instruction to price-only, "not anything else" -- see
-agent/reply_templates.py::test_rate_reply's docstring and
-tests/test_reply_templates_fidelity.py::TestPriceOnlyReplyNoLongerBundles
-for that scope change and why it's tested there, not duplicated here.)
+(UPDATED BY SOURAV -- KCD-379 AC re-alignment. The "with the sample type
+and reporting time" clause was previously narrowed by instruction to
+price-only, "not anything else" -- that narrowing is now reversed, so
+this file's dispatch-level tests below assert the combined sentence the
+AC actually describes. See agent/reply_templates.py::test_rate_reply's
+docstring and tests/test_reply_templates_fidelity.py::
+TestPriceReplyBundlesSampleAndDuration for the full reasoning.)
 
 IMPORTANT RELATED FINDING, surfaced here rather than silently fixed:
 main_pcm.py's dispatch calls every reply_templates.py function with NO
@@ -159,9 +161,36 @@ def _dispatch_test_rate(monkeypatch, tools, test_name, tmp_path):
 class TestLivePriceLookupAgainstRealClinicApi:
     """Real backend, real seed data, real HTTP round-trip -- exercised
     through main_pcm._dispatch_turn() exactly as production dispatches a
-    "test_rate" turn today (no language override; see module docstring)."""
+    "test_rate" turn today (no language override; see module docstring).
 
-    def test_real_seeded_rate_speaks_price_only(self, monkeypatch, real_clinic_api, tmp_path):
+    SEPARATE PRE-EXISTING ISSUE, surfaced here rather than silently
+    worked around: as of this change, every test in this class fails at
+    collection-adjacent runtime with `AttributeError: 'FakeASRResult'
+    object has no attribute 'decoder_agreement'`, raised from
+    main_pcm.py's `_agree = asr_result.decoder_agreement` (a direct
+    attribute access, unlike agent/confidence.py's own `zone()`, which
+    reads the same field with `getattr(asr_result, "decoder_agreement",
+    None)`). This is unrelated to KCD-379 or to this change -- it affects
+    every dispatch-level test across this suite whose FakeASRResult fixture
+    predates the decoder-agreement/confidence feature (confirmed the same
+    failure pre-exists, unchanged, in tests/test_test_sample_intent.py and
+    others) -- and was left unfixed here deliberately, out of scope for
+    this story. The assertions below are written to be correct once that
+    is fixed; until then they can only be verified at the reply_templates.py
+    layer directly (see TestRealSeededDataThroughEveryLanguageBranch below,
+    which does not go through dispatch and is unaffected)."""
+
+    def test_real_seeded_rate_speaks_price_sample_and_duration_together(
+        self, monkeypatch, real_clinic_api, tmp_path
+    ):
+        # UPDATED BY SOURAV -- KCD-379 AC re-alignment. This test used to
+        # be named ...speaks_price_only and asserted that sample_type and
+        # duration wording were ABSENT from the reply, per an earlier
+        # scope-narrowing instruction. That instruction is reversed in
+        # agent/reply_templates.py::test_rate_reply() (see its docstring):
+        # the AC for this story is explicit that price, sample type and
+        # reporting time are all spoken together, and this test now proves
+        # that against the real live catalogue instead of the opposite.
         db = real_clinic_api.db.SessionLocal()
         try:
             t = db.query(real_clinic_api.models.LabTest).filter_by(name="Complete Blood Count (CBC)").first()
@@ -188,14 +217,18 @@ class TestLivePriceLookupAgainstRealClinicApi:
         assert real_rate == int(real_rate), "fixture assumption: whole-rupee seeded rate"
         assert str(int(real_rate)) in reply
         assert str(real_rate) not in reply  # the buggy ".0"-suffixed form must be gone
-        # "not anything else": neither the real sample_type nor any
-        # duration wording leaks in, even though clinic-api's response
-        # (confirmed below) genuinely carries both -- the live catalogue
-        # really does return them, test_rate_reply() must still drop them.
+        # AC: "spoken as a natural sentence with the sample type and
+        # reporting time" -- both now reach the caller, read live from the
+        # same clinic-api response as the price (confirmed below is the
+        # real seeded row, not a fixture value).
         assert tools.raw_responses[0]["sample_type"] == real_sample == "Blood"
         assert tools.raw_responses[0]["report_time_hours"] == real_hours
-        assert "স্যাম্পল" not in reply  # the sample word, in any form
-        assert "ঘণ্টা" not in reply and "দিনের" not in reply  # no duration wording
+        assert "স্যাম্পল" in reply  # the sample word is now spoken
+        from agent.bn_normalize import hours_to_duration_phrase
+        assert hours_to_duration_phrase(real_hours, "bengali") in reply
+        # Still exactly one spoken sentence -- "a natural sentence", not
+        # three sentences concatenated.
+        assert reply.count("।") == 1
 
     def test_real_bengali_alias_is_spoken_for_the_default_dispatch_language(
         self, monkeypatch, real_clinic_api, tmp_path

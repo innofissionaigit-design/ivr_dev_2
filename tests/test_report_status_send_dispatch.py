@@ -52,6 +52,19 @@ class FakeToolsClient:
         self.get_report_status_response = None
         self.request_report_delivery_response = None
         self.verify_report_otp_response = None
+        # ADDED BY SOURAV -- KCD-383 ("Caller asks whether their report is
+        # ready"): the "confirm_delivery" state's callback pivot
+        # (main_pcm._pivot_report_offer_to_callback) calls this -- the
+        # SAME already-cached call the pre-existing "request_callback"
+        # intent branch uses -- to check clinic hours. Defaults to "open
+        # all day, every day" so every EXISTING test above, which never
+        # exercises this new branch, is unaffected.
+        self.get_clinic_info_response = {
+            "found": True,
+            "hours": {day: {"closed": False, "open": "00:00", "close": "23:59"}
+                      for day in ("monday", "tuesday", "wednesday", "thursday",
+                                  "friday", "saturday", "sunday")},
+        }
 
     async def get_report_status(self, phone, test_name=None):
         self.get_report_status_calls.append((phone, test_name))
@@ -64,6 +77,9 @@ class FakeToolsClient:
     async def verify_report_otp(self, phone, report_number, otp_code):
         self.verify_report_otp_calls.append((phone, report_number, otp_code))
         return self.verify_report_otp_response
+
+    async def get_clinic_info(self):
+        return self.get_clinic_info_response
 
 
 class _AsyncNoOp:
@@ -398,6 +414,77 @@ class TestOfferAndConfirmDelivery:
         })
         continue_pending(session, "হ্যাঁ")
         assert session.pending is None
+
+
+# --------------------------------------------------------------------- #
+# ADDED BY SOURAV -- KCD-383 ("Caller asks whether their report is
+# ready"): the "confirm_delivery" offer now names both delivery and a
+# callback (agent/reply_templates.py's report_status_reply()); these
+# cover the caller choosing the callback branch instead of a plain
+# yes/no, via main_pcm._pivot_report_offer_to_callback(). None of these
+# touch or weaken TestOfferAndConfirmDelivery's existing yes/no coverage
+# above -- that class's own tests are re-run unmodified by this suite as
+# the regression guard for "keep the existing OTP delivery logic intact".
+# --------------------------------------------------------------------- #
+
+class TestConfirmDeliveryOffersCallback:
+    def _pending(self, retries=0):
+        return {"awaiting": "confirm_delivery", "report_number": "RPT-A",
+                "test_name": "CBC", "phone": "9000000001", "retries": retries}
+
+    def test_callback_preference_routes_into_the_callback_flow(self, monkeypatch, env, tmp_path):
+        session = make_session(pending=self._pending())
+        continue_pending(session, "callback korun")
+        assert env.tools.request_report_delivery_calls == []
+        assert session.pending is not None
+        assert session.pending["awaiting"] == "callback_time_window"
+        # Acceptance Criterion 1: the report already being discussed
+        # seeds the reason, never re-asked and never a generic placeholder.
+        assert session.pending["slots"]["callback_reason"] == "Regarding CBC"
+
+    def test_bengali_callback_word_also_routes_into_the_callback_flow(self, monkeypatch, env, tmp_path):
+        session = make_session(pending=self._pending())
+        continue_pending(session, "না, কল ব্যাক করুন")
+        assert env.tools.request_report_delivery_calls == []
+        assert session.pending["awaiting"] == "callback_time_window"
+
+    def test_plain_no_still_declines_without_routing_to_callback(self, monkeypatch, env, tmp_path):
+        # Regression guard: a bare "না" (no callback word at all) must
+        # still take the ORIGINAL, unmodified decline path.
+        session = make_session(pending=self._pending())
+        continue_pending(session, "না")
+        assert session.pending is None
+        assert env.tools.request_report_delivery_calls == []
+
+    def test_plain_yes_still_requests_delivery_without_routing_to_callback(
+        self, monkeypatch, env, tmp_path
+    ):
+        env.tools.request_report_delivery_response = {
+            "success": True, "reason": "OTP_REQUIRED", "masked_phone": "xxxxx01",
+        }
+        session = make_session(pending=self._pending())
+        continue_pending(session, "হ্যাঁ")
+        assert env.tools.request_report_delivery_calls == [("9000000001", "RPT-A")]
+        assert session.pending["awaiting"] == "otp_code"
+
+    def test_callbacks_disabled_speaks_unavailable_and_clears_pending(self, monkeypatch, env, tmp_path):
+        monkeypatch.setattr(main_pcm, "CALLBACKS_ENABLED", False)
+        session = make_session(pending=self._pending())
+        continue_pending(session, "please give me a callback instead")
+        assert session.pending is None
+        assert env.spoken
+
+    def test_outside_clinic_hours_speaks_unavailable_and_clears_pending(self, monkeypatch, env, tmp_path):
+        env.tools.get_clinic_info_response = {
+            "found": True,
+            "hours": {day: {"closed": True, "open": None, "close": None}
+                      for day in ("monday", "tuesday", "wednesday", "thursday",
+                                  "friday", "saturday", "sunday")},
+        }
+        session = make_session(pending=self._pending())
+        continue_pending(session, "call me back please")
+        assert session.pending is None
+        assert env.spoken
 
 
 # --------------------------------------------------------------------- #

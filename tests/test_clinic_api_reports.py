@@ -44,7 +44,13 @@ def real_clinic_api(tmp_path_factory):
     from fastapi.testclient import TestClient
     client = TestClient(clinic_main.app)
 
-    yield types.SimpleNamespace(client=client, db=clinic_db, models=clinic_models)
+    # ADDED BY SOURAV -- KCD-384: exposed so tests can monkeypatch
+    # clinic_main.send_report_link_via_provider (the name main.py's own
+    # `from report_delivery_config import ...` bound into ITS module
+    # globals -- verify_report_otp() resolves that name against `main`'s
+    # own namespace, so patching it there, not on report_delivery_config
+    # itself, is what actually intercepts the call).
+    yield types.SimpleNamespace(client=client, db=clinic_db, models=clinic_models, main=clinic_main)
 
     sys.path.remove(CLINIC_API_DIR)
 
@@ -94,6 +100,39 @@ def seeded_otp_code(real_clinic_api, report_number, used=None):
             real_clinic_api.models.ReportOTP.id.desc(),
         ).first()
         return otp_row.otp_code
+
+
+def create_fresh_ready_report(real_clinic_api, phone, name, report_number,
+                               test_name="Complete Blood Count (CBC)"):
+    """ADDED BY SOURAV -- KCD-384: the delivery-trigger tests below need a
+    READY, delivery_enabled report belonging to a patient nobody else in
+    this file has already used (every seeded 9000000001-9000000011 phone
+    and RPT-1000X/1001X report number is already consumed by another test
+    in this class or TestOtpVerify/TestReportLink above -- reusing one
+    would risk colliding with a concurrent OTP row or a delivery already
+    recorded against it). Mirrors seed.py's own Patient/LabReport
+    construction exactly, just against a brand-new phone/report_number
+    pair instead of the seeded PATIENTS/REPORT_DATA tables."""
+    with real_clinic_api.db.SessionLocal() as db:
+        import datetime as _dt
+        patient = real_clinic_api.models.Patient(name=name, phone=phone)
+        db.add(patient)
+        db.flush()
+        test_row = db.query(real_clinic_api.models.LabTest).filter_by(
+            name=test_name).first()
+        now = _dt.datetime.now()
+        report = real_clinic_api.models.LabReport(
+            report_number=report_number,
+            patient_id=patient.id,
+            lab_test_id=test_row.id,
+            collected_at=now - _dt.timedelta(hours=8),
+            expected_ready_at=now - _dt.timedelta(hours=1),
+            ready_at=now - _dt.timedelta(hours=1),
+            status="READY",
+            delivery_enabled=True,
+        )
+        db.add(report)
+        db.commit()
 
 
 # --------------------------------------------------------------------- #
@@ -477,6 +516,138 @@ class TestReportLink:
             token = delivery.signed_link_token
         r = link(real_clinic_api.client, token)
         assert r == {"valid": True, "report_number": "RPT-10012"}
+
+
+# --------------------------------------------------------------------- #
+# KCD-384 -- signed-link delivery dispatch trigger
+#
+# ADDED BY SOURAV. verify_report_otp() in clinic-api/main.py now calls
+# report_delivery_config.send_report_link_via_provider() unconditionally
+# on every successful OTP verification (see that function's own
+# surrounding comments). These tests cover the three outcomes that call
+# site's try/except is actually designed for: a configured provider that
+# succeeds, no provider configured at all (the honest default in this
+# repo, since REPORT_DELIVERY_WEBHOOK_URL is unset in this test run), and
+# a configured provider that raises -- in every case the OTP-verify HTTP
+# response and the ReportDelivery row's delivery_status must come out
+# identically, because RULE 17 (OTP success != delivery-transport
+# success) means only audit_note is allowed to vary.
+#
+# Patches clinic_main.send_report_link_via_provider, not
+# report_delivery_config.send_report_link_via_provider -- see the
+# real_clinic_api fixture's own comment for why (verify_report_otp()
+# resolves the name against main's module globals, bound there once at
+# import time by `from report_delivery_config import ...`).
+# --------------------------------------------------------------------- #
+
+class TestKcd384ReportLinkDeliveryTrigger:
+    def test_configured_provider_that_succeeds_is_called_with_the_real_link_and_recorded(
+        self, real_clinic_api, monkeypatch,
+    ):
+        phone, report_number = "9000000091", "RPT-90001"
+        create_fresh_ready_report(real_clinic_api, phone, "Test Patient KCD384-A", report_number)
+
+        calls = []
+
+        def fake_send(dest_phone, report_link_url):
+            calls.append((dest_phone, report_link_url))
+            return True
+
+        monkeypatch.setattr(real_clinic_api.main, "send_report_link_via_provider", fake_send)
+
+        request_delivery(real_clinic_api.client, phone, report_number)
+        code = seeded_otp_code(real_clinic_api, report_number, used=False)
+        r = verify_otp(real_clinic_api.client, phone, report_number, code)
+        assert r["success"] is True
+        assert r["reason"] == "DELIVERY_SENT"
+
+        with real_clinic_api.db.SessionLocal() as db:
+            report = db.query(real_clinic_api.models.LabReport).filter_by(
+                report_number=report_number).first()
+            delivery = (
+                db.query(real_clinic_api.models.ReportDelivery)
+                .filter_by(report_id=report.id, delivery_status="SENT")
+                .order_by(real_clinic_api.models.ReportDelivery.created_at.desc())
+                .first()
+            )
+            token = delivery.signed_link_token
+            audit_note = delivery.audit_note
+
+        # Called exactly once, with this patient's real phone and the
+        # actual signed-link URL for the token this verify just minted --
+        # not a placeholder, not some other report's token.
+        assert len(calls) == 1
+        assert calls[0] == (phone, real_clinic_api.main.build_report_link_url(token))
+        assert "dispatched via configured delivery provider" in audit_note
+
+    def test_no_provider_configured_still_succeeds_and_says_so_in_the_audit_trail(
+        self, real_clinic_api,
+    ):
+        # No monkeypatch here -- exercises the REAL
+        # report_delivery_config.send_report_link_via_provider() with
+        # REPORT_DELIVERY_WEBHOOK_URL unset (this test run's actual
+        # environment), i.e. the honest default a fresh clone of this
+        # repo has out of the box.
+        assert not os.environ.get("REPORT_DELIVERY_WEBHOOK_URL")
+
+        phone, report_number = "9000000092", "RPT-90002"
+        create_fresh_ready_report(real_clinic_api, phone, "Test Patient KCD384-B", report_number)
+
+        request_delivery(real_clinic_api.client, phone, report_number)
+        code = seeded_otp_code(real_clinic_api, report_number, used=False)
+        r = verify_otp(real_clinic_api.client, phone, report_number, code)
+        # RULE 17: no delivery provider configured must never surface as
+        # a caller-facing failure -- the caller still hears success.
+        assert r["success"] is True
+        assert r["reason"] == "DELIVERY_SENT"
+
+        with real_clinic_api.db.SessionLocal() as db:
+            report = db.query(real_clinic_api.models.LabReport).filter_by(
+                report_number=report_number).first()
+            delivery = (
+                db.query(real_clinic_api.models.ReportDelivery)
+                .filter_by(report_id=report.id, delivery_status="SENT")
+                .order_by(real_clinic_api.models.ReportDelivery.created_at.desc())
+                .first()
+            )
+            assert delivery.signed_link_token  # still generated and stored
+            assert "No delivery provider configured" in delivery.audit_note
+
+    def test_provider_raising_never_blocks_the_success_response_or_the_delivery_status(
+        self, real_clinic_api, monkeypatch,
+    ):
+        phone, report_number = "9000000093", "RPT-90003"
+        create_fresh_ready_report(real_clinic_api, phone, "Test Patient KCD384-C", report_number)
+
+        def fake_send_that_raises(dest_phone, report_link_url):
+            raise RuntimeError("provider is down")
+
+        monkeypatch.setattr(
+            real_clinic_api.main, "send_report_link_via_provider", fake_send_that_raises,
+        )
+
+        request_delivery(real_clinic_api.client, phone, report_number)
+        code = seeded_otp_code(real_clinic_api, report_number, used=False)
+        r = verify_otp(real_clinic_api.client, phone, report_number, code)
+        assert r["success"] is True
+        assert r["reason"] == "DELIVERY_SENT"
+
+        with real_clinic_api.db.SessionLocal() as db:
+            report = db.query(real_clinic_api.models.LabReport).filter_by(
+                report_number=report_number).first()
+            delivery = (
+                db.query(real_clinic_api.models.ReportDelivery)
+                .filter_by(report_id=report.id)
+                .order_by(real_clinic_api.models.ReportDelivery.created_at.desc())
+                .first()
+            )
+            # The exception must not have rolled back or altered the
+            # already-committed successful delivery row -- still SENT,
+            # still has its token, only the audit_note reflects the
+            # provider failure.
+            assert delivery.delivery_status == "SENT"
+            assert delivery.signed_link_token
+            assert "No delivery provider configured (or the send attempt failed)" in delivery.audit_note
 
 
 if __name__ == "__main__":

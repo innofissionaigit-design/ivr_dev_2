@@ -623,6 +623,22 @@ def _digit_faithful_rate(raw_rate) -> str:
     return text
 
 
+# ADDED BY SOURAV -- KCD-379 AC re-alignment ("Caller asks the price of a
+# test"). Small, private joiner shared by test_rate_reply()'s four language
+# branches so the "how many clauses, what conjunction" logic is written
+# once instead of four times. Not reused elsewhere -- every other reply in
+# this file only ever has one or two clauses to join and writes its own
+# join_word inline; this is the first reply with up to three.
+def _join_clauses(clauses: list[str], language: str) -> str:
+    join_word = _SAMPLE_JOIN_WORD.get(language, _SAMPLE_JOIN_WORD["bengali"])
+    terminal = "।" if language == "bengali" else "."
+    if len(clauses) == 1:
+        sentence = clauses[0]
+    else:
+        sentence = f"{', '.join(clauses[:-1])}, {join_word} {clauses[-1]}"
+    return sentence + terminal
+
+
 def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     """"Caller asks the price of a test" (Epic: Conversation -- Information
     and Enquiry). AC: "The price is read from the live catalogue and
@@ -631,31 +647,53 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
     model. An unknown test produces the not-found path with near matches
     offered."
 
-    SCOPE, per explicit instruction: "only price will be told with a
-    normalize[d] tone for the tests, not anything else." This function
-    used to bundle rate + sample + duration into one sentence (the shape
-    the AC above literally describes); it now speaks ONLY the price, in
-    the same plain, consistent sentence structure across all four
-    languages -- no sample clause, no duration clause. This mirrors the
-    same one-question-one-answer discipline "Caller asks what sample is
-    needed" (sample_type_reply(), below) already established for the
-    sample-only question.
+    ADDED BY SOURAV -- KCD-379 AC re-alignment. An earlier instruction
+    ("only price will be told ... not anything else") narrowed this
+    function to speak ONLY the price -- the sprint sheet's own "Repo
+    Status: Enhance" / "Repo Evidence" note against KCD-379 flagged
+    exactly this gap (test_rate_reply() proven against seeded rates, but
+    not yet matching this AC's literal "with the sample type and
+    reporting time" clause). That narrowing is reversed here: the price,
+    the sample type and the reporting time are once again spoken together,
+    because that is what THIS story's AC asks for, word for word.
 
-    FLAGGED, not silently absorbed: this removes the only caller-visible
-    path that ever spoke bn_normalize.hours_to_duration_phrase()'s output
-    ("Caller asks how long results take", the previous story) -- that
-    function is untouched and still directly unit-tested, but nothing
-    dispatches to it anymore. A dedicated "how long does it take" intent
-    would need to be built for that story's answer to reach a caller
-    again; that is not part of this change. sample_type_reply()'s own
-    intent (test_sample) is unaffected -- it never called this function.
+    NOTHING CHANGED UPSTREAM OF THIS FUNCTION. clinic-api's
+    /api/v1/tests/search response has always carried sample_type and
+    report_time_hours alongside rate_inr for a test_rate lookup (see
+    clinic-api/main.py's _test_reply_dict() and
+    agent/tool_contract.py's REQUIRED_TEST_RATE_KEYS, unchanged), and
+    agent/tools_client.py's get_test_rate() has always returned them
+    untouched in `result`. Only the sentence this function builds from
+    that already-live data changed -- there was no data pipeline gap to
+    fix, only a template that had stopped using two fields it already had.
 
-    Also fixes a real, measured bug found while verifying this story:
-    _spoken_test_name() is now called with `language`, so an English/
-    Hinglish/Banglish caller no longer hears a raw Bengali-script alias
-    glued into their sentence (see that function's docstring for the
-    full story). rate_inr keeps its pre-existing exact-passthrough
-    discipline unchanged (see tests/test_number_fidelity*.py).
+    sample_type_reply() and test_duration_reply() (below) are left exactly
+    as they were: a caller who asks ONLY "what sample do I need" or "how
+    long does it take" -- their own dedicated intents -- still gets a
+    single-topic answer from those, unaffected by this change. This
+    function simply stops discarding the sample/duration fields on the
+    one path this story's AC actually covers (the price question).
+
+    Digit fidelity is unchanged and still the same template-substitution
+    discipline throughout: _digit_faithful_rate() still strips only an
+    exact whole-number ".0" (see its own docstring, above), the model is
+    never shown rate_inr/sample_type/report_time_hours and never composes
+    any of the three clauses -- each is still a plain substitution of a
+    clinic-api field into a fixed sentence shape, exactly as
+    tests/test_number_fidelity*.py and tests/test_fact_provenance.py
+    require.
+
+    Sample type and reporting time are each folded in only when
+    clinic-api actually returned a value for them -- the same
+    never-fabricate-a-missing-field discipline sample_type_reply()'s and
+    test_duration_reply()'s own "malformed row" fallbacks use. A row
+    missing both still gets exactly the price-only sentence this function
+    produced before this change; nothing is invented to fill the gap.
+
+    Also carries forward the earlier real bug fix in this function:
+    _spoken_test_name() is called with `language`, so an English/
+    Hinglish/Banglish caller still never hears a raw Bengali-script alias
+    glued into their sentence.
     """
     if not result.get("found"):
         return _test_not_found_reply(slots, result, language)
@@ -668,17 +706,76 @@ def test_rate_reply(slots: dict, result: dict, language: str = "bengali") -> str
     name = _spoken_test_name(slots, result, language)
     name_has_test = _name_already_says_test(name)
 
-    # Preserve exact rate value in all languages -- price only, nothing else.
+    # ADDED BY SOURAV -- KCD-379 AC re-alignment. Never fabricated: a
+    # sample/duration clause is only built when clinic-api actually
+    # returned that field (see this function's own docstring above).
+    sample = result.get("sample_type")
+    sample_str, sample_plural = _spoken_sample_types(sample, language) if sample else (None, False)
+
+    # report_time_hours is an Integer column in clinic-api/models.py, so
+    # _parse_exact()'s parse_float=str (see agent/tools_client.py) never
+    # touches it -- unlike rate_inr, it always reaches here as a genuine
+    # int over the real live-catalogue path. Coerced defensively anyway,
+    # the same "accepts str/int/float, call sites differ" discipline
+    # _digit_faithful_rate() already applies to rate_inr just above --
+    # hours_to_duration_phrase()'s bucket comparison needs a real number,
+    # and a value that cannot be coerced is treated as though it were
+    # never returned (never fabricate a duration from a malformed field)
+    # rather than crashing the whole reply.
+    raw_hours = result.get("report_time_hours")
+    hours = None
+    if raw_hours is not None:
+        try:
+            hours = int(raw_hours)
+        except (TypeError, ValueError):
+            hours = None
+    duration = hours_to_duration_phrase(hours, language) if hours is not None else None
+
+    # Preserve exact rate value in all languages -- the base clause is
+    # unchanged from the price-only version of this function.
     if language == "english":
-        reply = f"{name} rate is {rate} rupees." if name_has_test else f"{name} test rate is {rate} rupees."
+        base = f"{name} rate is {rate} rupees" if name_has_test else f"{name} test rate is {rate} rupees"
     elif language == "hinglish":
-        reply = f"{name} ka rate {rate} rupaye hai." if name_has_test else f"{name} test ka rate {rate} rupaye hai."
+        base = f"{name} ka rate {rate} rupaye hai" if name_has_test else f"{name} test ka rate {rate} rupaye hai"
     elif language == "banglish":
-        reply = f"{name} rate {rate} taka." if name_has_test else f"{name} test-er rate {rate} taka."
+        base = f"{name} rate {rate} taka" if name_has_test else f"{name} test-er rate {rate} taka"
     else:  # bengali
         # name_has_test checks both scripts -- see _name_already_says_test()
-        reply = f"{name} রেট {rate} টাকা।" if name_has_test else f"{name} টেস্টের রেট {rate} টাকা।"
-    return reply
+        base = f"{name} রেট {rate} টাকা" if name_has_test else f"{name} টেস্টের রেট {rate} টাকা"
+
+    clauses = [base]
+
+    if sample_str:
+        # Same noun construction sample_type_reply() uses for its own
+        # (single-topic) answer -- reused here as an embeddable clause
+        # rather than its own standalone sentence, since `name` was
+        # already introduced by `base` above.
+        if language == "english":
+            noun = f"{sample_str} samples" if sample_plural else f"{_a_or_an(sample_str)} {sample_str} sample"
+            clauses.append(f"you will need to give {noun}")
+        elif language == "hinglish":
+            noun = f"{sample_str} samples" if sample_plural else f"{sample_str} sample"
+            clauses.append(f"{noun} dena hoga")
+        elif language == "banglish":
+            noun = f"{sample_str} samples" if sample_plural else f"{sample_str} sample ta"
+            clauses.append(f"{noun} lagbe")
+        else:  # bengali
+            noun = f"{sample_str} স্যাম্পলগুলো" if sample_plural else f"{sample_str} স্যাম্পলটা"
+            clauses.append(f"{noun} লাগবে")
+
+    if duration:
+        # Same duration phrase test_duration_reply() speaks for its own
+        # (single-topic) answer, folded in as a clause here instead.
+        if language == "english":
+            clauses.append(f"the report will be ready {duration}")
+        elif language == "hinglish":
+            clauses.append(f"report {duration} ready ho jaayegi")
+        elif language == "banglish":
+            clauses.append(f"report {duration} ready hoye jabe")
+        else:  # bengali
+            clauses.append(f"রিপোর্ট {duration} রেডি হয়ে যাবে")
+
+    return _join_clauses(clauses, language)
 
 
 def sample_type_reply(slots: dict, result: dict, language: str = "bengali") -> str:
@@ -1142,6 +1239,32 @@ def doctor_schedule_reply(slots: dict, result: dict, language: str = "bengali") 
     not open a pending state after it -- this intent is purely
     informational. Adding a booking hand-off here would be a reasonable
     follow-up story, not assumed as part of this one.
+
+    NOT built here either (flagged, not silently absorbed): an
+    `ambiguous` clinic-api response (several doctors loosely matched --
+    see clinic-api/main.py::doctor_schedule()'s own docstring) has no
+    branch in this function at all, on purpose. Exactly like
+    doctor_availability_reply() above, that response is intercepted one
+    layer up, before this function is ever called with it, by
+    main.py's _speak_fact()/_offer_near_matches() (see their own
+    docstrings) -- which is what actually speaks the "did you mean...?"
+    offer. If this function is ever handed an ambiguous result directly
+    (e.g. a future call site that forgets to route through
+    _speak_fact), `result.get("found")` is falsy for that shape too, so
+    it degrades to the plain not-found sentence below rather than
+    crashing -- safe, but that call site would still be a bug to fix,
+    not a case this function should learn to render itself.
+
+    ADDED BY SOURAV -- KCD-385 AC: "A doctor who is on leave is reported
+    as such with the return date if known." Checked immediately after
+    the not-found branch and BEFORE the empty-schedule branch below,
+    because clinic-api always sends "schedule": [] for an on-leave
+    doctor too (their normal rows are left in the database, not
+    deleted -- see the endpoint's own docstring) and the two must never
+    be spoken the same way: one is "no fixed days, ask at the counter,"
+    the other is "temporarily away, back on this date" (or "back at some
+    point, no date given yet" -- the return date is never guessed at
+    when clinic-api sends None for it).
     """
     if not result.get("found"):
         if language == "english":
@@ -1154,6 +1277,26 @@ def doctor_schedule_reply(slots: dict, result: dict, language: str = "bengali") 
             return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার আমাদের এখানে নেই।"
 
     name = _spoken_doctor_name(slots, result, language=language)
+
+    if result.get("on_leave"):
+        return_date = result.get("leave_return_date")
+        if language == "english":
+            if return_date:
+                return f"{name} is currently on leave and is expected back on {return_date}."
+            return f"{name} is currently on leave. We don't have a return date yet -- please check at our counter."
+        elif language == "hinglish":
+            if return_date:
+                return f"{name} abhi leave par hain, {return_date} ko wapas aayenge."
+            return f"{name} abhi leave par hain. Wapas aane ki date abhi pata nahi -- hamare counter mein check kar sakte ho."
+        elif language == "banglish":
+            if return_date:
+                return f"{name} ekhon leave-e achen, {return_date} tarikh-e phirbe."
+            return f"{name} ekhon leave-e achen. Phirbe kobe seta ekhono jana nei -- amader counter-e khoj nite paren."
+        else:  # bengali
+            if return_date:
+                return f"{name} এখন ছুটিতে আছেন, {return_date} তারিখে ফিরবেন।"
+            return f"{name} এখন ছুটিতে আছেন। কবে ফিরবেন সেটা এখনো জানা নেই -- আমাদের কাউন্টারে খোঁজ নিতে পারেন।"
+
     schedule = result.get("schedule") or []
 
     if not schedule:
@@ -1521,9 +1664,22 @@ def report_status_reply(result: dict, language: str = "bengali") -> str:
     per models.py's own docstring ("NO clinical value is read aloud
     under this story") -- there is nothing here that COULD leak one.
 
-    Only offers delivery (appends the offer question) when the report is
-    READY *and* delivery_enabled -- Patient I (READY, delivery_enabled
-    False) hears the true status but is never asked if they want it sent.
+    Only offers delivery/callback (appends the offer question) when the
+    report is READY *and* delivery_enabled -- Patient I (READY,
+    delivery_enabled False) hears the true status but is never asked if
+    they want it sent.
+
+    ADDED BY SOURAV -- KCD-383 ("Caller asks whether their report is
+    ready"): the offer now names BOTH options the AC requires -- delivery
+    to the registered phone, or a callback -- rather than delivery alone.
+    This never promises the callback will happen on any particular
+    schedule (that promise, if the caller takes this option, is made
+    honestly by callback_confirmation_prompt()/callback_scheduled_reply()
+    once agent.callback_flow.check_callback_availability() has actually
+    confirmed the clinic can take it -- see main.py's
+    _pivot_report_offer_to_callback(), the "confirm_delivery" pending
+    state's handler for a caller who answers this question with a
+    callback preference instead of yes/no).
     """
     test_name = result.get("test_name", "")
     status = result.get("status")
@@ -1532,16 +1688,17 @@ def report_status_reply(result: dict, language: str = "bengali") -> str:
         if result.get("delivery_enabled"):
             if language == "english":
                 return (f"Good news -- your {test_name} report is ready. "
-                        f"Would you like me to send it to your registered phone?")
+                        f"Would you like me to send it to your registered phone, "
+                        f"or would you prefer a callback instead?")
             elif language == "hinglish":
                 return (f"Achi khabar -- aapka {test_name} report ready hai. "
-                        f"Kya aapke registered phone pe bhej doon?")
+                        f"Kya aapke registered phone pe bhej doon, ya callback prefer karenge?")
             elif language == "banglish":
                 return (f"Bhalo khobor -- apnar {test_name} report ready hoye geche. "
-                        f"Apnar registered phone e pathiye debo?")
+                        f"Apnar registered phone e pathiye debo, na callback pochondo korben?")
             else:  # bengali
                 return (f"সুখবর -- আপনার {test_name} রিপোর্ট তৈরি হয়ে গেছে। "
-                        f"আপনার নিবন্ধিত ফোনে পাঠিয়ে দেব?")
+                        f"আপনার নিবন্ধিত ফোনে পাঠিয়ে দেব, নাকি কল ব্যাক পছন্দ করবেন?")
         # READY but delivery_enabled is False (Patient I) -- true status,
         # no offer, and no explanation of WHY (that is an internal flag,
         # not something a caller-facing reply should describe -- see
@@ -1663,52 +1820,83 @@ def otp_verify_reply(result: dict, language: str = "bengali") -> str:
         else:  # bengali
             return f"আপনার রিপোর্ট নিরাপদে পাঠানো হয়েছে। লিংকটা {minutes} মিনিটের মধ্যে মেয়াদ শেষ হয়ে যাবে।"
 
+    # ADDED BY SOURAV -- KCD-384 ("Caller asks for their report to be
+    # sent") AC: "a failed verification offers collection in person."
+    # Every branch below is a FAILED verification in the sense the AC
+    # means (the caller did not end up with a delivered report this
+    # turn) -- OTP_INVALID/OTP_EXPIRED/OTP_ALREADY_USED still leave a
+    # retry open (a fresh OTP, or trying again), so the in-person offer
+    # is appended as an ALTERNATIVE, never a replacement for that retry
+    # path; OTP_MAX_ATTEMPTS is the one true dead end for this OTP (RULE
+    # 8 -- the row itself can never be verified again), so it is offered
+    # there most directly. Reuses the exact "collect it in person from
+    # the clinic" wording report_status_reply()/delivery_blocked_reply()
+    # already established, per language, rather than inventing new
+    # phrasing for the same fallback.
     if reason == "OTP_INVALID":
         if language == "english":
-            return "That OTP doesn't match. Please check your phone and tell me the OTP again."
+            return ("That OTP doesn't match. Please check your phone and tell me the OTP again, "
+                     "or you can collect the report in person from the clinic instead.")
         elif language == "hinglish":
-            return "Yeh OTP match nahi kar raha. Phone check karke dobara OTP bataiye."
+            return ("Yeh OTP match nahi kar raha. Phone check karke dobara OTP bataiye, "
+                     "ya chahen toh clinic se khud collect kar lein.")
         elif language == "banglish":
-            return "Ei OTP ta mile na. Phone check kore abar OTP ta bolun."
+            return ("Ei OTP ta mile na. Phone check kore abar OTP ta bolun, "
+                     "na hoy clinic theke nijei collect korte paren.")
         else:  # bengali
-            return "এই ওটিপিটা মিলছে না। ফোন দেখে আবার ওটিপিটা বলুন।"
+            return ("এই ওটিপিটা মিলছে না। ফোন দেখে আবার ওটিপিটা বলুন, "
+                     "অথবা চাইলে ক্লিনিক থেকে সশরীরে সংগ্রহ করতে পারেন।")
 
     if reason == "OTP_EXPIRED":
         if language == "english":
-            return "That OTP has expired. Let me know if you'd still like the report sent, and I'll send a new one."
+            return ("That OTP has expired. Let me know if you'd still like the report sent and I'll "
+                     "send a new one, or you can collect it in person from the clinic.")
         elif language == "hinglish":
-            return "Yeh OTP expire ho gaya hai. Agar abhi bhi report chahiye toh bataiye, naya OTP bhej dunga."
+            return ("Yeh OTP expire ho gaya hai. Agar abhi bhi report chahiye toh bataiye, naya OTP "
+                     "bhej dunga, ya clinic se khud collect kar lein.")
         elif language == "banglish":
-            return "Ei OTP ta expire hoye geche. Ekhono report chan ki na bolun, notun OTP pathiye debo."
+            return ("Ei OTP ta expire hoye geche. Ekhono report chan ki na bolun, notun OTP pathiye "
+                     "debo, na hoy clinic theke nijei collect korben.")
         else:  # bengali
-            return "এই ওটিপিটার মেয়াদ শেষ হয়ে গেছে। এখনো রিপোর্ট চান কি না বলুন, নতুন ওটিপি পাঠিয়ে দেব।"
+            return ("এই ওটিপিটার মেয়াদ শেষ হয়ে গেছে। এখনো রিপোর্ট চান কি না বলুন, নতুন ওটিপি "
+                     "পাঠিয়ে দেব, অথবা ক্লিনিক থেকে সশরীরে সংগ্রহ করতে পারেন।")
 
     if reason == "OTP_ALREADY_USED":
         if language == "english":
-            return "That OTP has already been used. Please ask me to send the report again if you need a new one."
+            return ("That OTP has already been used. Please ask me to send the report again if you "
+                     "need a new one, or you can collect it in person from the clinic.")
         elif language == "hinglish":
-            return "Yeh OTP pehle hi use ho chuka hai. Naya chahiye toh dobara report bhejne ko boliye."
+            return ("Yeh OTP pehle hi use ho chuka hai. Naya chahiye toh dobara report bhejne ko "
+                     "boliye, ya clinic se khud collect kar lein.")
         elif language == "banglish":
-            return "Ei OTP ta age e use hoye geche. Notun lagle abar report pathate bolun."
+            return ("Ei OTP ta age e use hoye geche. Notun lagle abar report pathate bolun, "
+                     "na hoy clinic theke nijei collect korben.")
         else:  # bengali
-            return "এই ওটিপিটা আগেই ব্যবহার হয়ে গেছে। নতুন লাগলে আবার রিপোর্ট পাঠাতে বলুন।"
+            return ("এই ওটিপিটা আগেই ব্যবহার হয়ে গেছে। নতুন লাগলে আবার রিপোর্ট পাঠাতে বলুন, "
+                     "অথবা ক্লিনিক থেকে সশরীরে সংগ্রহ করতে পারেন।")
 
     if reason == "OTP_MAX_ATTEMPTS":
         # RULE 8: locked out. Never reveals the correct value, and
         # explicitly points to a fresh flow rather than repeating the
         # same OTP prompt (which would be pointless -- the row is dead).
+        # This is the one branch where the AC's in-person offer matters
+        # most: this specific OTP can genuinely never be verified again.
         if language == "english":
             return ("You've entered the wrong OTP too many times, so I can't verify it right now. "
-                     "Please ask me to send the report again to get a new OTP.")
+                     "Please ask me to send the report again to get a new OTP, or you can collect "
+                     "it in person from the clinic.")
         elif language == "hinglish":
             return ("Bahut baar galat OTP diya gaya hai, isliye abhi verify nahi kar sakte. "
-                     "Naya OTP ke liye dobara report bhejne ko boliye.")
+                     "Naya OTP ke liye dobara report bhejne ko boliye, ya clinic se khud collect "
+                     "kar lein.")
         elif language == "banglish":
             return ("Onek bar bhul OTP deoya hoyeche, tai ekhon verify kora jabe na. "
-                     "Notun OTP er jonno abar report pathate bolun.")
+                     "Notun OTP er jonno abar report pathate bolun, na hoy clinic theke nijei "
+                     "collect korben.")
         else:  # bengali
             return ("অনেকবার ভুল ওটিপি দেওয়া হয়েছে, তাই এখন যাচাই করা যাচ্ছে না। "
-                     "নতুন ওটিপির জন্য আবার রিপোর্ট পাঠাতে বলুন।")
+                     "নতুন ওটিপির জন্য আবার রিপোর্ট পাঠাতে বলুন, অথবা ক্লিনিক থেকে সশরীরে "
+                     "সংগ্রহ করতে পারেন।")
 
     if reason == "OTP_NOT_REQUESTED":
         if language == "english":

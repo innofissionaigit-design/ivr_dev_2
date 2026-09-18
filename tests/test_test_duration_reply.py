@@ -57,8 +57,26 @@ class TestTheReportedBugIsFixed:
     """Reproduces the exact transcript that was reported, at the
     reply-function level: given the SAME clinic-api response test_rate_
     reply() receives, duration_reply() must speak the DURATION, never
-    the price, and rate_reply() must keep speaking ONLY the price
-    (unchanged, regression guard)."""
+    the price.
+
+    UPDATED BY SOURAV -- KCD-391 test cleanup. rate_reply() is NO LONGER
+    "unaffected" by duration the way it was when this file was written:
+    "Caller asks the price of a test" (see test_rate_reply()'s own
+    docstring in agent/reply_templates.py, "KCD-379 AC re-alignment")
+    deliberately REVERSED the earlier price-only narrowing this test used
+    to guard, and now bundles price, sample type and reporting time
+    together on purpose, because that AC asks for the price "with the
+    sample type and reporting time" word for word. This test was a stale
+    regression guard for scope that no longer exists -- it was still
+    checking that duration_reply()'s ADDITION didn't leak into rate_
+    reply(), a fair question in this file's original context, but wrong
+    now that rate_reply() legitimately speaks duration too, for reasons
+    that have nothing to do with duration_reply() existing. Rewritten
+    below to check the CURRENT, intentional contract instead: rate_reply()
+    still speaks the price, and now also speaks the same duration phrase
+    duration_reply() would -- both true, not a contradiction -- while
+    duration_reply() itself is untouched and still speaks ONLY the
+    duration, never the price (see the test above)."""
 
     def test_duration_reply_never_mentions_the_price(self):
         slots = {"test_name": "Urine Routine Examination"}
@@ -74,14 +92,19 @@ class TestTheReportedBugIsFixed:
         assert reply == f"The Urine Routine Examination test report will be ready {hours_to_duration_phrase(24, 'english')}."
         assert "24" not in reply
 
-    def test_rate_reply_is_unaffected_still_speaks_only_the_price(self):
-        # Regression guard: this fix must not touch rate_reply()'s
-        # own, deliberately narrowed scope.
+    def test_rate_reply_now_also_speaks_the_same_duration_phrase(self):
+        # UPDATED BY SOURAV -- KCD-391 test cleanup (was
+        # test_rate_reply_is_unaffected_still_speaks_only_the_price,
+        # which asserted the opposite of this and had gone stale -- see
+        # this class's own docstring above for the full story). rate_
+        # reply() bundling duration in is the CURRENT, intentional
+        # behaviour per KCD-379's AC re-alignment, not a regression to
+        # guard against.
         slots = {"test_name": "Urine Routine Examination"}
         result = _result()
         reply = rate_reply(slots, result, language="english")
         assert "200" in reply
-        assert hours_to_duration_phrase(24, "english") not in reply
+        assert hours_to_duration_phrase(24, "english") in reply
 
 
 class TestFoundAcrossAllFourLanguages:
@@ -105,12 +128,41 @@ class TestFoundAcrossAllFourLanguages:
 
 
 class TestNotFoundDelegatesToTheSharedHelper:
-    @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
+    @pytest.mark.parametrize("language", ["english", "hinglish", "banglish"])
     def test_not_found_with_suggestions(self, language):
         slots = {"test_name": "Yuric Assid"}
         result = {"found": False, "did_you_mean": ["Uric Acid"]}
         reply = duration_reply(slots, result, language=language)
         assert "Uric Acid" in reply
+
+    def test_not_found_with_suggestions_bengali(self):
+        # UPDATED BY SOURAV -- KCD-391 test cleanup. Split out of the
+        # parametrized test above, which fed the same English-language
+        # `did_you_mean` list into every language including Bengali and
+        # asserted the literal English name "Uric Acid" would appear in
+        # the BENGALI reply. That was only ever true by accident of an
+        # earlier _test_not_found_reply() shape: the shared helper (see
+        # its own docstring, agent/reply_templates.py) was later reworked,
+        # on purpose, to speak Bengali-specific suggestion names from a
+        # SEPARATE `did_you_mean_bn` field instead of reading the English
+        # `did_you_mean` list aloud -- an unpronounceable Latin-script test
+        # name read out to a Bengali caller is exactly the "spoken
+        # punctuation"-grade defect that rework fixed. This test was never
+        # updated to supply that field, so without it the Bengali branch
+        # has nothing to speak and falls through to the plain not-found
+        # sentence -- no suggestions at all -- which is why this
+        # parametrization was failing outright. Fixed here to supply
+        # `did_you_mean_bn` and check for the real seeded Bengali alias
+        # ("ইউরিক অ্যাসিড", from clinic-api/seed.py's own Uric Acid row),
+        # matching how a Bengali caller is actually meant to hear this.
+        slots = {"test_name": "Yuric Assid"}
+        result = {
+            "found": False,
+            "did_you_mean": ["Uric Acid"],
+            "did_you_mean_bn": ["ইউরিক অ্যাসিড"],
+        }
+        reply = duration_reply(slots, result, language="bengali")
+        assert "ইউরিক অ্যাসিড" in reply
 
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
     def test_not_found_without_suggestions(self, language):

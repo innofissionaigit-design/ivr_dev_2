@@ -64,19 +64,22 @@ class TestReplyTemplateValuePreservation:
             reply = rate_reply(slots, result)
             assert str(rate) in reply, f"Rate {rate} should be preserved in reply"
 
-    def test_test_rate_reply_speaks_price_only_not_duration(self):
+    def test_test_rate_reply_speaks_price_sample_and_duration_together(self):
         """"Caller asks the price of a test" (Conversation: Information
-        and Enquiry). Per explicit instruction narrowing this story's
-        scope ("only price will be told ... not anything else"),
-        test_rate_reply() no longer bundles report_time_hours (or
-        sample_type) into its reply at all -- it used to, back when
-        "Caller asks how long results take" added the natural-duration
-        phrasing here (see git history / TEST_REPORT_report_time_natural_
-        duration.md); this test replaces that story's now-stale assertion
-        that the duration phrase WAS present. bn_normalize.hours_to_
-        duration_phrase() itself is untouched and still directly unit-
-        tested below (TestReportTimeIsANaturalDuration) -- it simply has
-        no caller-visible call site anymore after this change."""
+        and Enquiry). ADDED BY SOURAV -- KCD-379 AC re-alignment.
+
+        This test used to assert the opposite of what it asserts now: an
+        earlier instruction ("only price will be told ... not anything
+        else") had narrowed test_rate_reply() to speak the price alone,
+        and this test locked that in. The sprint sheet's own AC for this
+        story is explicit and literal -- "spoken as a natural sentence
+        with the sample type and reporting time" -- so that narrowing has
+        been reversed in test_rate_reply() itself (see its docstring), and
+        this test now locks in the AC's actual wording instead: price,
+        sample type and reporting time all reach the caller from one
+        price question, via bn_normalize.hours_to_duration_phrase() (still
+        untouched, still directly unit-tested below in
+        TestReportTimeIsANaturalDuration) and _spoken_sample_types()."""
         slots = {"test_name": "CBC"}
         result = {
             "found": True,
@@ -89,12 +92,8 @@ class TestReplyTemplateValuePreservation:
 
         reply = rate_reply(slots, result)
         assert "850" in reply
-        assert hours_to_duration_phrase(4, "bengali") not in reply
-        # The raw hour figure must not be read out as a number either --
-        # "4" only legitimately appears here as part of "850" it does not
-        # (it doesn't), so a direct absence check is safe and exact.
-        assert "4 ঘণ্টা" not in reply
-        assert re.search(r"\b4\b", reply) is None
+        assert hours_to_duration_phrase(4, "bengali") in reply
+        assert "স্যাম্পল" in reply
 
     def test_booking_reply_preserves_confirmation_id(self):
         """Confirmation ID should be preserved exactly."""
@@ -542,42 +541,54 @@ class TestReportTimeIsANaturalDuration:
         hinglish "already says 'test'" guard (reply_templates.py's `if
         "test" in name.lower()`) -- this covers that branch for banglish,
         which is new code this story added (english/hinglish's equivalent
-        branch predates this story and is untouched by this diff)."""
+        branch predates this story and is untouched by this diff).
+
+        UPDATED BY SOURAV -- KCD-379 AC re-alignment: the base clause
+        ("CBC Test rate 850 taka") is unchanged, but it is now followed by
+        a comma and the sample/duration clauses rather than a period, so
+        the substring check below no longer includes the trailing period."""
         slots = {"test_name": "CBC Test"}
         result = {
             "found": True, "test_name": "CBC Test",
             "rate_inr": 850, "sample_type": "Blood", "report_time_hours": 24,
         }
         reply = rate_reply(slots, result, language="banglish")
-        assert "CBC Test rate 850 taka." in reply
+        assert "CBC Test rate 850 taka," in reply
         assert "Test test" not in reply and "test test" not in reply.lower()
 
 
-class TestPriceOnlyReplyNoLongerBundles:
-    """"Caller asks the price of a test" -- explicit scope-narrowing
-    instruction: "only price will be told with a normalize[d] tone for
-    the tests, not anything else." Replaces this file's former
-    TestReportTimeIsANaturalDuration.test_rate_reply_uses_the_duration_
-    phrase_not_a_raw_hour_figure / test_rate_reply_omits_duration_
-    sentence_when_hours_absent, both of which asserted the OPPOSITE of
-    current, intended behaviour and would otherwise be silently wrong."""
+class TestPriceReplyBundlesSampleAndDuration:
+    """"Caller asks the price of a test" -- KCD-379 AC, verbatim: "The
+    price is read from the live catalogue and spoken as a natural
+    sentence with the sample type and reporting time."
+
+    ADDED BY SOURAV -- KCD-379 AC re-alignment. This class replaces
+    TestPriceOnlyReplyNoLongerBundles, which locked in an explicit
+    scope-narrowing instruction ("only price will be told ... not
+    anything else") that predates this story and directly contradicted
+    its AC. That narrowing is reversed in test_rate_reply() itself (see
+    its docstring for the full reasoning); these tests now lock in the
+    AC's own wording instead of the instruction that used to override it."""
 
     _SEEDED_HOURS = [1, 4, 6, 12, 24, 48, 72, 96]
 
     @pytest.mark.parametrize("hours", _SEEDED_HOURS)
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
-    def test_never_speaks_a_duration_phrase_regardless_of_hours_present(self, hours, language):
+    def test_speaks_a_duration_phrase_when_hours_present(self, hours, language):
         slots = {"test_name": "Test"}
         result = {
             "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
             "rate_inr": 999, "sample_type": "Blood", "report_time_hours": hours,
         }
         reply = rate_reply(slots, result, language=language)
-        assert hours_to_duration_phrase(hours, language) not in reply
+        assert hours_to_duration_phrase(hours, language) in reply
         assert "999" in reply
 
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
-    def test_never_speaks_a_duration_phrase_when_hours_absent_either(self, language):
+    def test_omits_the_duration_clause_when_hours_absent_rather_than_fabricating_one(self, language):
+        # Never-fabricate discipline: a malformed/incomplete catalogue row
+        # that has no report_time_hours must not invent a duration -- same
+        # guard test_duration_reply()'s own "missing hours" fallback uses.
         slots = {"test_name": "Test"}
         result = {
             "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
@@ -589,9 +600,8 @@ class TestPriceOnlyReplyNoLongerBundles:
 
     @pytest.mark.parametrize("sample", ["Blood", "Urine", "Cardiac", "Imaging", "Sample (Cervical)"])
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
-    def test_never_speaks_the_sample_clause_either(self, sample, language):
-        # "not anything else" -- confirmed against every real catalogue
-        # sample_type, not just "Blood".
+    def test_speaks_the_sample_clause_when_present(self, sample, language):
+        # Confirmed against every real catalogue sample_type, not just "Blood".
         slots = {"test_name": "Test"}
         result = {
             "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
@@ -599,15 +609,24 @@ class TestPriceOnlyReplyNoLongerBundles:
         }
         reply = rate_reply(slots, result, language=language)
         assert "999" in reply
-        for word in ("sample", "স্যাম্পল", "dena hoga", "dite hobe", "lagbe", "you'll need to give"):
-            assert word.lower() not in reply.lower()
+        assert ("sample" in reply.lower()) or ("স্যাম্পল" in reply)
 
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
-    def test_reply_is_exactly_the_price_sentence_nothing_appended(self, language):
-        # Locks in the "normalized tone" requirement: one short, plain
-        # sentence, not a longer one with clauses silently trimmed out of
-        # it -- guards against a future re-bundling regression more
-        # strongly than substring-absence checks alone.
+    def test_omits_the_sample_clause_when_sample_type_absent_rather_than_fabricating_one(self, language):
+        slots = {"test_name": "Test"}
+        result = {
+            "found": True, "test_name": "Test", "test_name_bn": "টেস্ট",
+            "rate_inr": 999, "report_time_hours": 24,
+        }
+        reply = rate_reply(slots, result, language=language)
+        assert "sample" not in reply.lower() and "স্যাম্পল" not in reply
+
+    @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
+    def test_reply_is_still_one_combined_sentence_not_several(self, language):
+        # "spoken as a natural sentence" -- price, sample and duration are
+        # joined into ONE sentence (comma-separated clauses), not three
+        # separate sentences glued together. Guards against a future
+        # regression that re-splits this back into multiple sentences.
         slots = {"test_name": "CBC"}
         result = {
             "found": True, "test_name": "CBC", "test_name_bn": None,
@@ -615,6 +634,8 @@ class TestPriceOnlyReplyNoLongerBundles:
         }
         reply = rate_reply(slots, result, language=language)
         assert reply.count(".") + reply.count("।") == 1  # exactly one sentence
+        assert "sample" in reply.lower() or "স্যাম্পল" in reply
+        assert hours_to_duration_phrase(6, language) in reply
 
 
 # --------------------------------------------------------------------- #
@@ -797,11 +818,11 @@ class TestSampleTypeReply:
 class TestNoDoubleTestOrSampleWord:
     """User-specified requirement: words like "test" and "sample" must
     never come up twice in a single reply, in any language. Exercised
-    across both reply functions -- test_rate_reply (price only, since
-    "Caller asks the price of a test") and sample_type_reply (sample
-    only) -- for every real catalogue sample_type, plus the "Widal Test"-
-    without-a-Bengali-alias edge case that motivated
-    _name_already_says_test()."""
+    across both reply functions -- test_rate_reply (price, sample type
+    and reporting time together, per KCD-379's AC -- see its own
+    docstring) and sample_type_reply (sample only) -- for every real
+    catalogue sample_type, plus the "Widal Test"-without-a-Bengali-alias
+    edge case that motivated _name_already_says_test()."""
 
     def _assert_no_doubled_word(self, reply: str, word: str):
         lowered = reply.lower()

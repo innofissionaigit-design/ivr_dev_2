@@ -134,9 +134,19 @@ def interpret_report_status_result(result: dict, flow: str, language: str = "ben
     # flow == "report_status": offer, don't send yet (RULE 4 -- OTP/
     # delivery only ever starts after an explicit yes, tracked by
     # AWAITING_CONFIRM_DELIVERY below).
+    #
+    # ADDED BY SOURAV -- KCD-383: "test_name" is carried on the pending
+    # dict (never previously needed here, since only report_status_reply()
+    # above read it) so that a caller who answers this offer with a
+    # callback preference instead of yes/no can be routed into the
+    # request_callback flow with an honest, already-known reason attached
+    # (see main.py's _pivot_report_offer_to_callback(), which reads this
+    # exact key -- never re-asks the caller which report they meant).
     return report_status_reply(result, language), {
         "awaiting": AWAITING_CONFIRM_DELIVERY,
-        "report_number": result["report_number"], "retries": 0,
+        "report_number": result["report_number"],
+        "test_name": result.get("test_name"),
+        "retries": 0,
     }
 
 

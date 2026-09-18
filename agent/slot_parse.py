@@ -495,3 +495,30 @@ _DISCLOSURE_ASK_WORDS = (
 def looks_like_otp_disclosure_request(text: str) -> bool:
     lowered = (text or "").lower()
     return any(w in lowered for w in _OTP_WORDS) and any(w in lowered for w in _DISCLOSURE_ASK_WORDS)
+
+
+# ADDED BY SOURAV -- KCD-383 ("Caller asks whether their report is
+# ready"). main.py/main_pcm.py's "confirm_delivery" pending state now
+# offers BOTH delivery and a callback (agent/reply_templates.py's
+# report_status_reply(), READY+delivery_enabled branch) -- this is the
+# local detector that state's handler uses to notice when the caller's
+# answer names the callback option instead of a plain yes/no, the same
+# "checked only after is_affirmative()/is_negative() have already failed
+# on this same utterance" ordering guarantee looks_like_otp_disclosure_
+# request() above already follows, so an unambiguous "yes"/"না" is never
+# misrouted by a stray word. Substring matching (not an exact-match set
+# like _AFFIRMATIVE/_NEGATIVE) is deliberate here: unlike a bare yes/no,
+# a callback preference is naturally said alongside other words ("না,
+# callback korun", "amake callback din"), so anchoring on the single
+# clearest signal word/phrase is more robust than trying to enumerate
+# every full sentence a caller might use.
+_CALLBACK_WORDS = (
+    "callback", "call back", "call me back", "call us back", "ring me back",
+    "call korun", "call korben", "call koro", "wapas call",
+    "কল ব্যাক", "কলব্যাক", "কল করুন", "কল করবেন",
+)
+
+
+def looks_like_callback_preference(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(w in lowered for w in _CALLBACK_WORDS)

@@ -388,7 +388,14 @@ def _tree() -> ast.Module:
 
 
 FACTUAL_TEMPLATES = {"test_rate_reply", "doctor_availability_reply",
-                     "doctors_by_department_reply"}
+                     "doctors_by_department_reply",
+                     # ADDED BY SOURAV -- KCD-385: doctor_schedule_reply now
+                     # reaches the caller through _speak_fact too (see
+                     # main.py/main_pcm.py's own "UPDATED BY SOURAV --
+                     # KCD-385" comment on the doctor_schedule dispatch
+                     # branch), so it belongs in the same mechanically
+                     # enforced allow-list as the other three factual routes.
+                     "doctor_schedule_reply"}
 
 
 def _calls_to(tree: ast.Module, name: str) -> list[ast.Call]:

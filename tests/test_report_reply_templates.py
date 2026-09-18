@@ -178,6 +178,52 @@ class TestRule2NoClinicalValueEverAppears:
             assert "anemia" not in text.lower()
 
 
+class TestKcd384FailedVerificationOffersInPersonCollection:
+    """ADDED BY SOURAV -- KCD-384 ("Caller asks for their report to be
+    sent") AC: "a failed verification offers collection in person."
+    Before this, only DELIVERY_FAILED (a provider-side send failure
+    AFTER a successful OTP) offered the in-person fallback -- an actual
+    failed OTP VERIFICATION (wrong/expired/reused/locked-out code) never
+    did. These four reasons are exactly that: the caller did not end up
+    with a delivered report on this turn. The "collect" marker below is
+    the same English loanword the codebase already uses for this
+    fallback in hinglish/banglish ("collect kar(o)"/"collect kor(o)"),
+    and "সংগ্রহ" is the established Bengali word for it -- see
+    report_status_reply()'s and delivery_blocked_reply()'s own existing
+    wording, reused verbatim rather than invented fresh here."""
+
+    OTP_FAILURE_REASONS = ("OTP_INVALID", "OTP_EXPIRED", "OTP_ALREADY_USED", "OTP_MAX_ATTEMPTS")
+
+    def test_every_otp_failure_reason_offers_in_person_collection_every_language(self):
+        for reason in self.OTP_FAILURE_REASONS:
+            for lang in LANGUAGES:
+                text = otp_verify_reply({"success": False, "reason": reason}, lang)
+                lowered = text.lower()
+                offers_collection = "collect" in lowered or "সংগ্রহ" in text
+                assert offers_collection, (reason, lang, text)
+
+    def test_max_attempts_lockout_still_never_reveals_the_correct_otp(self):
+        # Regression guard alongside the new wording: RULE 8/9 still hold
+        # -- adding the in-person offer must never smuggle in a mention
+        # of the actual code.
+        for lang in LANGUAGES:
+            text = otp_verify_reply({"success": False, "reason": "OTP_MAX_ATTEMPTS"}, lang)
+            assert "otp_code" not in text.lower()
+
+    def test_unaffected_reasons_are_not_touched_by_this_change(self):
+        # DELIVERY_SENT (success) and OTP_NOT_REQUESTED are not "a failed
+        # verification" in the AC's sense -- neither should have picked
+        # up the in-person offer as a side effect of this change.
+        for lang in LANGUAGES:
+            sent = otp_verify_reply(
+                {"success": True, "reason": "DELIVERY_SENT", "masked_phone": "0001",
+                 "signed_link_expires_minutes": 15}, lang,
+            )
+            assert "collect" not in sent.lower() and "সংগ্রহ" not in sent
+            not_requested = otp_verify_reply({"success": False, "reason": "OTP_NOT_REQUESTED"}, lang)
+            assert "collect" not in not_requested.lower() and "সংগ্রহ" not in not_requested
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

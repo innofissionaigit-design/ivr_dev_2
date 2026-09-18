@@ -609,6 +609,24 @@ _LATIN_SPOKEN_BN = {
     "saliva": "লালা",
     "swab": "সোয়াব",
     "plasma": "প্লাজমা",
+    # ADDED BY SOURAV -- KCD-390 ("Caller asks what sample is needed"). These
+    # three were the actual measured gap: "Imaging", "Cardiac" and "Cervical"
+    # (the _SAMPLE_RENAMES-normalised form of "Sample (Cervical)" -- see
+    # agent/reply_templates.py) are real LabTest.sample_type values on 7
+    # real seeded tests (ECG, TMT, 2D Echocardiography -> Cardiac; Chest
+    # X-Ray, USG Whole Abdomen, USG Pregnancy Profile -> Imaging; Pap Smear
+    # -> Cervical), and none of the three had an entry here, so a Bengali
+    # caller asking what sample any of those 7 tests needs heard the
+    # sentence with the sample word missing entirely -- not a wrong word,
+    # silence (proven by tests/test_reply_templates_fidelity.py::
+    # TestSampleTypeReply::test_bengali_never_produces_silent_latin_script,
+    # which failed for exactly these three before this fix).
+    # Same "how a Kolkata caller actually says the borrowed clinical word"
+    # principle as blood/urine/etc. above, not a literary-Bengali
+    # translation -- see this table's own module comment just above.
+    "imaging": "ইমেজিং",
+    "cardiac": "কার্ডিয়াক",
+    "cervical": "সার্ভিক্যাল",
 }
 
 

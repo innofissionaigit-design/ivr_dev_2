@@ -76,6 +76,12 @@ from models import (
 # generated code actually reaches the patient is a separate, pluggable
 # concern -- see this module's own docstring on the file below.
 from otp_messaging_config import send_otp_via_provider
+# ADDED BY SOURAV -- KCD-384 ("Caller asks for their report to be
+# sent"): how the freshly minted SIGNED LINK actually reaches the
+# patient is its own separate, pluggable concern -- see that file's own
+# module docstring for why this is not just reusing the OTP webhook
+# above.
+from report_delivery_config import build_report_link_url, send_report_link_via_provider
 
 app = FastAPI(title="Kolkata Care Diagnostics -- Clinic Data API (dummy)")
 
@@ -657,19 +663,67 @@ def doctor_schedule(name: str = Query(...), db: Session = Depends(get_db)):
     DoctorSchedule's own docstring). The caller-facing wording is built
     from this list in agent/reply_templates.py::doctor_schedule_reply().
 
+    FIXED BY SOURAV -- KCD-385. This endpoint used to call a function
+    named `_find_doctor`, which does not exist anywhere in this file (it
+    was the pre-refactor name -- every other doctor lookup below was
+    updated to call `_resolve_doctor()` instead, see that function's own
+    docstring, but this one endpoint was missed). Every call here raised
+    a NameError, for every query, found or not. Now resolved the same
+    way doctor_availability() and book_appointment() already do, which
+    also means an unknown/misspelled name now goes through the same
+    near-match ranker they use instead of a flat not-found (see the
+    AMBIGUOUS branch below, and match_band.py's own module docstring for
+    the "Doctor Nobody" incident this ranker exists to fix).
+
     Response shapes:
       found=false: {"found": false, "query": "..."}
-      found=true, doctor has 1+ scheduled weekdays:
+      found=false, ambiguous: {"found": false, "ambiguous": true,
+        "query": "...", "candidates": [{"name", "name_bn"}, ...]} -- see
+        _ambiguous_reply()'s own docstring for why this is its own shape
+        rather than an overloaded found=false.
+      found=true, doctor is currently on leave (ADDED BY SOURAV --
+        KCD-385 AC: "A doctor who is on leave is reported as such with
+        the return date if known."): {"found": true, "doctor_name": "...",
+        "doctor_name_bn": "...", "on_leave": true,
+        "leave_return_date": "YYYY-MM-DD" or null, "schedule": []} --
+        checked and returned BEFORE the DoctorSchedule rows are read at
+        all. Deliberately not read as "schedule": [] plus the caller
+        having to infer why: a doctor's normal recurring rows are left
+        untouched in the database while they are on leave (they resume
+        the same days on return), so without this explicit flag a caller
+        would be told the same "no fixed schedule" sentence a genuinely
+        schedule-less doctor gets, which is not what is actually true
+        here and gives no return date even when one is known.
+      found=true, doctor not on leave, has 1+ scheduled weekdays:
         {"found": true, "doctor_name": "...", "doctor_name_bn": "...",
+         "on_leave": false,
          "schedule": [{"weekday": 0, "start_time": "10:00", "end_time": "12:00"}, ...]}
-      found=true, doctor exists but has ZERO DoctorSchedule rows (a real,
-      honest edge case -- e.g. a doctor on indefinite leave with no
-      chamber days configured at all): "schedule": [] -- the caller-facing
-      reply function must say so plainly rather than fabricating a day.
+      found=true, doctor not on leave but has ZERO DoctorSchedule rows (a
+      real, honest edge case -- a doctor between assignments with no
+      chamber days configured at all, distinct from being on leave):
+      "on_leave": false, "schedule": [] -- the caller-facing reply
+      function must say so plainly rather than fabricating a day.
     """
-    doctor = _find_doctor(db, name)
+    verdict, doctor, offered = _resolve_doctor(db, name)
+    if verdict == match_band.AMBIGUOUS:
+        return _ambiguous_reply(name, offered)
     if not doctor:
         return {"found": False, "query": name}
+
+    # ADDED BY SOURAV -- KCD-385 leave clause, checked before querying
+    # DoctorSchedule at all -- see this function's own docstring above
+    # for why the normal schedule rows are deliberately left alone in
+    # the database and only hidden here, at read time, while the doctor
+    # is away.
+    if doctor.is_on_leave:
+        return {
+            "found": True,
+            "doctor_name": doctor.name,
+            "doctor_name_bn": _first_alias_bn(doctor.aliases_bn),
+            "on_leave": True,
+            "leave_return_date": doctor.leave_return_date,
+            "schedule": [],
+        }
 
     rows = (
         db.query(DoctorSchedule)
@@ -681,6 +735,7 @@ def doctor_schedule(name: str = Query(...), db: Session = Depends(get_db)):
         "found": True,
         "doctor_name": doctor.name,
         "doctor_name_bn": _first_alias_bn(doctor.aliases_bn),
+        "on_leave": False,
         "schedule": [
             {"weekday": r.weekday, "start_time": r.start_time, "end_time": r.end_time}
             for r in rows
@@ -1186,6 +1241,39 @@ def verify_report_otp(req: OtpVerifyRequest, db: Session = Depends(get_db)):
         audit_note="OTP verified; report delivered successfully.",
     )
     db.add(delivery)
+    db.commit()
+
+    # ADDED BY SOURAV -- KCD-384 "expiring signed link" half of the AC.
+    # Before this, a token was minted and stored (and GET /api/v1/reports/
+    # link/{token} correctly validated it) but nothing ever actually
+    # constructed the URL or pushed it to the patient -- the caller was
+    # told "your report has been securely sent" while nothing was sent.
+    # Committed above BEFORE this runs, same "fail safe, not fail open"
+    # ordering as send_otp_via_provider() a few lines up in
+    # request_report_delivery(): a provider hiccup here must never turn a
+    # successful OTP verification into a failure response, only ever be
+    # recorded honestly in this row's own audit_note (the "verification
+    # path" part of the AC's audit-trail requirement) for staff to see --
+    # never spoken to the caller. send_report_link_via_provider() already
+    # promises never to raise on its own, but this call site is still
+    # wrapped in a try/except too -- defense in depth, the same posture
+    # request_report_delivery() already takes around send_otp_via_provider().
+    try:
+        link_sent = send_report_link_via_provider(patient.phone, build_report_link_url(token))
+    except Exception as e:
+        logging.getLogger("clinic-api").error(
+            "send_report_link_via_provider() raised unexpectedly for report %s: %s",
+            report.report_number, e,
+        )
+        link_sent = False
+    delivery.audit_note = (
+        "OTP verified; report delivered successfully. Signed link dispatched via "
+        "configured delivery provider."
+        if link_sent else
+        "OTP verified; report delivered successfully. No delivery provider configured "
+        "(or the send attempt failed) -- signed link generated but not transmitted; "
+        "see signed_link_token on this row for manual delivery."
+    )
     db.commit()
 
     return {

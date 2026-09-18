@@ -1812,6 +1812,43 @@ def seed():
                 doctor_index += 1
 
         # ====================================================
+        # ADDED BY SOURAV -- KCD-385 ("Caller asks when a doctor sits")
+        # AC: "A doctor who is on leave is reported as such with the
+        # return date if known." Two already-seeded doctors are put on
+        # leave here so this path has real data to exercise end to end,
+        # rather than only being provable with a hand-built fixture:
+        #   - Dr. T. Bose (Orthopaedics) has a known return date.
+        #   - Dr. K. Halder (ENT) does not -- covers the AC's own "if
+        #     known" clause honestly (see doctor_schedule_reply()'s
+        #     docstring for why a missing return date is never guessed
+        #     at rather than fabricated).
+        # Neither name is referenced anywhere else in the test suite
+        # (checked before picking them), so this does not collide with
+        # any existing test's expectations.
+        #
+        # Deliberately does NOT touch either doctor's DoctorSchedule
+        # rows above -- see clinic-api/main.py::doctor_schedule()'s
+        # docstring: a doctor's normal recurring schedule is left in the
+        # database while they are away (they will resume the same days
+        # when they return), and it is that ENDPOINT's job to hide it
+        # behind the leave status at read time, not seed.py's job to
+        # delete it.
+        # ====================================================
+        on_leave_with_return_date = (
+            db.query(Doctor).filter_by(name="Dr. T. Bose").first()
+        )
+        on_leave_with_return_date.is_on_leave = True
+        on_leave_with_return_date.leave_return_date = "2026-10-15"
+
+        on_leave_no_return_date = (
+            db.query(Doctor).filter_by(name="Dr. K. Halder").first()
+        )
+        on_leave_no_return_date.is_on_leave = True
+        on_leave_no_return_date.leave_return_date = None
+
+        db.flush()
+
+        # ====================================================
         # SECTION 4
         # LAB TESTS
         #

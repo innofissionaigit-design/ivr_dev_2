@@ -285,6 +285,31 @@ class Doctor(Base):
         cascade="all, delete-orphan",
     )
 
+    # ADDED BY SOURAV -- KCD-385 ("Caller asks when a doctor sits"): a
+    # doctor's leave status is a property of the PERSON, not of any one
+    # weekday row in DoctorSchedule -- it is temporary and independent of
+    # which days they normally sit, and it should not require touching (or
+    # deleting) the real schedule rows to represent. is_on_leave is a plain
+    # flag; leave_return_date is a free-text string (not a Date column --
+    # this table has none in use elsewhere, and the value is only ever
+    # spoken, never computed on) so it can be left null when the return
+    # date genuinely is not known yet, and doctor_schedule_reply() in
+    # agent/reply_templates.py speaks that as "no return date given" rather
+    # than a fabricated one. See clinic-api/main.py's doctor_schedule()
+    # endpoint for how this is read, and seed.py for the two doctors seeded
+    # on leave (one with a known return date, one without) so this path is
+    # provable against real data, not just a hand-built fixture.
+    is_on_leave = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+
+    leave_return_date = Column(
+        String,
+        nullable=True,
+    )
+
 
 # ============================================================================
 # DOCTOR SCHEDULE
