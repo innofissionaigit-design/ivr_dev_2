@@ -18,6 +18,10 @@ from agent.reply_templates import (
     _spoken_sample_types, _name_already_says_test, _a_or_an, _spoken_test_name,
 )
 from agent.bn_normalize import verbalize, hours_to_duration_phrase, unspeakable_spans
+# ADDED BY SOURAV -- KCD-454. See TestNoSpokenPunctuationArtifact's own
+# comment below for why this class now imports the central gate's
+# corpus instead of maintaining a second, independently-drifting one.
+from tests.test_spoken_punctuation import CASES as _GATE_CASES, FORBIDDEN as _GATE_FORBIDDEN
 
 
 class TestReplyTemplateValuePreservation:
@@ -471,6 +475,36 @@ class TestNoSpokenPunctuationArtifact:
     @pytest.mark.parametrize("language", ["bengali", "english", "hinglish", "banglish"])
     def test_booking_correction_prompt_is_clean(self, language):
         self._assert_clean(booking_correction_prompt(language=language), language)
+
+    # ADDED BY SOURAV -- KCD-454. This class was written when
+    # reply_templates.py had roughly a dozen public functions and hand-
+    # covers only those, in three or four languages each. reply_
+    # templates.py has since grown to 45 public functions, and unlike
+    # tests/test_spoken_punctuation.py's central gate -- which has its
+    # OWN mechanical self-check (test_the_gate_covers_every_public_
+    # reply_function()) that fails the build the moment a new public
+    # function has no case -- this class had no such signal at all: it
+    # would go on silently only ever checking the same original dozen
+    # forever, its own staleness invisible as a passing test suite.
+    #
+    # Rather than hand-writing a second full corpus here (33 more
+    # functions, several languages each) that would need updating by
+    # hand every time the central gate's corpus does -- the exact
+    # "two files that look like duplicates aren't automatically in
+    # sync" trap KCD-449's own report flagged -- this reuses the central
+    # gate's (name, reply) pairs directly. Growing reply_templates.py
+    # from here on only ever needs a case added in ONE place (test_
+    # spoken_punctuation.py's _replies()) for both test files to see it,
+    # and if that central gate ever loses coverage of a function, its
+    # own self-check fails first and loudest.
+    @pytest.mark.parametrize("name,reply", _GATE_CASES, ids=[c[0] for c in _GATE_CASES])
+    def test_the_central_gates_cases_are_clean_here_too(self, name, reply):
+        spoken = verbalize(reply)
+        offenders = [ch for ch in _GATE_FORBIDDEN if ch in spoken]
+        assert not offenders, (
+            f"{name}: {offenders} survives verbalize() and would be spoken.\n"
+            f"  spoken: {spoken}"
+        )
 
 
 class TestReportTimeIsANaturalDuration:

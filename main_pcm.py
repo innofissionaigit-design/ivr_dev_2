@@ -878,6 +878,52 @@ async def _speak_fact(session: CallSession, intent: str, slots: dict,
     return False
 
 
+def _record_answer_for_ledger(session: CallSession, intent: str, slots: dict,
+                              result: dict, reply: str) -> str:
+    """The consistency-check-and-annotate half of _speak_fact() above,
+    factored out for _resolve_combinable_intent_fragment() below.
+
+    ADDED BY SOURAV -- KCD-449. A multi-intent turn ("what's the CBC
+    rate, and is Dr Sen in today?") resolves each of its questions
+    through _resolve_combinable_intent_fragment(), never through the
+    solo dispatch branches _speak_fact() already guards -- so a
+    test_rate/doctor_availability/doctors_by_department answer given
+    inside a combined turn was never recorded in the ledger at all, and
+    a repeat of it (asked combined again, or asked plainly on its own
+    afterwards) had nothing to be compared against.
+
+    Deliberately does NOT call _offer_near_matches() the way _speak_fact()
+    does: _resolve_combinable_intent_fragment()'s own docstring is
+    explicit that a multi-intent turn never opens a follow-up pending
+    state of any kind, near-match "did you mean" offers included -- this
+    keeps that guarantee exactly as narrow as it already was. An
+    ambiguous result inside a combined turn still gets whatever
+    _resolve_combinable_intent_fragment() already rendered for it (a
+    separate, pre-existing limitation of that path, not something this
+    consistency fix should touch); AnswerLedger.check() already refuses
+    to record an ambiguous result on its own (see its own docstring), so
+    nothing here needs to duplicate that guard either.
+
+    Takes `reply` pre-rendered, exactly like _speak_fact(), and returns it
+    -- annotated with the change notice when the verdict is CHANGED --
+    for the caller to fold into its own joined multi-fragment sentence.
+    Never speaks anything itself.
+    """
+    verdict, previous = session.answer_ledger.check(intent, slots, result)
+
+    if verdict != answer_ledger.FIRST:
+        _consistency["repeats"] += 1
+        _consistency[verdict] += 1
+
+    if verdict == answer_ledger.CHANGED:
+        logger.warning("[%s] %s answer changed within the call (combined turn): %s -> %s",
+                       session.call_id, intent, previous,
+                       answer_ledger.facts(intent, result))
+        reply = with_change_notice(reply)
+
+    return reply
+
+
 async def _slice_utterance(session: CallSession, start_s: float, end_s: float, seq: int) -> str:
     """Cuts [start_s, end_s+pad] -- both ABSOLUTE call-time offsets -- out
     of the call's decoded WAV into its own small file for ASR."""
@@ -1924,7 +1970,7 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # docstring; every intent agent/state.py can ever produce an
         # ambiguous_kind for is one _resolve_combinable_intent_fragment
         # already knows how to answer.
-        reply = await _resolve_combinable_intent_fragment(pending["intent"], resolved_slots, language)
+        reply = await _resolve_combinable_intent_fragment(session, pending["intent"], resolved_slots, language)
         if reply:
             await _speak(session, reply)
         return True
@@ -3471,7 +3517,22 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                     await _speak(session, missing_slot_prompt(intent, "test_name", language=language))
                     return
                 result = await _tools.get_test_rate(slots["test_name"])
-                await _speak(session, test_rate_reply(slots, result, language=language))
+                # FIXED BY SOURAV -- KCD-449. This was the one ordinary,
+                # plain-single-question dispatch path for test_rate that
+                # spoke straight from _speak(), never touching the answer
+                # ledger at all -- see agent/answer_ledger.py's own module
+                # docstring and tests/test_answer_consistency.py's
+                # AST-based safeguard, which fails the build on exactly
+                # this shape of miss (a route that forgot the gate).
+                # Every OTHER test_rate call site (the near-match retry,
+                # the multi-part single-utterance path) already routed
+                # through _speak_fact(); this plain path is also the
+                # single most common way a caller ever asks this question,
+                # so it was also the one most likely to be asked twice
+                # with nothing recorded to compare the second time against.
+                if await _speak_fact(session, intent, slots, result,
+                                     test_rate_reply(slots, result, language=language)):
+                    return
                 _remember_primary_entity(session, intent, slots, result)
 
             elif intent == "test_sample":
@@ -3697,7 +3758,23 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 # instead of "not today, but they're on Tuesdays" etc.
                 date_iso = slots.get("date") or datetime.date.today().isoformat()
                 result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
-                await _speak(session, doctor_availability_reply(slots, result, language=language))
+                # FIXED BY SOURAV -- KCD-449. Same miss as test_rate just
+                # above: this plain single-question path spoke straight
+                # from _speak(), bypassing the answer ledger entirely,
+                # while every OTHER doctor_availability call site (the
+                # near-match retry, the "date" follow-up, the multi-part
+                # single-utterance path) already used _speak_fact().
+                # offered_date is threaded through exactly as those other
+                # call sites do, so a later disambiguation is compared
+                # against the same day this turn asked about. A True
+                # return means _speak_fact() already spoke a "did you
+                # mean...?" offer and opened its OWN pending state for it
+                # -- return immediately, before the "keep the flow open
+                # for booking" logic below would otherwise clobber it.
+                if await _speak_fact(session, intent, slots, result,
+                                     doctor_availability_reply(slots, result, language=language),
+                                     offered_date=date_iso):
+                    return
                 _remember_primary_entity(session, intent, slots, result)
 
                 # Keep the flow open for "yes, book that day" / "another
@@ -3745,18 +3822,24 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 # named/misspelled doctor can come back
                 # {"ambiguous": true, "candidates": [...]} instead of a
                 # flat not-found. Before this fix this branch always spoke
-                # straight from `result` (same still-unfixed gap
-                # doctor_availability's own first-turn dispatch just above
-                # has -- flagged there, out of this story's scope): an
-                # ambiguous response has no "found" key at all, so
-                # doctor_schedule_reply() read it as a plain not-found and
-                # told the caller "we don't have a doctor named X" about a
-                # doctor we clearly have candidates for. Routing through
-                # _speak_fact() is what actually speaks the "did you
-                # mean...?" offer and opens the entity_choice pending
-                # state instead -- see _continue_pending's own
-                # "doctor_schedule" case for what happens when the caller
-                # answers it.
+                # straight from `result`: an ambiguous response has no
+                # "found" key at all, so doctor_schedule_reply() read it
+                # as a plain not-found and told the caller "we don't have
+                # a doctor named X" about a doctor we clearly have
+                # candidates for. Routing through _speak_fact() is what
+                # actually speaks the "did you mean...?" offer and opens
+                # the entity_choice pending state instead -- see
+                # _continue_pending's own "doctor_schedule" case for what
+                # happens when the caller answers it.
+                #
+                # UPDATE -- KCD-449: doctor_availability's own first-turn
+                # dispatch just above had this identical ambiguous-
+                # response gap (it spoke straight from `result` the same
+                # way, unwrapped) until it was wrapped in _speak_fact()
+                # too, as part of wiring it into the answer-consistency
+                # ledger -- see that branch's own "FIXED BY SOURAV --
+                # KCD-449" comment. That gap is closed now, as a side
+                # effect of this story's fix, not merely flagged.
                 if await _speak_fact(session, intent, slots, result,
                                      doctor_schedule_reply(slots, result, language=language)):
                     return
@@ -3775,7 +3858,21 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 # bypasses this (used as-is below).
                 date_iso = slots.get("date") or datetime.date.today().isoformat()
                 result = await _tools.get_doctors_by_department(slots["department"], date_iso)
-                await _speak(session, doctors_by_department_reply(slots, result, language=language))
+                # FIXED BY SOURAV -- KCD-449. Same miss as test_rate and
+                # doctor_availability above: this plain single-question
+                # path spoke straight from _speak(), bypassing the answer
+                # ledger entirely. Routed through _speak_fact() the same
+                # way every other doctors_by_department call site already
+                # is, with offered_date threaded through so a later
+                # disambiguation compares against the same day this turn
+                # asked about. A True return means an offer was already
+                # spoken and its own pending state opened -- return
+                # immediately, before the "continue straight into
+                # booking" logic below would otherwise clobber it.
+                if await _speak_fact(session, intent, slots, result,
+                                     doctors_by_department_reply(slots, result, language=language),
+                                     offered_date=date_iso):
+                    return
 
                 # Continue straight into booking: offer the doctors just
                 # listed as candidates, so the caller's very next utterance
@@ -3973,11 +4070,19 @@ _MULTI_INTENT_NEEDS_SEPARATE_FLOW = {"book_appointment", "report_status", "repor
 _MULTI_INTENT_NO_FRAGMENT = {"smalltalk", "unclear"}
 
 
-async def _resolve_combinable_intent_fragment(intent: str, slots: dict, language: str) -> str | None:
+async def _resolve_combinable_intent_fragment(session: CallSession, intent: str, slots: dict, language: str) -> str | None:
     """ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
     Resolves ONE intent (one entry of a multi-question turn's "intents"
     array) into its own spoken fragment for _dispatch_multi_intent_turn()
     below to join with the others, in order.
+
+    UPDATED BY SOURAV -- KCD-449. Takes `session` now, purely to reach
+    session.answer_ledger: the three ledgered intents (test_rate,
+    doctor_availability, doctors_by_department) route their fragment
+    through _record_answer_for_ledger() below before returning it -- see
+    that function's own docstring for why this path needed its own,
+    narrower version of what _speak_fact() does for the solo dispatch
+    branches.
 
     Returns None ONLY for "smalltalk"/"unclear" -- see
     _MULTI_INTENT_NO_FRAGMENT above: neither is really a second QUESTION
@@ -4034,7 +4139,10 @@ async def _resolve_combinable_intent_fragment(intent: str, slots: dict, language
         if not slots.get("test_name"):
             return multi_intent_missing_info_reply(language=language)
         result = await _tools.get_test_rate(slots["test_name"])
-        return test_rate_reply(slots, result, language=language)
+        # FIXED BY SOURAV -- KCD-449. See _record_answer_for_ledger()'s
+        # own docstring.
+        return _record_answer_for_ledger(session, intent, slots, result,
+                                         test_rate_reply(slots, result, language=language))
 
     if intent == "test_sample":
         if not slots.get("test_name"):
@@ -4084,7 +4192,10 @@ async def _resolve_combinable_intent_fragment(intent: str, slots: dict, language
             return multi_intent_missing_info_reply(language=language)
         date_iso = slots.get("date") or datetime.date.today().isoformat()
         result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
-        return doctor_availability_reply(slots, result, language=language)
+        # FIXED BY SOURAV -- KCD-449. See _record_answer_for_ledger()'s
+        # own docstring.
+        return _record_answer_for_ledger(session, intent, slots, result,
+                                         doctor_availability_reply(slots, result, language=language))
 
     if intent == "doctor_schedule":
         if not slots.get("doctor_name"):
@@ -4097,7 +4208,10 @@ async def _resolve_combinable_intent_fragment(intent: str, slots: dict, language
             return multi_intent_missing_info_reply(language=language)
         date_iso = slots.get("date") or datetime.date.today().isoformat()
         result = await _tools.get_doctors_by_department(slots["department"], date_iso)
-        return doctors_by_department_reply(slots, result, language=language)
+        # FIXED BY SOURAV -- KCD-449. See _record_answer_for_ledger()'s
+        # own docstring.
+        return _record_answer_for_ledger(session, intent, slots, result,
+                                         doctors_by_department_reply(slots, result, language=language))
 
     if intent == "health_package":
         if slots.get("package_name"):
@@ -4199,7 +4313,7 @@ async def _dispatch_multi_intent_turn(session: CallSession, intents_list: list[d
         intent = item.get("intent")
         slots = item.get("slots") or {}
         try:
-            fragment = await _resolve_combinable_intent_fragment(intent, slots, language)
+            fragment = await _resolve_combinable_intent_fragment(session, intent, slots, language)
         except ToolCallError as e:
             logger.error("[%s] clinic API call failed for intent %s (multi-intent turn): %s",
                          session.call_id, intent, e)

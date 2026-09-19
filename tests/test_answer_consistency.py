@@ -445,3 +445,128 @@ def test_every_factual_route_still_goes_through_the_gate():
             f"_speak_fact at line {call.lineno} is not passed a freshly "
             f"rendered reply template -- this is the property "
             f"tests/test_fact_provenance.py exempts the wrapper on")
+
+
+# ------------------------------------- the second route: combined turns
+#
+# ADDED BY SOURAV -- KCD-449. "What's the CBC rate, and is Dr Sen in
+# today?" answers two of this story's three ledgered questions inside ONE
+# turn, through _resolve_combinable_intent_fragment() and
+# _record_answer_for_ledger() in main.py, never through _speak_fact().
+# Everything above this point exercises only the solo dispatch route; a
+# consistency check that only ever ran on _speak_fact() would leave a
+# combined turn's answers completely unrecorded, invisible to every test
+# above, and invisible to test_no_factual_reply_reaches_speak_directly's
+# own AST walk (that test looks for a bare _speak() call, and this route
+# never calls _speak() itself -- its caller joins the fragments and
+# speaks them together).
+
+def test_the_combined_turn_path_is_consistent_too(call):
+    """The criterion test above, exercised through the second route
+    instead of the first: three renders of the same combined-turn
+    fragment, unchanged backend, identical facts each time."""
+    session, _ = call
+    slots = {"test_name": "ইউরিক অ্যাসিড"}
+
+    fragments = [
+        main._record_answer_for_ledger(session, "test_rate", slots, ALIASED,
+                                       rate_reply(slots, ALIASED))
+        for _ in range(3)
+    ]
+
+    assert fragments[0] == fragments[1] == fragments[2]
+    assert not any(_changed(f) for f in fragments)
+
+
+def test_a_combined_turn_still_announces_a_genuine_change(call):
+    """The other half: a fact that actually moves between two combined-
+    turn askings is still announced, exactly as it would be on the solo
+    path."""
+    session, _ = call
+    slots = {"doctor_name": "সেন"}
+
+    first = main._record_answer_for_ledger(
+        session, "doctor_availability", slots, IN_CHAMBER,
+        doctor_availability_reply(slots, IN_CHAMBER))
+    changed_result = dict(IN_CHAMBER, available=False, next_available_date="2026-09-16")
+    second = main._record_answer_for_ledger(
+        session, "doctor_availability", slots, changed_result,
+        doctor_availability_reply(slots, changed_result))
+
+    assert not _changed(first)
+    assert _changed(second)
+    assert main._consistency == {"repeats": 1, answer_ledger.SAME: 0,
+                                 answer_ledger.CHANGED: 1}
+
+
+def test_one_question_is_one_question_whichever_route_asks_it(call):
+    """The ledger has no notion of "which code path asked" -- an identity
+    key is an identity key, so _speak_fact() (the solo path) and
+    _record_answer_for_ledger() (the combined-turn path) must read from
+    and write into the very same table. A caller who asks about a
+    department plainly, then asks about it again folded into a combined
+    turn, still gets caught on a genuine change -- and the reverse order
+    works exactly the same way."""
+    session, said = call
+    slots = {"department": "হৃদরোগ"}
+
+    solo = _ask(session, said, "doctors_by_department", slots, DEPARTMENT,
+                doctors_by_department_reply)
+    changed_result = dict(DEPARTMENT, doctors=[{"name": "Dr. A Sen", "doctor_name_bn": "সেন"}])
+    combined = main._record_answer_for_ledger(
+        session, "doctors_by_department", slots, changed_result,
+        doctors_by_department_reply(slots, changed_result))
+
+    assert not _changed(solo)
+    assert _changed(combined), (
+        "a roster change made through the combined-turn path was not "
+        "recognised as a repeat of the solo-path question")
+
+
+def test_no_factual_reply_bypasses_the_ledger_in_a_combined_turn():
+    """The combined-turn counterpart of
+    test_no_factual_reply_reaches_speak_directly above.
+
+    _resolve_combinable_intent_fragment() never calls _speak() itself, so
+    that test's own pattern -- walking the file for a bare _speak() call
+    -- cannot see this function at all; a regression here would be
+    completely invisible to the safeguard that already exists. This walks
+    _resolve_combinable_intent_fragment()'s own `return` statements
+    instead: a ledgered template's rendered result must be wrapped in
+    _record_answer_for_ledger() before it leaves this function, or a
+    combined turn's answer is unrecorded and never compared against a
+    repeat -- same failure as the solo path, just on the route the other
+    safeguard cannot reach.
+
+    Deliberately narrower than FACTUAL_TEMPLATES above: doctor_schedule_
+    reply() is intentionally NOT wrapped in _record_answer_for_ledger()
+    here, because "doctor_schedule" is not one of
+    answer_ledger.LEDGERED_INTENTS at all (see that module's own docstring
+    -- this story's ledger only ever covers test_rate, doctor_availability
+    and doctors_by_department) and _resolve_combinable_intent_fragment()
+    never opens a near-match "did you mean" offer for ANY intent, ledgered
+    or not, so there is nothing for doctor_schedule to be wrapped in on
+    this path.
+    """
+    fn = None
+    for node in ast.walk(_tree()):
+        if (isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "_resolve_combinable_intent_fragment"):
+            fn = node
+            break
+    assert fn is not None, "_resolve_combinable_intent_fragment not found in main.py"
+
+    ledgered_templates = {"test_rate_reply", "doctor_availability_reply",
+                          "doctors_by_department_reply"}
+
+    offenders = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Call):
+            returned = node.value
+            if isinstance(returned.func, ast.Name) and returned.func.id in ledgered_templates:
+                offenders.append((node.lineno, returned.func.id))
+
+    assert not offenders, (
+        "factual reply returned from the combined-turn path without the "
+        f"consistency check at {offenders} -- wrap in _record_answer_for_ledger"
+    )
