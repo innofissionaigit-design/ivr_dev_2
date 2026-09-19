@@ -370,10 +370,19 @@ class TestIdentifierVerbalization:
     """Test that identifiers (confirmation IDs, phone numbers) are digit-faithful."""
 
     def test_confirmation_ids(self):
-        """Confirmation IDs should be spelled out character by character."""
-        assert spell_out("KCD-4471") == "কে সি ডি চার চার সাত এক"
-        assert spell_out("KCD-1234") == "কে সি ডি এক দুই তিন চার"
-        assert spell_out("KCD-9876") == "কে সি ডি নয় আট সাত ছয়"
+        """Confirmation IDs should be spelled out character by character.
+
+        UPDATED BY SOURAV -- KCD-445 test cleanup. These assertions predate
+        spell_out()'s grouping contract ("Figures are spoken at a pace a
+        caller can write down" -- see spell_out()'s own docstring in
+        agent/bn_normalize.py): it now joins the letters group and the
+        digits group with GROUP_SEPARATOR, a deliberate pacing comma, not a
+        flat run of words. The digits and letters themselves are unchanged
+        and still in the original order; only the separator was missing
+        from these expectations."""
+        assert spell_out("KCD-4471") == f"কে সি ডি{GROUP_SEPARATOR} চার চার সাত এক"
+        assert spell_out("KCD-1234") == f"কে সি ডি{GROUP_SEPARATOR} এক দুই তিন চার"
+        assert spell_out("KCD-9876") == f"কে সি ডি{GROUP_SEPARATOR} নয় আট সাত ছয়"
 
     def test_phone_numbers(self):
         """Phone numbers should be read digit by digit."""
@@ -394,11 +403,16 @@ class TestFullVerbalizationPipeline:
         assert "650" not in result
 
     def test_confirmation_id_in_template(self):
-        """A confirmation ID in a template should be spelled out."""
+        """A confirmation ID in a template should be spelled out.
+
+        UPDATED BY SOURAV -- KCD-445 test cleanup. Same stale-grouping issue
+        as TestIdentifierVerbalization.test_confirmation_ids just above:
+        spell_out()'s output is comma-grouped now, so the expected substring
+        needs the same separator."""
         template = "কনফার্মেশন নম্বর: KCD-4471।"
         result = verbalize(template)
-        # Should be spelled out character by character
-        assert "কে সি ডি চার চার সাত এক" in result
+        # Should be spelled out character by character, in groups
+        assert f"কে সি ডি{GROUP_SEPARATOR} চার চার সাত এক" in result
         # Original ID should not appear as is
         assert "KCD-4471" not in result
 

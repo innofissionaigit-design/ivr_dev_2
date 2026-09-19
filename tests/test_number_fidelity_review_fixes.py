@@ -45,7 +45,7 @@ import random
 import pytest
 
 from agent.reply_templates import test_rate_reply as rate_reply, booking_reply
-from agent.bn_normalize import verbalize, number_to_bn_words, digits_one_by_one
+from agent.bn_normalize import verbalize, number_to_bn_words, digits_one_by_one, GROUP_SEPARATOR
 from agent.tools_client import _parse_exact
 
 
@@ -163,7 +163,22 @@ class TestConfirmationIdCorpus:
 
     def test_short_confirmation_id_still_works(self):
         """Existing single-group IDs (e.g. 'KCD-4471') must keep working
-        exactly as before -- this fix must not narrow what already matched."""
+        exactly as before -- this fix must not narrow what already matched.
+
+        UPDATED BY SOURAV -- KCD-445 test cleanup. This assertion was written
+        against spell_out()'s OLD flat-string contract (one run of words, no
+        separator). spell_out() was later, deliberately, changed to GROUP its
+        output -- see its own docstring in agent/bn_normalize.py, "Figures
+        are spoken at a pace a caller can write down" -- joining the letters
+        group and the digits group with GROUP_SEPARATOR (", ") so a caller
+        gets a breath between them. That is a real, intentional change to
+        what gets spoken, not a regression: the digits and letters
+        themselves are unchanged and still in order, only a pacing comma was
+        inserted between the two groups. This test was never updated for it,
+        so the old no-comma string could never be found in the (now comma-
+        separated) spoken output. Fixed to check for the current, grouped
+        contract instead, the same way test_a_confirmation_id_is_spoken_in_
+        full() in tests/test_number_fidelity.py already does."""
         result = {
             "success": True,
             "doctor_name_bn": "সেন",
@@ -173,7 +188,7 @@ class TestConfirmationIdCorpus:
         }
         reply = booking_reply({}, result)
         spoken = verbalize(reply)
-        assert "কে সি ডি চার চার সাত এক" in spoken
+        assert f"কে সি ডি{GROUP_SEPARATOR} চার চার সাত এক" in spoken
 
 
 def _random_currency_samples(n: int, seed: int) -> list[str]:

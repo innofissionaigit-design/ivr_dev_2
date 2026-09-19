@@ -572,7 +572,35 @@ _RE_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b(\s*তারিখে?)?")
 _RE_TIME_RANGE = re.compile(r"\b(\d{1,2}):(\d{2})\s*[-–—to]{1,2}\s*(\d{1,2}):(\d{2})\b")
 _RE_TIME = re.compile(r"\b(\d{1,2}):(\d{2})\b")
 _RE_PHONE = re.compile(r"\b(\d{10,})\b")
-_RE_CONF_ID = re.compile(r"\b([A-Z]{2,}[-]?\d{3,})\b")
+# FIXED BY SOURAV -- KCD-445 ("Numbers are never rounded, reordered or
+# approximated"). This pattern only ever matched the FIRST hyphen group of
+# an identifier. That was invisible while every real confirmation ID was
+# shaped like "KCD-4471" -- one letters group, one digits group, nothing
+# after it. clinic-api/main.py's real generator produces a THREE-part id,
+# f"KCD-{date}-{uuid.uuid4().hex[:4].upper()}" (see
+# test_the_generated_id_format_is_the_one_being_tested), and the old
+# pattern stopped at "KCD-20260911", leaving "-4A2F" outside the match
+# entirely. What happened to that leftover piece then depended on chance:
+#   - a hex group containing a letter (~85% of real ids, since the suffix
+#     is 4 random hex characters) was left as raw, untranslated Latin
+#     script sitting inside an otherwise-Bengali sentence -- caught by
+#     agent/speakability.py as blocked, but SPEAKABILITY_ENFORCE defaults
+#     off, so the garbled reply was still spoken.
+#   - an all-digit group (the remaining ~15%, e.g. "0031", "0000") fell
+#     through to the bare-integer sweep below and was read as a ROUNDED
+#     NUMBER WORD with its leading zeros silently dropped ("0031" ->
+#     "thirty-one") -- valid, fluent Bengali, and therefore never once
+#     caught by the speakability gate, whether or not enforcement is on.
+# The fix: capture one optional trailing "-<alphanumeric>" group as part
+# of the SAME identifier, so the whole three-part id reaches spell_out()
+# together (which already groups and speaks it correctly, character by
+# character, per its own docstring) instead of splitting the tail off to
+# be guessed at separately. The trailing group still requires a leading
+# digit run of 3+ (unchanged), so a bare uppercase word with no digits at
+# all -- "CBC", "ECG", "DEADBEEF", "ABCDEF" -- still never matches this
+# pattern in the first place; see
+# test_an_ordinary_uppercase_word_is_not_mistaken_for_an_identifier.
+_RE_CONF_ID = re.compile(r"\b([A-Z]{2,}[-]?\d{3,}(?:-[A-Z0-9]{2,})?)\b")
 _RE_DECIMAL = re.compile(r"\b(\d+)\.(\d+)\b")
 _RE_INT = re.compile(r"\d+")
 
