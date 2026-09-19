@@ -3103,6 +3103,31 @@ def callback_confirmation_prompt(slots: dict, language: str = "bengali") -> str:
         return f"একটু কনফার্ম করে নিই, আমরা আপনাকে {phone} নম্বরে {window}-এর মধ্যে কল ব্যাক করব। ঠিক আছে তো?"
 
 
+# ADDED BY SOURAV -- KCD-448 ("Every critical value is read back before it
+# is used"). Asked when the caller rejects callback_confirmation_prompt()
+# above. Acceptance criterion, same wording booking_correction_prompt()
+# above already satisfies for book_appointment: "a rejection opens a
+# correction path rather than repeating the prompt."
+#
+# Before this, a "না" here abandoned the whole callback outright ("ঠিক
+# আছে, তাহলে থাক") -- not even a repeat of the prompt, but the literal
+# stronger failure the AC calls out: one misheard digit in either of only
+# two fields threw away both and made the caller redial and give both
+# again. This is the DIFFERENT question (which of the two is wrong?) that
+# closes that gap, mirroring booking_correction_prompt()'s own menu but
+# scoped to the two fields a callback request actually has.
+def callback_correction_prompt(language: str = "bengali") -> str:
+    """Same four languages as callback_confirmation_prompt() above."""
+    if language == "english":
+        return "No problem -- which one should I fix, the phone number or the time?"
+    elif language == "hinglish":
+        return "Koi baat nahi -- kya theek karna hai, phone number ya time?"
+    elif language == "banglish":
+        return "Kono problem nei -- ki thik korte hobe, phone number na ki time?"
+    else:  # bengali
+        return "ঠিক আছে, কোনটা ঠিক করে দেব - ফোন নম্বর, নাকি সময়?"
+
+
 def callback_scheduled_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     """Spoken after request_callback() actually persists the row (main.py's
     _finish_callback(), only once missing_callback_write_fields() has

@@ -138,6 +138,9 @@ from agent.reply_templates import (
     # agent/callback_flow.py's module docstring and each function's own
     # docstring for when these are spoken.
     callback_unavailable_reply, callback_confirmation_prompt, callback_scheduled_reply,
+    # ADDED BY SOURAV -- KCD-448 correction path for request_callback, same
+    # discipline as booking_correction_prompt above.
+    callback_correction_prompt,
 )
 from agent.compare_flow import build_comparison
 # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
@@ -161,6 +164,9 @@ from agent.semantic_cache import SemanticCache, embed as _embed_probe
 from agent.slot_parse import (
     parse_date, parse_time, parse_phone, is_affirmative, is_negative,
     parse_correction_field,
+    # ADDED BY SOURAV -- KCD-448 correction path for request_callback, same
+    # discipline as parse_correction_field above.
+    parse_callback_correction_field,
     # ADDED BY SOURAV -- report_status/report_send combined story: OTP entry
     # is parsed deterministically here, never sent to the LLM or the
     # semantic cache (see agent/slot_parse.py's parse_otp() docstring and
@@ -1102,13 +1108,22 @@ async def _finish_booking(session: CallSession, slots: dict, *, confirmed: bool 
         # Not an error the caller caused -- most likely a new code path that
         # skipped the readback. Log it loudly, then do the safe thing rather
         # than the convenient one: ask, and write only if they say yes.
+        #
+        # FIXED BY SOURAV -- KCD-448. This still called the older, Bengali-
+        # only booking_confirm_prompt(slots), unchanged since before
+        # booking_confirmation_prompt() (the 4-language readback this story
+        # built) existed. A caller reaching this rare defensive branch in
+        # English/Hinglish/Banglish would have been asked to confirm their
+        # own booking in Bengali. `language` is already a parameter here
+        # (see this function's own docstring) -- this branch just never
+        # used it.
         logger.error("[%s] booking reached _finish_booking unconfirmed -- "
                      "refusing the write and asking the caller", session.call_id)
         session.pending = {
             "awaiting": "confirm_booking", "slots": slots,
             "candidates": None, "offered_date": slots.get("date"), "retries": 0,
         }
-        await _speak(session, booking_confirm_prompt(slots))
+        await _speak(session, booking_confirmation_prompt(slots, language=language))
         return
 
     session.pending = None
@@ -1965,10 +1980,28 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         if is_affirmative(text):
             await _finish_callback(session, pending["slots"], language=language)
             return True
+
         if is_negative(text):
-            session.pending = None
-            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            # story title: Every critical value is read back before it is used
+            # acceptance criteria: Phone numbers, dates, times and names are
+            #   confirmed aloud before any write, and a rejection opens a
+            #   correction path rather than repeating the prompt. Readback is
+            #   mandatory regardless of confidence for values that affect a
+            #   write.
+            #
+            # FIXED BY SOURAV -- KCD-448. This used to abandon the whole
+            # callback outright here ("ঠিক আছে, তাহলে থাক") -- not even a
+            # repeat of the prompt, the stronger failure the AC names: one
+            # misheard digit in either of only two fields threw both away,
+            # and the caller had to redial and give both again. Same
+            # correction-path discipline "confirm_booking" above already
+            # has: ask WHICH of the two values is wrong, keep the other one,
+            # and re-collect only the disputed field.
+            pending["awaiting"] = "confirm_callback_correction"
+            pending["retries"] = 0
+            await _speak(session, callback_correction_prompt(language=language))
             return True
+
         # Neither a clear yes nor a clear no -- bounded retries of the
         # SAME confirmation, same posture as "confirm_booking" above.
         pending["retries"] += 1
@@ -1976,6 +2009,50 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             session.pending = None
             return False
         await _speak(session, callback_confirmation_prompt(pending["slots"], language=language))
+        return True
+
+    # story title: Every critical value is read back before it is used
+    # acceptance criteria: ...a rejection opens a correction path rather
+    #   than repeating the prompt.
+    #
+    # ADDED BY SOURAV -- KCD-448. This turn is the caller's answer to
+    # callback_correction_prompt() above: which of the two callback values
+    # is wrong. Mirrors "confirm_correction" above field for field --
+    # re-collecting ONE field and returning to the readback is what makes
+    # this a correction rather than a restart, and a caller saying "না"
+    # here is not naming a field (the agent has already listed both
+    # options), so, like "confirm_correction" above, this state is
+    # deliberately NOT covered by the universal "না" escape hatch further
+    # down; it is its own abandon instead.
+    if awaiting == "confirm_callback_correction":
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+
+        field = parse_callback_correction_field(text)
+        if field is None:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                logger.info("[%s] callback correction abandoned -- no field named",
+                            session.call_id)
+                await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+                return True
+            await _speak(session, callback_correction_prompt(language=language))
+            return True
+
+        logger.info("[%s] correcting callback %s", session.call_id, field)
+        # The disputed value is cleared, not merely left to be overwritten --
+        # a stale, known-wrong value has no business sitting in slots while
+        # it is being re-collected. "callback_phone" is the awaiting STATE
+        # name (see parse_callback_correction_field's own docstring); the
+        # slots dict itself still keys the value as plain "phone".
+        slot_key = "phone" if field == "callback_phone" else field
+        pending["slots"].pop(slot_key, None)
+        pending["awaiting"] = field
+        pending["retries"] = 0
+        await _speak(session, missing_slot_prompt("request_callback", field, language=language))
         return True
 
     if awaiting == "which_report":
@@ -2219,6 +2296,15 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             return True
 
         logger.info("[%s] correcting %s", session.call_id, field)
+        # FIXED BY SOURAV -- KCD-448 test cleanup. The disputed value used
+        # to be left sitting in pending["slots"] until overwritten by the
+        # caller's next answer -- harmless in practice (nothing reads it
+        # while `awaiting` is pointed at re-collecting it), but a value
+        # already known to be wrong has no business surviving in the
+        # confirmed data even briefly. Cleared here instead, matching
+        # test_naming_phone_reenters_phone_collection_with_others_kept's
+        # own expectation.
+        pending["slots"].pop(field, None)
         pending["awaiting"] = field
         pending["retries"] = 0
         await _speak(session, missing_slot_prompt("book_appointment", field, language=language))
@@ -3057,12 +3143,23 @@ async def _answer_part(session: CallSession, text: str, part: dict) -> str:
                 # from a single sentence of phone audio is where a
                 # mishearing is likeliest and least visible. Route it
                 # through the same confirmation state as the slow path.
+                #
+                # FIXED BY SOURAV -- KCD-448. This called the older,
+                # Bengali-only booking_confirm_prompt(merged), the same
+                # staleness fixed in _finish_booking's own defensive branch
+                # (see that function's comment) -- _answer_part() has no
+                # `language` parameter of its own (this whole multi-part-
+                # turn path predates the language-detection work; see the
+                # module-level detect_language import comment), but `text`
+                # -- this part's own utterance -- is right here, so it is
+                # detected locally rather than left Bengali-only.
                 session.pending = {
                     "awaiting": "confirm_booking", "slots": merged,
                     "candidates": None,
                     "offered_date": merged.get("date"), "retries": 0,
                 }
-                await _speak(session, booking_confirm_prompt(merged))
+                await _speak(session, booking_confirmation_prompt(
+                    merged, language=detect_language(text)))
                 return INTERACTIVE
 
             session.pending = {

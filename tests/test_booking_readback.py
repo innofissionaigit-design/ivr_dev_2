@@ -93,8 +93,14 @@ def wired(monkeypatch):
     is observable without one ever happening."""
     written: list[dict] = []
 
-    async def _finish(session, slots, *, confirmed=False):
-        written.append({"slots": dict(slots), "confirmed": confirmed})
+    async def _finish(session, slots, *, confirmed=False, language="bengali"):
+        # UPDATED BY SOURAV -- KCD-448 test cleanup. `language` is a real
+        # keyword _continue_pending now passes on every call (see the
+        # module-level detect_language import comment in main.py) -- this
+        # stub's signature had not caught up, so every call to the real
+        # _finish_booking() raised TypeError before this spy ever recorded
+        # anything.
+        written.append({"slots": dict(slots), "confirmed": confirmed, "language": language})
         session.pending = None
 
     monkeypatch.setattr(main, "_speak", _say)
@@ -221,7 +227,14 @@ def test_a_corrected_booking_is_read_back_in_full_again(wired):
     assert session.pending["awaiting"] == "confirm_booking"
     assert session.pending["slots"]["phone"] == "9123456789", "the new value"
     assert session.pending["slots"]["date"] == FULL["date"], "the others are intact"
-    assert session.said[-1] == booking_confirm_prompt(session.pending["slots"])
+    # UPDATED BY SOURAV -- KCD-448 test cleanup. This compared against the
+    # older, Bengali-only booking_confirm_prompt(), which the round-trip's
+    # actual call site (_continue_pending's tail, see main.py) no longer
+    # calls -- it was moved onto the newer, 4-language
+    # booking_confirmation_prompt() when that function was built for this
+    # same story. The all-Bengali-digits final turn detects as "bengali".
+    assert session.said[-1] == booking_confirmation_prompt(
+        session.pending["slots"], language="bengali")
 
     _turn(session, "হ্যাঁ")
     assert len(wired) == 1 and wired[0]["slots"]["phone"] == "9123456789"
@@ -525,11 +538,27 @@ class _AsyncNoOp:
 
 
 def make_session(pending=None):
+    # UPDATED BY SOURAV -- KCD-448 test cleanup. This stub had fallen behind
+    # the real Session object, same gap fixed for the same reason in
+    # tests/test_doctor_schedule_dispatch.py (see that file's own "UPDATED
+    # BY SOURAV -- KCD-385" comment): _dispatch_turn_inner() reads
+    # session.utt_seq and session.call_state directly, before any
+    # intent-specific code runs at all, purely to log the turn -- a bare
+    # SimpleNamespace missing either crashed every test that goes through
+    # _dispatch_turn (not _continue_pending) with an AttributeError, masked
+    # in the logs as "turn crashed -- answering as unreachable".
+    # confirm_attempts is confidence.py::zone()'s own read, added for the
+    # same reason. answer_ledger is NOT needed here, unlike that file's
+    # fixture: this module's dispatch tests all reach book_appointment via
+    # _speak() directly, never _speak_fact().
     return types.SimpleNamespace(
         call_id="test-call-1",
         pending=pending,
         dispatch_lock=asyncio.Lock(),
         send_json=_AsyncNoOp(),
+        utt_seq=1,
+        call_state=None,
+        confirm_attempts=0,
     )
 
 
@@ -627,8 +656,18 @@ class TestConfirmBookingState:
             assert session.pending is not None
         # Third unparseable reply exceeds the retry budget (matches the
         # >2 cap every other awaiting-state in this module uses).
+        #
+        # UPDATED BY SOURAV -- KCD-448 test cleanup. This asserted `handled
+        # is False` for the give-up outcome, but _continue_pending's own
+        # docstring defines that return value as "was this turn consumed by
+        # the pending-state machine at all" -- a give-up IS a handled turn
+        # (the agent spoke BOOKING_NOT_CONFIRMED_BN and cleared pending),
+        # just one with a bad outcome; `False` means the turn fell through
+        # untouched, which never happened here. test_the_correction_loop_is_
+        # capped below already gets this right by not asserting on
+        # `handled` at all for the same kind of give-up.
         handled = run(main_pcm._continue_pending(session, "কি বললেন?"))
-        assert handled is False
+        assert handled is True
         assert session.pending is None
         assert stub_speak_and_tools.tools.book_appointment_calls == []
 
@@ -718,6 +757,16 @@ class TestSingleShotBookingAlsoConfirms:
     ):
         class FakeASRResult:
             text = "ignored -- _resolve_intent is stubbed directly below"
+            # UPDATED BY SOURAV -- KCD-448 test cleanup. A bare result with
+            # no decoder-agreement fields reads to agent/confidence.py::
+            # zone() as "no comparison was made", which routes to the
+            # CONFIRM zone instead of PROCEED -- same gap, same fix, as
+            # tests/test_doctor_schedule_dispatch.py's own FakeASRResult
+            # (see that file's "UPDATED BY SOURAV -- KCD-385" comment).
+            decoder_used = "ctc"
+            decoder_agreement = 1.0
+            ctc_words = 5
+            rnnt_words = 5
 
         class FakeASR:
             async def transcribe_utterance(self, wav_path):

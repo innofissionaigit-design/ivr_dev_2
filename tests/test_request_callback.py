@@ -323,6 +323,16 @@ class _AsyncNoOp:
 
 class FakeASRResult:
     text = "amake ektu callback korte bolben"
+    # UPDATED BY SOURAV -- KCD-448 test cleanup. A bare result with no
+    # decoder-agreement fields reads to agent/confidence.py::zone() as "no
+    # comparison was made", which routes to the CONFIRM zone instead of
+    # PROCEED -- same gap, same fix, as tests/test_doctor_schedule_
+    # dispatch.py's own FakeASRResult (see that file's "UPDATED BY SOURAV
+    # -- KCD-385" comment).
+    decoder_used = "ctc"
+    decoder_agreement = 1.0
+    ctc_words = 5
+    rnnt_words = 5
 
 
 class FakeASR:
@@ -332,10 +342,24 @@ class FakeASR:
 
 def make_session(pending=None):
     from agent.state import DialogueState as _DS
+    # UPDATED BY SOURAV -- KCD-448 test cleanup. This stub had fallen
+    # behind the real Session object, same gap already fixed for the same
+    # reason in tests/test_doctor_schedule_dispatch.py and tests/test_
+    # booking_readback.py (see either file's own "UPDATED BY SOURAV"
+    # comment on make_session): _dispatch_turn_inner() reads
+    # session.utt_seq and session.call_state directly, purely to log the
+    # turn, before any intent-specific code runs -- a bare SimpleNamespace
+    # missing either crashed every dispatch test in this file with an
+    # AttributeError, masked in the logs as "turn crashed -- answering as
+    # unreachable". confirm_attempts is confidence.py::zone()'s own read,
+    # added for the same reason.
     return types.SimpleNamespace(
         call_id="test-call-1", pending=pending,
         dispatch_lock=asyncio.Lock(), send_json=_AsyncNoOp(),
         state=_DS(),
+        utt_seq=1,
+        call_state=None,
+        confirm_attempts=0,
     )
 
 
@@ -470,12 +494,118 @@ class TestCallbackDispatchCollectionAndConfirmation:
         assert session.pending is None
         assert "request_callback" not in [c[0] for c in stub.tools.calls]
 
-    def test_negative_reply_to_confirmation_abandons_cleanly(self, stub, monkeypatch, tmp_path):
+    def test_negative_reply_to_confirmation_opens_correction_path(self, stub, monkeypatch, tmp_path):
+        # story title: Every critical value is read back before it is used
+        # acceptance criteria: ...a rejection opens a correction path rather
+        #   than repeating the prompt.
+        #
+        # UPDATED BY SOURAV -- KCD-448. Was test_negative_reply_to_
+        # confirmation_abandons_cleanly, pinning the exact behaviour this
+        # story's AC calls out as wrong: a "না" here used to throw away
+        # BOTH values and abandon the callback outright, not even a repeat
+        # of the prompt. Rewritten to check the new, correct contract --
+        # see main.py/main_pcm.py's own "FIXED BY SOURAV -- KCD-448"
+        # comment on this exact branch.
         session = _dispatch(
             stub, monkeypatch, "request_callback",
             _empty_slots(callback_time_window="evening", phone="9831012345"), tmp_path,
         )
         assert session.pending["awaiting"] == "confirm_callback"
+        _continue(stub, session, "না")
+        assert session.pending is not None, "a rejection must not abandon the callback"
+        assert session.pending["awaiting"] == "confirm_callback_correction"
+        # Neither value is thrown away by the rejection itself -- only
+        # naming one clears it (see the round-trip test below).
+        assert session.pending["slots"]["callback_time_window"] == "evening"
+        assert session.pending["slots"]["phone"] == "9831012345"
+        assert "request_callback" not in [c[0] for c in stub.tools.calls]
+        # The correction prompt is a DIFFERENT question, never a repeat.
+        assert stub.spoken[-1] != callback_confirmation_prompt(session.pending["slots"])
+
+    def test_naming_phone_reenters_phone_collection_with_time_window_kept(
+        self, stub, monkeypatch, tmp_path
+    ):
+        session = _dispatch(
+            stub, monkeypatch, "request_callback",
+            _empty_slots(callback_time_window="evening", phone="9831012345"), tmp_path,
+        )
+        _continue(stub, session, "না")
+        _continue(stub, session, "ফোন নম্বরটা ভুল")
+        assert session.pending["awaiting"] == "callback_phone"
+        # The disputed value is cleared, the other one is kept.
+        assert "phone" not in session.pending["slots"]
+        assert session.pending["slots"]["callback_time_window"] == "evening"
+        assert "request_callback" not in [c[0] for c in stub.tools.calls]
+
+    def test_naming_time_window_reenters_its_collection_with_phone_kept(
+        self, stub, monkeypatch, tmp_path
+    ):
+        session = _dispatch(
+            stub, monkeypatch, "request_callback",
+            _empty_slots(callback_time_window="evening", phone="9831012345"), tmp_path,
+        )
+        _continue(stub, session, "না")
+        _continue(stub, session, "সময়টা ঠিক না")
+        assert session.pending["awaiting"] == "callback_time_window"
+        assert "callback_time_window" not in session.pending["slots"]
+        assert session.pending["slots"]["phone"] == "9831012345"
+
+    def test_full_callback_correction_round_trip_reaches_confirm_again(
+        self, stub, monkeypatch, tmp_path
+    ):
+        # Regression test for the whole loop, mirroring test_booking_
+        # readback.py's own test_a_corrected_booking_is_read_back_in_full_
+        # again: reject -> name a field -> supply a new value -> back to
+        # confirm_callback -> affirm -> exactly one write, corrected value.
+        session = _dispatch(
+            stub, monkeypatch, "request_callback",
+            _empty_slots(callback_time_window="evening", phone="9831012345"), tmp_path,
+        )
+        _continue(stub, session, "না")                      # readback rejected
+        _continue(stub, session, "ফোন নম্বরটা ভুল")          # names the field
+        _continue(stub, session, "9123456789")               # gives the new value
+        assert session.pending["awaiting"] == "confirm_callback"
+        assert session.pending["slots"]["phone"] == "9123456789"
+        assert session.pending["slots"]["callback_time_window"] == "evening"
+        assert "request_callback" not in [c[0] for c in stub.tools.calls]
+
+        _continue(stub, session, "হ্যাঁ")
+        assert session.pending is None
+        assert ("request_callback", ("9123456789", "evening", None)) in stub.tools.calls
+
+    def test_unnameable_field_re_asks_rather_than_guessing(self, stub, monkeypatch, tmp_path):
+        session = _dispatch(
+            stub, monkeypatch, "request_callback",
+            _empty_slots(callback_time_window="evening", phone="9831012345"), tmp_path,
+        )
+        _continue(stub, session, "না")
+        _continue(stub, session, "জানি না")
+        assert session.pending["awaiting"] == "confirm_callback_correction"
+        assert "request_callback" not in [c[0] for c in stub.tools.calls]
+
+    def test_the_callback_correction_loop_is_capped(self, stub, monkeypatch, tmp_path):
+        session = _dispatch(
+            stub, monkeypatch, "request_callback",
+            _empty_slots(callback_time_window="evening", phone="9831012345"), tmp_path,
+        )
+        _continue(stub, session, "না")
+        for _ in range(4):
+            _continue(stub, session, "জানি না")
+        assert session.pending is None, "the correction loop never ended"
+        assert "request_callback" not in [c[0] for c in stub.tools.calls]
+
+    def test_saying_no_to_the_callback_correction_question_abandons(
+        self, stub, monkeypatch, tmp_path
+    ):
+        # Once the agent has listed the two options, a caller saying "না"
+        # is not naming a field -- they have given up. Same considered
+        # divergence booking's own confirm_correction state makes (see
+        # that state's own comment in main.py).
+        session = _dispatch(
+            stub, monkeypatch, "request_callback",
+            _empty_slots(callback_time_window="evening", phone="9831012345"), tmp_path,
+        )
+        _continue(stub, session, "না")
         _continue(stub, session, "না")
         assert session.pending is None
         assert "request_callback" not in [c[0] for c in stub.tools.calls]

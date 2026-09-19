@@ -151,6 +151,45 @@ def parse_correction_field(text: str) -> str | None:
     return None
 
 
+# ADDED BY SOURAV -- KCD-448 ("Every critical value is read back before it
+# is used"). request_callback's own two-field analogue of
+# parse_correction_field() above. Reuses the SAME phone/time word lists
+# rather than duplicating them (a caller says "phone number" or "time" the
+# same way regardless of which flow they are in) but scoped to only the
+# two fields a callback request actually collects -- there is no doctor,
+# date or patient name to correct here, and matching those words would
+# just be dead code that can never fire.
+#
+# The two returned names ("callback_phone", "callback_time_window") are
+# main.py/main_pcm.py's own "awaiting" state names for collecting these
+# fields (NOT "phone"/"time_slot" -- see _continue_pending's own comment on
+# why the callback flow uses distinctly-named states), so the caller of
+# this function can set pending["awaiting"] to the return value directly
+# and land straight back in the existing collection code, unchanged.
+_CALLBACK_CORRECTION_FIELD_WORDS = {
+    "callback_phone": _CORRECTION_FIELD_WORDS["phone"],
+    "callback_time_window": _CORRECTION_FIELD_WORDS["time_slot"],
+}
+_CALLBACK_CORRECTION_FIELD_ORDER = ("callback_phone", "callback_time_window")
+
+
+def parse_callback_correction_field(text: str) -> str | None:
+    """-> "callback_phone", "callback_time_window", or None if the reply
+    does not confidently name one of the two callback fields.
+
+    Same trust model as parse_correction_field() above: None rather than a
+    guess, so main.py re-asks instead of silently re-collecting the wrong
+    field.
+    """
+    t = _strip(text).lower()
+    if not t:
+        return None
+    for field in _CALLBACK_CORRECTION_FIELD_ORDER:
+        if any(word in t for word in _CALLBACK_CORRECTION_FIELD_WORDS[field]):
+            return field
+    return None
+
+
 # Any character in the Bengali Unicode block -- letters, vowel signs, the
 # nukta, and the ০-৯ digits. Used as a word boundary that actually works for
 # this script; see the comment inside parse_date().
