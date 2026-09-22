@@ -572,7 +572,12 @@ _RE_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b(\s*তারিখে?)?")
 _RE_TIME_RANGE = re.compile(r"\b(\d{1,2}):(\d{2})\s*[-–—to]{1,2}\s*(\d{1,2}):(\d{2})\b")
 _RE_TIME = re.compile(r"\b(\d{1,2}):(\d{2})\b")
 _RE_PHONE = re.compile(r"\b(\d{10,})\b")
-_RE_CONF_ID = re.compile(r"\b([A-Z]{2,}[-]?\d{3,})\b")
+# E4-S3: the optional trailing group. clinic-api issues IDs shaped
+# KCD-20260915-4F0C; the pattern used to stop at "KCD-20260915", so the
+# suffix's digits were read as a bare number and its Latin letters dropped by
+# the tokenizer -- the caller heard "... পাঁচ-চারFশূন্যC" on every booking
+# confirmation. A reference that cannot be read back cannot be quoted back.
+_RE_CONF_ID = re.compile(r"\b([A-Z]{2,}-?\d{3,}(?:-[0-9A-Z]{2,})?)\b")
 _RE_DECIMAL = re.compile(r"\b(\d+)\.(\d+)\b")
 _RE_INT = re.compile(r"\d+")
 

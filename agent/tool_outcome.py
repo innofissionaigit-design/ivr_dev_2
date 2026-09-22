@@ -95,7 +95,11 @@ INSUFFICIENT = "insufficient"
 # of a thing not existing, it is the thing existing twice.
 AMBIGUOUS = "ambiguous"
 
-TOOLS = ("test_rate", "doctor_availability", "doctors_by_department", "book_appointment")
+TOOLS = ("test_rate", "doctor_availability", "doctors_by_department", "book_appointment",
+         # E4-S3 -- Caller moves an existing appointment.
+         "find_appointments", "appointment_availability", "reschedule_appointment",
+         # E4-S4 -- Caller cancels an appointment.
+         "cancellation_quote", "cancel_appointment")
 
 # book_appointment reasons that mean the named thing does not exist, as opposed
 # to existing and being unavailable. Explicit allow-list, not a "contains
@@ -123,6 +127,18 @@ def classify(tool: str, payload: dict) -> str:
             return ANSWERED
         return (NOT_FOUND if payload.get("reason") in _NOT_FOUND_BOOKING_REASONS
                 else ANSWERED)
+    # E4-S3: a refused move (slot taken, conflict, past ...) is the clinic
+    # ANSWERING. Only an unknown reference is a thing that does not exist.
+    if tool == "reschedule_appointment":
+        if payload.get("success"):
+            return ANSWERED
+        return NOT_FOUND if payload.get("reason") == "not_found" else ANSWERED
+    # E4-S4: same rule. A refusal (charge not confirmed, already cancelled,
+    # rules unavailable ...) is the clinic answering.
+    if tool in ("cancel_appointment", "cancellation_quote"):
+        if payload.get("success") or payload.get("found"):
+            return ANSWERED
+        return NOT_FOUND if payload.get("reason") == "not_found" else ANSWERED
     return ANSWERED if payload.get("found") else NOT_FOUND
 
 

@@ -77,6 +77,14 @@ _CONTRACTS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
          "chamber_hours", "next_available_date"),
         ("query",),
     ),
+    # "Caller asks for the earliest available appointment": `slots` is
+    # required even when empty -- an empty list means "nothing free within
+    # the horizon", which is spoken; a missing key is a contract change.
+    "doctor_earliest_slots": (
+        "found",
+        ("doctor_name", "doctor_name_bn", "horizon_days", "slots"),
+        ("query",),
+    ),
     "doctors_by_department": (
         "found",
         ("department", "department_bn", "date", "doctors"),
@@ -105,6 +113,45 @@ _CONTRACTS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
     "book_appointment": (
         "success",
         ("doctor_name", "doctor_name_bn"),
+        ("reason",),
+    ),
+    # story title: Caller moves an existing appointment (E4-S3)
+    # Every field the reschedule templates read. `matches` is required in
+    # BOTH shapes: a found=false lookup still carries an (empty) list, and a
+    # lookup that silently dropped the key would read as "no appointment"
+    # when it means "the contract changed".
+    "find_appointments": (
+        "found",
+        ("matches",),
+        ("matches",),
+    ),
+    "appointment_availability": (
+        "found",
+        ("date", "available", "chamber_hours", "next_available_date"),
+        ("query",),
+    ),
+    # The success shape is what the confirmation is spoken FROM, so every
+    # value in it is required. A refusal needs only its reason.
+    "reschedule_appointment": (
+        "success",
+        ("reference", "doctor_name", "doctor_name_bn", "old_date", "old_time_slot",
+         "new_date", "new_time_slot"),
+        ("reason",),
+    ),
+    # story title: Caller cancels an appointment (E4-S4)
+    # Every field the cancellation templates read. The charge and the refund
+    # eligibility are spoken FROM these, so a quote that dropped one must be
+    # refused here -- never read as "no charge".
+    "cancellation_quote": (
+        "found",
+        ("reference", "cancellable", "reason", "window_id", "charge_inr",
+         "refund_eligibility", "refund_percent", "policy_version"),
+        ("reason",),
+    ),
+    "cancel_appointment": (
+        "success",
+        ("reference", "doctor_name", "doctor_name_bn", "date", "time_slot",
+         "charge_inr", "charge_status", "refund_eligibility", "refund_percent"),
         ("reason",),
     ),
 }

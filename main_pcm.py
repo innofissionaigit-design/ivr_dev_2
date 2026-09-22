@@ -72,7 +72,9 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
+import unicodedata
 import time
 import uuid
 import wave
@@ -154,6 +156,30 @@ from agent.reply_templates import (
     # agent/callback_flow.py's module docstring and each function's own
     # docstring for when these are spoken.
     callback_unavailable_reply, callback_confirmation_prompt, callback_scheduled_reply,
+    # E4-S3 "Caller moves an existing appointment". See _continue_reschedule.
+    reschedule_prompt, reschedule_found_prompt, reschedule_pick_prompt,
+    reschedule_not_found_reply, reschedule_day_unavailable_reply,
+    reschedule_time_prompt, reschedule_confirm_prompt, reschedule_reply,
+    reschedule_kept_reply, reschedule_not_changed_reply,
+    reschedule_outcome_unknown_reply,
+    # E4-S4 "Caller cancels an appointment". See _continue_cancel.
+    cancel_choice_prompt, cancel_prompt, cancel_pick_prompt, cancel_not_found_reply,
+    cancel_confirm_prompt, cancel_charge_prompt, cancel_charge_retry_prompt,
+    cancel_quote_changed_prompt, cancel_unavailable_reply, cancel_reply,
+    cancel_kept_reply, cancel_not_cancelled_reply, cancel_outcome_unknown_reply,
+    # E13-S7 "Caller gives everything in one sentence". See _open_booking.
+    booking_doctor_not_found_prompt, booking_day_unavailable_prompt,
+    booking_time_outside_hours_prompt,
+    # E13-S7 follow-up: a date calculated from "কাল" etc., rechecked.
+    booking_date_check_prompt,
+    # "Caller names only a doctor". See _open_booking / _next_booking_step.
+    booking_doctor_offer_prompt, booking_date_time_prompt, booking_patient_contact_prompt,
+    # "Caller asks for the earliest available appointment". See _offer_earliest.
+    booking_earliest_slots_prompt, booking_earliest_none_prompt,
+    # "Requested slot is already taken". See _open_booking / _finish_booking.
+    booking_slot_taken_prompt,
+    # "Caller says tomorrow, day after, or next Monday". See _date_gate.
+    date_ask_prompt, date_range_pick_prompt,
 )
 from agent.compare_flow import build_comparison
 # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
@@ -188,6 +214,14 @@ from agent.slot_parse import (
     # callback (agent/reply_templates.py's report_status_reply()). See
     # agent/slot_parse.py's own docstring for the ordering guarantee.
     looks_like_callback_preference,
+    # E4-S3: a spoken confirmation reference, and "the second one".
+    parse_reference, parse_ordinal, wants_earliest,
+    # E4-S4: "cancel, keep or move?", and agreement to a stated charge.
+    parse_cancel_choice, is_explicit_consent,
+    # E13-S7: the one phone number in a whole booking sentence.
+    find_phone_in_sentence,
+    # E13-S7 follow-up: what the caller's day word ("কাল") meant.
+    spoken_day_word,
 )
 # story title: The model never originates a fact
 # user story: As a clinical lead, I want every price, date and identifier to
@@ -204,7 +238,12 @@ from agent.slot_parse import (
 # cannot go stale in the semantic cache.
 from agent import date_calc
 from agent.date_calc import SOURCE_INTERPRETED, SOURCE_PARSED
-from agent.tools_client import ClinicToolsClient, ToolCallError
+from agent.tools_client import (
+    ClinicToolsClient, ToolCallError,
+    # E4-S3: a write that fails has two truthful outcomes, not one -- see
+    # _commit_reschedule.
+    ToolWriteNotApplied, ToolOutcomeUnknown,
+)
 from agent.outcomes import (
     missing_booking_write_fields,
     record_insufficient_verified_information,
@@ -1070,6 +1109,566 @@ def _clean_patient_name(text: str) -> str | None:
     return t or None
 
 
+_NUMERAL_RUN = re.compile(r"[0-9০-৯](?:[ \-]?[0-9০-৯])*")
+_PHONE_WORDS = re.compile(r"(?i)\b(?:phone|number|mobile|no)\b|ফোন|নম্বর|নাম্বার|মোবাইল")
+
+
+def _starts_affirmative(text: str) -> bool:
+    """"হ্যাঁ, সকাল দশটায়" -- the first word alone is a yes."""
+    first = re.split(r"[\s,।!?.]+", text.strip(), maxsplit=1)[0]
+    return bool(first) and is_affirmative(first)
+
+
+def _split_name_and_phone(text: str) -> tuple[str | None, str | None]:
+    """The answer to "name and phone?" -> (name, phone). Only a phone said
+    in numerals is split off; without one the whole answer is the name,
+    exactly as before."""
+    if not _NUMERAL_RUN.search(text):
+        return _clean_patient_name(text), None
+    phone = find_phone_in_sentence(text)
+    if not phone:
+        return _clean_patient_name(text), None
+    rest =_PHONE_WORDS.sub(" ", _NUMERAL_RUN.sub(" ", text))
+    rest = re.sub(r"\s+", " ", rest).strip(" ,।!?.-")
+    return _clean_patient_name(rest), phone
+
+
+# story title: Caller gives everything in one sentence (E13-S7)
+# user story: As a caller who already knows what I want, I want to say it all
+#   at once and only confirm, so that a simple booking takes one exchange
+#   rather than five.
+# acceptance criteria: A caller who states doctor, day, time and patient name
+#   in the opening utterance is asked only to confirm. Every slot is filled
+#   from that single turn and no question already answered is asked again.
+#   The confirmation reads back all four values. Median turns for this
+#   scenario is two.
+#
+# ONE path for "this turn is a booking request", used by BOTH dispatchers
+# (_dispatch_turn_inner and _answer_part), which used to differ: the main one
+# copied the model's `date` -- the caller's WORDS since the "model never
+# originates a fact" story -- straight into the booking, and ignored
+# `date_expr`, so "কাল সকাল দশটায় ..." was asked "কোন দিন?" again. Plan and
+# findings F1-F7: docs/stories/E13-S7-one-sentence-booking-plan.md.
+#
+#   _booking_slots_from_turn()  every field this sentence gives, each one read
+#                               by code where code can read it
+#   _open_booking()             the doctor checked once with clinic-api, then
+#                               ONLY a missing or unbookable field is asked --
+#                               or, with nothing missing, the existing readback
+#
+# The readback (confirm_booking), the correction path and the write
+# (_finish_booking) are unchanged.
+
+# The states of a booking in progress, for the caller-turn count logged when
+# a booking is confirmed (AC4 is measured from that log line).
+_BOOKING_STATES = frozenset({"doctor_name", "date", "time_slot", "patient_name", "phone",
+                             "confirm_booking", "confirm_correction",
+                             "confirm_booking_date"})
+
+
+# E13-S7 follow-up -- "আজ, আজকে, কাল, কালকে, আগামীকাল, পরশু, পরশুদিন" (and a
+# weekday name, and the Latin-script forms) are understood on EVERY booking
+# route: a whole sentence, a field-by-field answer to "কোন দিন?", and a
+# correction. The date is CALCULATED -- by slot_parse.parse_date /
+# agent/date_calc, never by the model -- and a calculated date is RECHECKED
+# with the caller before it is used:
+#
+#   more still to ask   -> "আগামীকাল মানে রবিবার, সেপ্টেম্বর মাসের কুড়ি তারিখ।
+#                           ঠিক আছে?" is asked FIRST (state confirm_booking_date)
+#   nothing left to ask -> the readback itself names it -- "ডাঃ সেন,
+#                           আগামীকাল রবিবার, সেপ্টেম্বর মাসের কুড়ি তারিখ, ..." --
+#                           and its "হ্যাঁ" is the approval, so a caller who says
+#                           everything at once still books in two turns.
+#
+# On "হ্যাঁ" the booking carries on exactly as before (the next field, the
+# readback, the write); on "না" only the day is asked again.
+#
+# What the word meant ("tomorrow") and its weekday are kept on the slots
+# beside the date (date_said, date_weekday); date_checked marks that the
+# caller has approved it. The booking API reads only its five fields.
+_EXPR_DAY_KEYS = frozenset({"today", "tomorrow", "day_after_tomorrow", "monday", "tuesday",
+                            "wednesday", "thursday", "friday", "saturday", "sunday"})
+
+
+def _day_key_from_expr(date_expr: str | None) -> str | None:
+    """The model named the day ("next_saturday") and the calendar resolved
+    it. -> the key the recheck speaks ("saturday"), or None."""
+    if not date_expr:
+        return None
+    key = date_expr[len("next_"):] if date_expr.startswith("next_") else date_expr
+    return key if key in _EXPR_DAY_KEYS else None
+
+
+def _apply_booking_date(slots: dict, date_iso: str | None, said: str | None = None) -> None:
+    """Set (or clear) the booking date. Anything known about the OLD date --
+    the word it came from, its weekday, the caller's approval -- goes with
+    it, so a new date is never read back under an old approval."""
+    for key in ("date_said", "date_weekday", "date_checked", "date_candidates", "date_range"):
+        slots.pop(key, None)
+    if not date_iso:
+        slots.pop("date", None)
+        return
+    slots["date"] = date_iso
+    if said:
+        slots["date_said"] = said
+        slots["date_weekday"] = datetime.date.fromisoformat(date_iso).weekday()
+
+
+async def _next_booking_step(session: CallSession, pending: dict, language: str) -> None:
+    """After a field is filled: a calculated date not yet approved is
+    rechecked first; otherwise the next missing field; otherwise the
+    readback. (The readback names a calculated date, so when nothing else is
+    missing it IS the recheck.)"""
+    slots = pending["slots"]
+    missing = _next_missing(slots)
+    if missing is None:
+        pending["awaiting"] = "confirm_booking"
+        await _speak(session, booking_confirmation_prompt(slots, language=language))
+        return
+    if slots.get("date_said") and not slots.get("date_checked"):
+        pending["awaiting"] = "confirm_booking_date"
+        await _speak(session, booking_date_check_prompt(slots, language=language))
+        return
+    pending["awaiting"] = missing
+    # "Caller says tomorrow, ...": the caller's day could not be settled --
+    # offer the date(s) found, or read the range back and ask which day.
+    if missing == "date" and slots.get("date_candidates") is not None:
+        await _speak(session, date_ask_prompt(slots["date_candidates"], language=language))
+        return
+    if missing == "date" and slots.get("date_range"):
+        start, end = slots["date_range"]
+        await _speak(session, date_range_pick_prompt(start, end, language=language))
+        return
+    # Related fields are asked together when both are still empty; the
+    # answer to "date" / "patient_name" also fills its pair (_continue_pending).
+    if missing == "date" and not slots.get("time_slot"):
+        await _speak(session, booking_date_time_prompt(language=language))
+        return
+    if missing == "patient_name" and not slots.get("phone"):
+        await _speak(session, booking_patient_contact_prompt(language=language))
+        return
+    await _speak(session, missing_slot_prompt("book_appointment", missing, language=language))
+
+
+def _booking_slots_from_turn(text: str, slots: dict, carried: dict | None) -> dict:
+    """-> the booking fields known after THIS turn: `carried` (fields from an
+    earlier turn) plus everything this sentence gives. A value is stored only
+    if it is usable; anything else is left empty so that exactly that field
+    is asked (plan, D4)."""
+    merged = dict(carried or {})
+
+    # The doctor: the caller's own words. clinic-api does the matching
+    # (_open_booking); a stale Bengali name from an earlier doctor must not
+    # be read back with a new one.
+    if slots.get("doctor_name") and slots["doctor_name"] != merged.get("doctor_name"):
+        merged["doctor_name"] = slots["doctor_name"]
+        merged.pop("doctor_name_bn", None)
+
+    # The date: only a value date_calc computed from THIS sentence. The model
+    # names the meaning ("tomorrow"); code does the calendar. A range ("next
+    # week") is not one appointment day, so it is left for the date question.
+    # "Caller says tomorrow, day after, or next Monday": the ONE date rule
+    # (date_calc.decide) -- parser and model agree -> the date, rechecked
+    # with the caller ("date" marks a calendar date they said); they differ
+    # or only one has a date -> ask, offering them; a range -> which day.
+    decision = date_calc.decide(text, slots.get("date_expr"), slots.get("date"))
+    if decision.kind == "confirm":
+        _apply_booking_date(merged, decision.date, decision.said or "date")
+    elif decision.kind == "ask":
+        _apply_booking_date(merged, None)
+        merged["date_candidates"] = list(decision.candidates)
+    elif decision.kind == "range":
+        _apply_booking_date(merged, None)
+        merged["date_range"] = [decision.start, decision.end]
+
+    # The time: the local parser over the sentence first, the model's value
+    # second, and only ever stored as HH:MM.
+    if slots.get("time_slot"):
+        parsed = parse_time(text) or parse_time(slots["time_slot"])
+        if parsed:
+            merged["time_slot"] = parsed
+
+    # The phone: exactly one clean number in the sentence, else the model's
+    # digits. Never parse_phone(sentence), which takes the LAST ten digits
+    # and so swallows a time said after the number (plan, F3).
+    phone = find_phone_in_sentence(text) or (parse_phone(slots["phone"]) if slots.get("phone") else None)
+    if phone:
+        merged["phone"] = phone
+
+    if slots.get("patient_name"):
+        name = _clean_patient_name(slots["patient_name"])
+        if name:
+            merged["patient_name"] = name
+
+    # "Caller asks for the earliest available appointment": no day said, and
+    # the caller asked for the soonest one -> _open_booking offers the
+    # earliest free slots instead of asking for a day.
+    if not merged.get("date") and wants_earliest(text):
+        merged["want_earliest"] = True
+    return merged
+
+
+def _time_within_hours(time_slot: str, chamber_hours: str | None) -> bool:
+    """HH:MM inside "HH:MM-HH:MM" (start inclusive, end exclusive). Unknown
+    hours are not a reason to refuse: the write still checks the slot."""
+    if not chamber_hours or "-" not in chamber_hours:
+        return True
+    start, end = (part.strip() for part in chamber_hours.split("-", 1))
+    return start <= time_slot < end
+
+
+# "Caller asks for the earliest available appointment"
+# (docs/stories/earliest-appointment-plan.md). Built ON the booking flow:
+# this only OFFERS the earliest free slots (read live from clinic-api, nothing
+# held). The caller's pick fills date + time in the existing "date" state and
+# the existing flow does the rest -- the sitting/hours check, name + phone,
+# the readback, the write. Nothing free within the horizon -> the existing
+# callback flow, with the time window and reason already filled.
+_SLOT_OPENS_WINDOW = {
+    "bengali": "সময় খালি হওয়ার দিন",
+    "english": "the day a time opens",
+    "hinglish": "time khali hone ke din",
+    "banglish": "somoy khali howar din",
+}
+
+
+async def _offer_earliest(session: CallSession, merged: dict, language: str, *,
+                          turns: int = 1) -> None:
+    try:
+        result = await _tools.get_earliest_slots(merged["doctor_name"])
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+        return
+
+    pending = {"awaiting": "date", "slots": merged, "candidates": None,
+               "offered_date": None, "retries": 0, "turns": turns}
+    if not result.get("found"):
+        # The doctor was just matched by name; a miss here is not expected.
+        # Ask for the day and time rather than guess.
+        session.pending = pending
+        await _speak(session, booking_date_time_prompt(language=language))
+        return
+
+    offered = result.get("slots") or []
+    logger.info("[%s] earliest slots for %s: %d offered (as of %s)", session.call_id,
+                merged["doctor_name"], len(offered), result.get("as_of"))
+    if offered:
+        pending.update(offered_date=offered[0]["date"], offered_slots=offered)
+        session.pending = pending
+        await _speak(session, booking_earliest_slots_prompt(merged, result, language=language))
+        return
+
+    # Nothing free within the horizon: say so, and offer a callback when a
+    # slot opens -- recorded for a staff member, through the existing flow.
+    if not CALLBACKS_ENABLED:
+        session.pending = None
+        await _speak(session, booking_earliest_none_prompt(merged, result, language=language,
+                                                           ask_phone=False))
+        await _speak(session, callback_unavailable_reply("disabled", language=language))
+        return
+    try:
+        info = await _tools.get_clinic_info()
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+        return
+    now = datetime.datetime.now()
+    availability = check_callback_availability(
+        info.get("hours") if info.get("found") else None, now.weekday(),
+        now.strftime("%H:%M"), CALLBACKS_ENABLED)
+    if not availability["available"]:
+        session.pending = None
+        await _speak(session, booking_earliest_none_prompt(merged, result, language=language,
+                                                           ask_phone=False))
+        await _speak(session, callback_unavailable_reply(availability["reason"], language=language))
+        return
+
+    callback = {
+        "callback_time_window": _SLOT_OPENS_WINDOW.get(language, _SLOT_OPENS_WINDOW["bengali"]),
+        "callback_reason": (f"earliest appointment with {merged['doctor_name']}: nothing free "
+                            f"within {result.get('horizon_days')} days (asked {now.date().isoformat()})"),
+    }
+    if merged.get("phone"):
+        callback["phone"] = merged["phone"]
+        session.pending = {"awaiting": "confirm_callback", "slots": callback, "candidates": None,
+                           "offered_date": None, "retries": 0}
+        await _speak(session, booking_earliest_none_prompt(merged, result, language=language,
+                                                           ask_phone=False))
+        await _speak(session, callback_confirmation_prompt(callback, language=language))
+        return
+    session.pending = {"awaiting": "callback_phone", "slots": callback, "candidates": None,
+                       "offered_date": None, "retries": 0}
+    await _speak(session, booking_earliest_none_prompt(merged, result, language=language))
+
+
+# "Requested slot is already taken": the other day may be picked by its
+# weekday name with any ending ("বৃহস্পতিবারেরটা"), or as "the other day".
+_WEEKDAY_NAMES = (("সোমবার", "monday", "sombar", "somvaar"), ("মঙ্গলবার", "tuesday", "mongolbar", "mangalvaar"),
+                  ("বুধবার", "wednesday", "budhbar", "budhvaar"), ("বৃহস্পতিবার", "thursday", "brihospotibar", "guruvaar"),
+                  ("শুক্রবার", "friday", "shukrobar", "shukravaar"), ("শনিবার", "saturday", "shonibar", "shanivaar"),
+                  ("রবিবার", "sunday", "robibar", "ravivaar"))
+_OTHER_DAY_WORDS = re.compile(r"পরের দিন|অন্য দিনের|other day|next day|dusre din|onno diner")
+
+
+def _pick_offered_slot(text: str, offered: list[dict], yes_takes_first: bool = True) -> dict | None:
+    """The caller's answer to "which one?": "প্রথমটা" / "দ্বিতীয়টা", one of
+    the offered times, the other day by name ("বৃহস্পতিবারেরটা") or as "the
+    other day", or -- when `yes_takes_first` -- a bare "হ্যাঁ" (the first).
+    None -> not a pick."""
+    index = parse_ordinal(text, len(offered))
+    if index is not None:
+        return offered[index]
+    said = parse_time(text)
+    if said:
+        day = parse_date(text)
+        matches = [slot for slot in offered
+                   if slot["time_slot"] == said and (day is None or slot["date"] == day)]
+        if len(matches) == 1:
+            return matches[0]
+    first_day = offered[0]["date"]
+    others = [slot for slot in offered if slot["date"] != first_day]
+    low = _nfc_lower(text)
+    named = [slot for slot in others
+             if any(re.search(rf"(?<![\u0980-\u09FF\w]){name}", low)
+                    for name in _WEEKDAY_NAMES[datetime.date.fromisoformat(slot["date"]).weekday()])]
+    if len(named) == 1:
+        return named[0]
+    if len(others) == 1 and _OTHER_DAY_WORDS.search(low):
+        return others[0]
+    if yes_takes_first and (is_affirmative(text) or _starts_affirmative(text) and said is None):
+        return offered[0]
+    return None
+
+
+def _nfc_lower(text: str) -> str:
+    return unicodedata.normalize("NFC", text or "").lower()
+
+
+def _taken_offer(date_iso: str | None, result: dict) -> list[dict]:
+    """clinic-api's alternatives for a taken time -> the offered slots, each
+    with its date: the nearest free times that day, then the same time on
+    the nearest other day."""
+    offered = [{"date": date_iso, "time_slot": t} for t in result.get("alternative_slots") or []]
+    other = result.get("other_day_slot")
+    if other:
+        offered.append({"date": other["date"], "time_slot": other["time_slot"]})
+    return offered
+
+
+def _pick_date_candidate(text: str, candidates: list) -> str | None:
+    """The answer to "do you mean X, or Y?": "প্রথমটা"/"দ্বিতীয়টা", one of
+    the dates said again, or a plain yes when only one was offered."""
+    if not candidates:
+        return None
+    index = parse_ordinal(text, len(candidates))
+    if index is not None:
+        return candidates[index]
+    if len(candidates) == 1 and (is_affirmative(text) or _starts_affirmative(text)):
+        return candidates[0]
+    said = parse_date(text)
+    return said if said in candidates else None
+
+
+# E13-S9 "Cap the number of questions before escalating": a caller who keeps
+# rejecting the date check is not looped forever. The third rejection hands
+# the call to a human (logged for staff), the same honest escalation the
+# "unclear" / out-of-scope paths use.
+_DATE_REJECTIONS_MAX = 3
+
+
+async def _escalate_date(session: CallSession, intent: str, language: str) -> None:
+    logger.info("[%s] %s: the date was rejected %d times -- escalating",
+                session.call_id, intent, _DATE_REJECTIONS_MAX)
+    session.pending = None
+    record_human_handoff(intent, call_id=session.call_id)
+    await _speak(session, human_fallback_reply(language=language))
+
+
+def _date_check_slots(date_iso: str, said: str | None) -> dict:
+    return {"date": date_iso, "date_said": said or "date",
+            "date_weekday": datetime.date.fromisoformat(date_iso).weekday()}
+
+
+async def _date_gate(session: CallSession, text: str, slots: dict, intent: str,
+                     subject: dict, language: str) -> str | None:
+    """"Caller says tomorrow, day after, or next Monday" -- the ONE date rule
+    for an availability or department question (docs/stories/relative-dates-
+    plan.md). -> the date to answer for NOW (today, when no day was said), or
+    None when a question was asked instead (the pending state is set):
+    agree -> confirm; differ / one-sided -> ask; range -> confirm the range."""
+    decision = date_calc.decide(text, slots.get("date_expr"), slots.get("date"))
+    if decision.kind == "absent":
+        return datetime.date.today().isoformat()
+    base = {"slots": subject, "candidates": None, "retries": 0}
+    if decision.kind == "confirm":
+        session.pending = dict(base, awaiting="confirm_date", offered_date=decision.date,
+                               resume_intent=intent, span_end=decision.date)
+        await _speak(session, booking_date_check_prompt(_date_check_slots(decision.date, decision.said),
+                                                        language=language))
+        return None
+    if decision.kind == "range":
+        logger.info("[%s] date range %s..%s, confirming", session.call_id, decision.start, decision.end)
+        session.pending = dict(base, awaiting="confirm_date", offered_date=decision.start,
+                               resume_intent=intent, span_end=decision.end)
+        await _speak(session, date_range_confirm_prompt(decision.start, decision.end))
+        return None
+    logger.info("[%s] the day could not be settled (%s) -- asking", session.call_id,
+                list(decision.candidates))
+    session.pending = dict(base, offered_date=None, date_candidates=list(decision.candidates),
+                           awaiting="availability_date" if intent == "doctor_availability"
+                           else "department_date")
+    await _speak(session, date_ask_prompt(decision.candidates, language=language))
+    return None
+
+
+async def _date_answer(session: CallSession, pending: dict, text: str, intent: str,
+                       language: str) -> str | None:
+    """The answer to "which day?" in an availability / department question.
+    -> the date to use, None (not a date: the caller's existing retry), or ""
+    (a question was asked: a new date is confirmed first -- the one rule)."""
+    candidates = pending.get("date_candidates")
+    if candidates is not None:
+        chosen = _pick_date_candidate(text, candidates)
+        if chosen:
+            return chosen
+        if is_negative(text):
+            pending.pop("date_candidates", None)
+            pending["retries"] = 0
+            await _speak(session, missing_slot_prompt(intent, "date", language=language))
+            return ""
+    value = parse_date(text, offered_date=pending.get("offered_date"))
+    if value is None:
+        return None
+    if value == pending.get("offered_date") and is_affirmative(text):
+        return value
+    session.pending = {"awaiting": "confirm_date", "slots": pending["slots"], "candidates": None,
+                       "offered_date": value, "retries": 0, "resume_intent": intent,
+                       "span_end": value, "date_rejections": pending.get("date_rejections", 0)}
+    await _speak(session, booking_date_check_prompt(_date_check_slots(value, spoken_day_word(text)),
+                                                    language=language))
+    return ""
+
+
+async def _open_booking(session: CallSession, merged: dict, language: str, *,
+                        turns: int = 1, retries: int = 0, offered_date: str | None = None) -> None:
+    """Ask the ONE thing still needed, or read the whole booking back.
+
+    When a doctor is named, clinic-api is asked once (doctor availability --
+    no new endpoint) BEFORE anything else, so a doctor who does not exist,
+    two doctors who fit the name, a day the doctor does not sit, or a time
+    outside their hours is caught before the caller confirms a booking the
+    write would refuse (E13-S6). Each of those asks for that field ONLY; the
+    other fields stay as the caller gave them.
+    """
+    def pend(awaiting: str, **extra) -> None:
+        session.pending = {"awaiting": awaiting, "slots": merged, "candidates": None,
+                           "offered_date": offered_date, "retries": 0, "turns": turns,
+                           **extra}
+
+    if merged.get("doctor_name"):
+        try:
+            result = await _tools.get_doctor_availability(merged["doctor_name"], merged.get("date"),
+                                                          merged.get("time_slot"))
+        except ToolCallError as e:
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+            return
+
+        if result.get("ambiguous"):
+            # Two doctors fit the name. Never book the likelier one.
+            candidates = result.get("candidates") or []
+            logger.info("[%s] booking: doctor name fits %d doctors", session.call_id, len(candidates))
+            merged.pop("doctor_name", None)
+            merged.pop("doctor_name_bn", None)
+            pend("doctor_name", candidates=candidates or None, retries=retries)
+            await _speak(session, near_match_prompt(candidates))
+            return
+
+        if not result.get("found"):
+            merged.pop("doctor_name", None)
+            merged.pop("doctor_name_bn", None)
+            if retries >= 2:
+                logger.info("[%s] booking abandoned -- no doctor found", session.call_id)
+                session.pending = None
+                await _speak(session, BOOKING_NOT_CONFIRMED_BN)
+                return
+            pend("doctor_name", retries=retries + 1)
+            await _speak(session, booking_doctor_not_found_prompt(language=language))
+            return
+
+        # The canonical name is what the booking API matches; the Bengali
+        # name is what the readback SPEAKS.
+        merged["doctor_name"] = result.get("doctor_name") or merged["doctor_name"]
+        merged["doctor_name_bn"] = result.get("doctor_name_bn")
+
+        # "Caller names only a doctor": no day given, so clinic-api's answer
+        # is the doctor's NEXT sitting. Confirm the doctor and offer it; a
+        # plain "হ্যাঁ" takes it, and the day answer re-enters here so a day
+        # the doctor does not sit still gets the nearest alternative.
+        # (An open date question -- "do you mean X or Y?", or "which day of
+        # next week?" -- is asked by _next_booking_step, not replaced here.)
+        if (not merged.get("date") and merged.get("date_candidates") is None
+                and not merged.get("date_range")):
+            if merged.pop("want_earliest", None):
+                await _offer_earliest(session, merged, language, turns=turns)
+                return
+            offered_date = result.get("date") if result.get("available") else None
+            pend("date")
+            await _speak(session, booking_doctor_offer_prompt(merged, result, language=language))
+            return
+
+        if merged.get("date") and not result.get("available"):
+            _apply_booking_date(merged, None)
+            offered_date = result.get("next_available_date")
+            pend("date")
+            await _speak(session, booking_day_unavailable_prompt(merged, result, language=language))
+            return
+
+        if (merged.get("date") and merged.get("time_slot")
+                and not _time_within_hours(merged["time_slot"], result.get("chamber_hours"))):
+            merged.pop("time_slot", None)
+            pend("time_slot")
+            await _speak(session, booking_time_outside_hours_prompt(merged, result, language=language))
+            return
+
+        # "Requested slot is already taken": the time asked is not free right
+        # now -> the nearest free times that day and the same time on the
+        # nearest other day, in one sentence, BEFORE name and phone are asked.
+        # Capped: a caller whose every pick is taken is not looped forever.
+        if merged.get("date") and merged.get("time_slot") and result.get("slot_free") is False:
+            rounds = (session.pending or {}).get("taken_rounds", 0) + 1
+            if rounds > 3:
+                logger.info("[%s] booking abandoned -- every time asked was taken", session.call_id)
+                session.pending = None
+                await _speak(session, BOOKING_NOT_CONFIRMED_BN)
+                return
+            offered = _taken_offer(merged["date"], result)
+            if offered:
+                await _speak(session, booking_slot_taken_prompt(merged, result, language=language))
+                merged.pop("time_slot", None)
+                pend("time_slot", offered_slots=offered, offer_kind="taken", taken_rounds=rounds)
+                return
+            # Nothing near that day and not that time on any other day: not a
+            # dead end (E12-S5) -- say so and offer his earliest free slots.
+            await _speak(session, booking_reply(merged, {"success": False, "reason": "slot_taken"},
+                                                language=language))
+            merged.pop("time_slot", None)
+            await _offer_earliest(session, merged, language, turns=turns)
+            return
+
+    # Everything known -> the SAME readback as the field-by-field path, and
+    # the write still needs an explicit yes (E13-S4). Otherwise a calculated
+    # date is rechecked first, then the one missing field is asked.
+    if _next_missing(merged) is None:
+        offered_date = merged.get("date")
+    pend("confirm_booking")
+    await _next_booking_step(session, session.pending, language)
+
+
 async def _finish_booking(session: CallSession, slots: dict, *, confirmed: bool = False,
                            language: str = "bengali"):
     """All 5 fields are filled -- place the booking and clear pending
@@ -1182,7 +1781,10 @@ async def _finish_booking(session: CallSession, slots: dict, *, confirmed: bool 
         await _speak(session, near_match_prompt(candidates))
         return
 
-    unverified = outcomes.missing_booking_write_fields(result)
+    # Only a write that REPORTED success can be unverifiable. A refusal
+    # (slot taken, day not sat) has no confirmation to verify; checking it
+    # told the caller "booked, do not rebook" when nothing was booked.
+    unverified = outcomes.missing_booking_write_fields(result) if result.get("success") else []
     if unverified:
         logger.error("[%s] booking write is unverifiable -- missing %s. The "
                      "appointment WAS created; the response did not carry it back.",
@@ -1194,6 +1796,25 @@ async def _finish_booking(session: CallSession, slots: dict, *, confirmed: bool 
         await _speak(session, INSUFFICIENT_VERIFIED_INFORMATION_BN)
         return
     await _speak(session, booking_reply(slots, result, language=language))
+
+    # The slot was taken between the readback and the write (nothing is held
+    # when offered). booking_reply() has just read out the free times on the
+    # same day and asked which -- keep the booking open on them, so the
+    # caller's answer carries on with every other field kept, instead of
+    # starting again.
+    if result.get("reason") == "slot_taken":
+        kept = {k: v for k, v in slots.items() if k != "time_slot"}
+        offered = _taken_offer(kept.get("date"), result)
+        if offered:
+            session.pending = {
+                "awaiting": "time_slot", "slots": kept, "candidates": None,
+                "offered_date": kept.get("date"), "retries": 0,
+                "offered_slots": offered, "offer_kind": "taken", "taken_rounds": 1,
+            }
+        elif kept.get("doctor_name"):
+            # Nothing near that day, and that time on no other day: offer his
+            # earliest free slots rather than stop on "nothing free".
+            await _offer_earliest(session, kept, language)
 
 
 # ADDED BY SOURAV -- "Caller asks to be called back" story. Same shape as
@@ -1507,6 +2128,536 @@ def _remember_compared_entities(session: CallSession, entity_a: dict, entity_b: 
             state.mark(kind, distinct[0])
 
 
+# story title: Caller moves an existing appointment (E4-S3)
+# user story: As a patient whose plans changed, I want to move my appointment
+#   without cancelling it, so that I do not lose my place entirely.
+# acceptance criteria: The booking is found by contact number, name or
+#   reference. The new slot is swapped atomically, holding the old one until
+#   the new commits, and a failed swap leaves the original intact.
+#   Confirmation is sent on both channels.
+#
+# Before this, "অ্যাপয়েন্টমেন্টটা বৃহস্পতিবারে সরাতে চাই" was classified as a
+# NEW booking: the caller was walked through five fields and left holding two
+# appointments. Plan, decisions D1-D6 and the reconciliation with this tree:
+# docs/stories/E4-S3-reschedule-plan.md.
+#
+# One more flow on session.pending, marked flow="reschedule" and routed from
+# the TOP of _continue_pending -- before the universal "না" escape, whose
+# wording ("the appointment is dropped") would make a caller believe their
+# EXISTING appointment had been cancelled. Every step is parsed locally; the
+# model is never consulted inside the flow and never phrases a line of it.
+#
+#   resched_ident -> resched_name -> [resched_pick] -> resched_date
+#     -> resched_time -> resched_confirm -> _commit_reschedule
+#
+# Nothing about a booking is spoken before clinic-api has matched TWO
+# identifying factors (D1) -- the system checks identity, never the model.
+
+# The third unparseable reply in one step ends the flow, saying nothing
+# changed -- rather than handing the reply to the LLM the way the booking
+# flow does, which would leave the caller unsure what became of their booking.
+_RESCHED_MAX_RETRIES = 2
+
+
+def _reschedule_pending() -> dict:
+    # "slots"/"candidates" are carried only so code that reads the COMMON
+    # pending shape (e.g. book_appointment merging pending["slots"]) never
+    # KeyErrors on this flow's dict.
+    return {
+        "flow": "reschedule", "awaiting": "resched_ident",
+        "slots": {}, "candidates": None, "retries": 0,
+        "ident": {}, "matches": [], "appointment": None,
+        "new_date": None, "new_time_slot": None, "offered_date": None,
+        "idempotency_key": None,
+    }
+
+
+async def _start_reschedule(session: CallSession) -> None:
+    """Entry point from both dispatchers. Asks for a phone number or a
+    reference first -- the slots the model extracted are ignored on purpose:
+    everything that selects or moves an appointment is collected and parsed
+    here, step by step, where each value can be checked."""
+    session.pending = _reschedule_pending()
+    await _speak(session, reschedule_prompt("phone"))
+
+
+async def _reschedule_retry(session: CallSession, pending: dict, field: str) -> bool:
+    pending["retries"] += 1
+    if pending["retries"] > _RESCHED_MAX_RETRIES:
+        session.pending = None
+        await _speak(session, reschedule_not_changed_reply())
+        return True
+    await _speak(session, reschedule_prompt(field))
+    return True
+
+
+async def _commit_reschedule(session: CallSession, pending: dict, *, confirmed: bool = False):
+    """The one irreversible step of the flow.
+
+    `confirmed` must be True -- the same write guard as _finish_booking, for
+    the same reason: a guard remembered at each call site is one that is
+    eventually forgotten at one of them.
+
+    THREE ways a write can fail, and the caller hears three different things:
+      ToolWriteNotApplied -> provably not written: "unchanged".
+      ToolOutcomeUnknown  -> sent, answer lost: claim NEITHER done nor unchanged.
+      ToolCallError       -> anything else: the one system-unreachable line.
+    Caught most specific first.
+    """
+    appointment = pending["appointment"]
+    if not confirmed:
+        logger.error("[%s] reschedule reached the write unconfirmed -- "
+                     "refusing and reading back", session.call_id)
+        pending.update(awaiting="resched_confirm", retries=0)
+        await _speak(session, reschedule_confirm_prompt(
+            appointment, pending["new_date"], pending["new_time_slot"]))
+        return
+
+    try:
+        result = await _tools.reschedule_appointment(
+            appointment["reference"], pending["new_date"], pending["new_time_slot"],
+            appointment["date"], appointment["time_slot"],
+            pending["idempotency_key"], session.call_id,
+        )
+    except ToolOutcomeUnknown as e:
+        logger.error("[%s] reschedule outcome unknown: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, reschedule_outcome_unknown_reply(), fallback_reason="tool_failure")
+        return
+    except ToolWriteNotApplied as e:
+        logger.error("[%s] reschedule not applied: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, reschedule_not_changed_reply(), fallback_reason="tool_failure")
+        return
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+        return
+
+    reason = result.get("reason")
+    logger.info("[%s] reschedule result: %s", session.call_id,
+                "success" if result.get("success") else reason)
+    if result.get("success"):
+        session.pending = None
+    elif reason == "slot_taken" and result.get("alternative_slots"):
+        # The reply reads out free times on the same day: the next answer
+        # is a time. A new readback will mint a NEW key -- a different slot
+        # is a different action, and must not replay this refusal.
+        pending.update(awaiting="resched_time", new_time_slot=None,
+                       idempotency_key=None, retries=0)
+    elif reason in ("slot_taken", "doctor_not_available_that_day", "same_slot"):
+        pending.update(awaiting="resched_date", new_date=None, new_time_slot=None,
+                       idempotency_key=None, retries=0,
+                       offered_date=result.get("next_available_date"))
+    else:
+        # success, conflict, past, not_found, invalid_date: nothing more
+        # this flow can do on this call.
+        session.pending = None
+    await _speak(session, reschedule_reply(result, appointment))
+
+
+async def _continue_reschedule(session: CallSession, text: str) -> bool:
+    """One step of the reschedule flow. Returns True: the turn is handled."""
+    pending = session.pending
+
+    # "না"/"থাক" at ANY step: nothing is written, and the caller is told so,
+    # with the slot they still hold if it was found.
+    if is_negative(text):
+        session.pending = None
+        await _speak(session, reschedule_kept_reply(pending.get("appointment")))
+        return True
+
+    awaiting = pending["awaiting"]
+
+    if awaiting == "resched_ident":
+        # Reference FIRST: a spoken reference is also a long digit run, and
+        # parse_phone would read its last ten digits as a phone number.
+        ref = parse_reference(text)
+        phone = None if ref else parse_phone(text)
+        if not ref and not phone:
+            return await _reschedule_retry(session, pending, "phone")
+        pending["ident"] = {"reference": ref} if ref else {"phone": phone}
+        pending.update(awaiting="resched_name", retries=0)
+        await _speak(session, reschedule_prompt("name"))
+        return True
+
+    if awaiting == "resched_name":
+        name = _clean_patient_name(text)
+        if not name:
+            return await _reschedule_retry(session, pending, "name")
+        try:
+            result = await _tools.find_appointments(name=name, **pending["ident"])
+        except ToolCallError as e:
+            # The message carries the exception type only -- never the URL,
+            # which holds the phone number and the name.
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+            return True
+        matches = result.get("matches") or []
+        logger.info("[%s] reschedule lookup: %d match(es)", session.call_id, len(matches))
+        if not matches:
+            session.pending = None
+            await _speak(session, reschedule_not_found_reply())
+            return True
+        if len(matches) == 1:
+            pending.update(appointment=matches[0], awaiting="resched_date", retries=0)
+            await _speak(session, reschedule_found_prompt(matches[0]))
+            return True
+        # D6: at most three are offered, earliest first. Never the likeliest.
+        pending.update(matches=matches[:3], awaiting="resched_pick", retries=0)
+        await _speak(session, reschedule_pick_prompt(matches[:3]))
+        return True
+
+    if awaiting == "resched_pick":
+        index = parse_ordinal(text, len(pending["matches"]))
+        if index is None:
+            return await _reschedule_retry(session, pending, "pick")
+        chosen = pending["matches"][index]
+        pending.update(appointment=chosen, matches=[], awaiting="resched_date", retries=0)
+        await _speak(session, reschedule_found_prompt(chosen))
+        return True
+
+    if awaiting == "resched_date":
+        # A bare "হ্যাঁ"/"ঠিক আছে" takes the day just offered (the doctor's
+        # next sitting day, after a day they do not sit).
+        new_date = parse_date(text, offered_date=pending["offered_date"])
+        if new_date is None:
+            return await _reschedule_retry(session, pending, "date")
+        appointment = pending["appointment"]
+        try:
+            # Scoped to THIS appointment's doctor -- never re-matched by name.
+            result = await _tools.get_appointment_availability(appointment["reference"], new_date)
+        except ToolCallError as e:
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+            return True
+        if not result.get("found"):
+            # The reference no longer resolves -- it changed since the lookup.
+            session.pending = None
+            await _speak(session, reschedule_reply({"success": False, "reason": "conflict"},
+                                                   appointment))
+            return True
+        if result.get("available"):
+            pending.update(new_date=new_date, offered_date=None,
+                           awaiting="resched_time", retries=0)
+            await _speak(session, reschedule_time_prompt(appointment, new_date, result))
+            return True
+        pending["retries"] += 1
+        if pending["retries"] > _RESCHED_MAX_RETRIES:
+            session.pending = None
+            await _speak(session, reschedule_not_changed_reply())
+            return True
+        pending["offered_date"] = result.get("next_available_date")
+        await _speak(session, reschedule_day_unavailable_reply(appointment, result))
+        return True
+
+    if awaiting == "resched_time":
+        new_time = parse_time(text)
+        if new_time is None:
+            return await _reschedule_retry(session, pending, "time_slot")
+        # Blueprint 4.9: call_id + action id. Minted ONCE per readback, so a
+        # lost answer is retried under the same key and can never move twice.
+        pending.update(new_time_slot=new_time, awaiting="resched_confirm", retries=0,
+                       idempotency_key=f"{session.call_id}-resched-{uuid.uuid4().hex[:12]}")
+        await _speak(session, reschedule_confirm_prompt(
+            pending["appointment"], pending["new_date"], new_time))
+        return True
+
+    if awaiting == "resched_confirm":
+        if not is_affirmative(text):
+            return await _reschedule_retry(session, pending, "confirm")
+        await _commit_reschedule(session, pending, confirmed=True)
+        return True
+
+    logger.error("[%s] unknown reschedule state %r -- dropping the flow",
+                 session.call_id, awaiting)
+    session.pending = None
+    return False
+
+
+# story title: Caller cancels an appointment (E4-S4)
+# user story: As a patient who cannot attend, I want to cancel and be told any
+#   charge clearly, so that I am not surprised by a deduction later.
+# acceptance criteria: Cancellation applies the configured window rules and
+#   states refund eligibility from policy, never improvised. A cancellation
+#   within a charging window is confirmed explicitly with the charge stated
+#   before it is applied.
+#
+# WHO DECIDES WHAT. The model decides only that the caller WANTS to cancel
+# (intent cancel_appointment). The caller then decides cancel / keep / move,
+# parsed locally. clinic-api decides which appointment (two matching factors)
+# and what cancelling costs (the admin's rules file,
+# clinic-api/cancellation_rules.txt). The caller's explicit agreement decides
+# whether a charge is applied, and clinic-api checks the charge again at the
+# moment of writing. Plan and decisions: docs/stories/E4-S4-cancel-plan.md.
+#
+# A second flow on session.pending, flow="cancel", routed from the TOP of
+# _continue_pending next to the reschedule flow, for the same reason: "না"
+# here means "keep my appointment", and the caller must be told exactly that.
+#
+#   cancel_choice -(move)-> the E4-S3 reschedule flow
+#        |(cancel)
+#   cancel_ident -> cancel_name -> [cancel_pick] -> quote from clinic-api
+#     -> cancel_confirm (no charge: a readback yes is enough)
+#      | cancel_confirm_charge (a charge: ONLY explicit consent)
+#     -> _commit_cancel
+#
+# The identification steps repeat the reschedule flow's on purpose rather
+# than sharing a helper (plan, D9): the reschedule code stays unchanged, and
+# every sentence stays a named reply_templates call at its _speak site.
+
+# The third unusable reply in one step ends the flow, saying nothing was
+# cancelled.
+_CANCEL_MAX_RETRIES = 2
+
+
+def _cancel_pending() -> dict:
+    # "slots"/"candidates" are carried only so code that reads the COMMON
+    # pending shape never KeyErrors on this flow's dict.
+    return {
+        "flow": "cancel", "awaiting": "cancel_choice",
+        "slots": {}, "candidates": None, "retries": 0,
+        "ident": {}, "matches": [], "appointment": None,
+        "quote": None, "idempotency_key": None,
+    }
+
+
+async def _start_cancel(session: CallSession) -> None:
+    """Entry point from both dispatchers. The caller is asked FIRST whether
+    they really want to cancel, or would rather move the appointment -- a
+    caller who "cannot come on Thursday" often wants another day, not to
+    lose the appointment. The slots the model extracted are ignored: every
+    value that selects or cancels an appointment is collected step by step
+    here, where each one can be checked."""
+    session.pending = _cancel_pending()
+    await _speak(session, cancel_choice_prompt())
+
+
+async def _cancel_retry(session: CallSession, pending: dict, field: str) -> bool:
+    pending["retries"] += 1
+    if pending["retries"] > _CANCEL_MAX_RETRIES:
+        session.pending = None
+        await _speak(session, cancel_not_cancelled_reply())
+        return True
+    if field == "confirm_charge":
+        # The charge is restated on every re-ask -- never agreed to by a
+        # caller who no longer has the amount in mind.
+        await _speak(session, cancel_charge_retry_prompt(pending["quote"]))
+        return True
+    await _speak(session, cancel_prompt(field))
+    return True
+
+
+async def _cancel_to_reschedule(session: CallSession, appointment: dict | None) -> None:
+    """The caller would rather MOVE it: hand over to the E4-S3 flow. Once the
+    appointment is already identified it is passed across, so the caller is
+    not asked for the phone and name a second time."""
+    if appointment is None:
+        await _start_reschedule(session)
+        return
+    pending = _reschedule_pending()
+    pending.update(appointment=appointment, awaiting="resched_date")
+    session.pending = pending
+    await _speak(session, reschedule_found_prompt(appointment))
+
+
+def _set_cancel_question(pending: dict, quote: dict, call_id: str) -> None:
+    """Record the quote the caller is about to hear, and the state that
+    matches it. A NEW idempotency key for every question: a different quote
+    is a different action and must never replay an earlier refusal; a lost
+    answer to THIS question is retried under this same key."""
+    pending.update(
+        quote=quote, retries=0,
+        awaiting="cancel_confirm_charge" if quote["charge_inr"] > 0 else "cancel_confirm",
+        idempotency_key=f"{call_id}-cancel-{uuid.uuid4().hex[:12]}",
+    )
+
+
+async def _cancel_found(session: CallSession, pending: dict, appointment: dict) -> bool:
+    """One appointment is identified. Ask clinic-api what cancelling it NOW
+    would cost, and ask the caller the matching question."""
+    pending.update(appointment=appointment, matches=[])
+    try:
+        quote = await _tools.get_cancellation_quote(appointment["reference"])
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+        return True
+    logger.info("[%s] cancellation quote: cancellable=%s window=%s charge=%s reason=%s",
+                session.call_id, quote.get("cancellable"), quote.get("window_id"),
+                quote.get("charge_inr"), quote.get("reason"))
+    if not quote.get("found") or not quote.get("cancellable"):
+        # not_found, already_cancelled, after_start, policy_unavailable: no
+        # question is asked and no amount is spoken.
+        session.pending = None
+        await _speak(session, cancel_unavailable_reply(quote.get("reason")))
+        return True
+    _set_cancel_question(pending, quote, session.call_id)
+    if quote["charge_inr"] > 0:
+        await _speak(session, cancel_charge_prompt(appointment, quote))
+    else:
+        await _speak(session, cancel_confirm_prompt(appointment, quote))
+    return True
+
+
+async def _commit_cancel(session: CallSession, pending: dict, *, charge_confirmed: bool) -> None:
+    """The one irreversible step of the flow.
+
+    clinic-api recomputes the charge and refuses unless it is exactly the one
+    just spoken, and refuses a charge without charge_confirmed -- so neither
+    a crossed window boundary nor a dialogue bug can apply a charge the
+    caller did not agree to.
+
+    THREE ways the write can fail, and the caller hears three things:
+      ToolOutcomeUnknown  -> sent, answer lost: claim NEITHER outcome.
+      ToolWriteNotApplied -> provably not written: "nothing was cancelled".
+      ToolCallError       -> anything else: the one system-unreachable line.
+    Caught most specific first.
+    """
+    appointment, quote = pending["appointment"], pending["quote"]
+    try:
+        result = await _tools.cancel_appointment(
+            appointment["reference"], appointment["date"], appointment["time_slot"],
+            quote["window_id"], quote["charge_inr"], quote["policy_version"],
+            charge_confirmed, pending["idempotency_key"], session.call_id,
+        )
+    except ToolOutcomeUnknown as e:
+        logger.error("[%s] cancel outcome unknown: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, cancel_outcome_unknown_reply(), fallback_reason="tool_failure")
+        return
+    except ToolWriteNotApplied as e:
+        logger.error("[%s] cancel not applied: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, cancel_not_cancelled_reply(), fallback_reason="tool_failure")
+        return
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        session.pending = None
+        await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+        return
+
+    reason = result.get("reason")
+    logger.info("[%s] cancel result: %s", session.call_id,
+                "success" if result.get("success") else reason)
+    if result.get("success"):
+        session.pending = None
+        await _speak(session, cancel_reply(result))
+        return
+    new_quote = result.get("quote") or {}
+    if reason == "quote_changed" and new_quote.get("cancellable"):
+        # The charge changed while the caller was answering. State the NEW
+        # charge and ask again; the earlier yes does not carry over.
+        _set_cancel_question(pending, new_quote, session.call_id)
+        await _speak(session, cancel_quote_changed_prompt(appointment, new_quote))
+        return
+    if reason == "charge_not_confirmed":
+        # Only a dialogue bug reaches this: the server refused, as it must.
+        logger.error("[%s] cancel sent without consent to a charge -- refused by clinic-api",
+                     session.call_id)
+    session.pending = None
+    await _speak(session, cancel_unavailable_reply(reason))
+
+
+async def _continue_cancel(session: CallSession, text: str) -> bool:
+    """One step of the cancel flow. Returns True: the turn is handled."""
+    pending = session.pending
+
+    # "না"/"থাক" at ANY step: nothing is cancelled, and the caller is told so.
+    if is_negative(text):
+        session.pending = None
+        await _speak(session, cancel_kept_reply(pending.get("appointment")))
+        return True
+
+    awaiting = pending["awaiting"]
+
+    if awaiting == "cancel_choice":
+        choice = parse_cancel_choice(text)
+        if choice == "move":
+            logger.info("[%s] cancel request -> caller chose to move it instead", session.call_id)
+            await _cancel_to_reschedule(session, None)
+            return True
+        if choice == "keep":
+            session.pending = None
+            await _speak(session, cancel_kept_reply(None))
+            return True
+        if choice != "cancel":
+            return await _cancel_retry(session, pending, "choice")
+        pending.update(awaiting="cancel_ident", retries=0)
+        await _speak(session, cancel_prompt("phone"))
+        return True
+
+    if awaiting == "cancel_ident":
+        # Reference FIRST: a spoken reference is also a long digit run, and
+        # parse_phone would read its last ten digits as a phone number.
+        ref = parse_reference(text)
+        phone = None if ref else parse_phone(text)
+        if not ref and not phone:
+            return await _cancel_retry(session, pending, "phone")
+        pending["ident"] = {"reference": ref} if ref else {"phone": phone}
+        pending.update(awaiting="cancel_name", retries=0)
+        await _speak(session, cancel_prompt("name"))
+        return True
+
+    if awaiting == "cancel_name":
+        name = _clean_patient_name(text)
+        if not name:
+            return await _cancel_retry(session, pending, "name")
+        try:
+            result = await _tools.find_appointments(name=name, **pending["ident"])
+        except ToolCallError as e:
+            # The message carries the exception type only -- never the URL,
+            # which holds the phone number and the name.
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+            return True
+        matches = result.get("matches") or []
+        logger.info("[%s] cancel lookup: %d match(es)", session.call_id, len(matches))
+        if not matches:
+            session.pending = None
+            await _speak(session, cancel_not_found_reply())
+            return True
+        if len(matches) == 1:
+            return await _cancel_found(session, pending, matches[0])
+        # At most three are offered, earliest first. Never the likeliest.
+        pending.update(matches=matches[:3], awaiting="cancel_pick", retries=0)
+        await _speak(session, cancel_pick_prompt(matches[:3]))
+        return True
+
+    if awaiting == "cancel_pick":
+        index = parse_ordinal(text, len(pending["matches"]))
+        if index is None:
+            return await _cancel_retry(session, pending, "pick")
+        return await _cancel_found(session, pending, pending["matches"][index])
+
+    if awaiting in ("cancel_confirm", "cancel_confirm_charge"):
+        if parse_cancel_choice(text) == "move":
+            logger.info("[%s] cancel readback -> caller chose to move it instead", session.call_id)
+            await _cancel_to_reschedule(session, pending["appointment"])
+            return True
+        if awaiting == "cancel_confirm":
+            # No charge: an ordinary yes is enough.
+            if not (is_affirmative(text) or is_explicit_consent(text)):
+                return await _cancel_retry(session, pending, "confirm")
+            await _commit_cancel(session, pending, charge_confirmed=False)
+            return True
+        # AC2: a charge is applied ONLY on explicit agreement to it. "হুম",
+        # "ওকে", "ঠিক আছে" or a bare "হ্যাঁ" restate the charge and ask again.
+        if not is_explicit_consent(text):
+            return await _cancel_retry(session, pending, "confirm_charge")
+        await _commit_cancel(session, pending, charge_confirmed=True)
+        return True
+
+    logger.error("[%s] unknown cancel state %r -- dropping the flow", session.call_id, awaiting)
+    session.pending = None
+    return False
+
+
 async def _continue_pending(session: CallSession, text: str) -> bool:
     """The fix for "appointment pipeline breaking": every turn used to be
     classified from a bare transcript with ZERO memory of the turn before
@@ -1705,6 +2856,15 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     if pending is None:
         return False
 
+    # E4-S3: the reschedule flow owns every turn while it is open, including
+    # "না" -- which here means "leave my appointment alone", not the
+    # booking-flow escape further down that tells the caller "dropped".
+    if pending.get("flow") == "reschedule":
+        return await _continue_reschedule(session, text)
+    # E4-S4: same reason -- "না" here means "keep my appointment".
+    if pending.get("flow") == "cancel":
+        return await _continue_cancel(session, text)
+
     # ADDED BY SOURAV -- see the module-level detect_language import
     # comment above for the real bug this fixes. Detected fresh from
     # THIS turn's own utterance (not carried over from an earlier turn,
@@ -1714,6 +2874,12 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     language = detect_language(text)
 
     awaiting = pending["awaiting"]
+
+    # E13-S7 (AC4, median turns): every caller turn spent inside a booking is
+    # counted on the pending dict, and the count is logged when the booking
+    # is confirmed. The opening sentence is turn 1.
+    if awaiting in _BOOKING_STATES:
+        pending["turns"] = pending.get("turns", 1) + 1
 
     # NOTE: confirm_booking/confirm_correction are handled below, together
     # with the universal "না" escape hatch -- see that hatch's own comment
@@ -2146,7 +3312,56 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     # the agent has asked "which one should I fix -- doctor, date, time, name,
     # or phone?", a caller answering "no" is not naming a field; the likeliest
     # reading is that they have given up, and that is what the hatch does.
-    if is_negative(text) and awaiting != "confirm_booking":
+    # E13-S7 follow-up: the caller's answer to "আগামীকাল মানে রবিবার, ...
+    # ঠিক আছে?". Before the universal "না" hatch below, because "না" here
+    # means "not that day" -- only the day is asked again -- never "drop the
+    # booking".
+    if awaiting == "confirm_booking_date":
+        slots = pending["slots"]
+        if is_affirmative(text):
+            slots["date_checked"] = True
+            pending["retries"] = 0
+            await _next_booking_step(session, pending, language)
+            return True
+        if is_negative(text):
+            slots["date_rejections"] = slots.get("date_rejections", 0) + 1
+            if slots["date_rejections"] >= _DATE_REJECTIONS_MAX:
+                await _escalate_date(session, "book_appointment", language)
+                return True
+            _apply_booking_date(slots, None)
+            pending.update(awaiting="date", retries=0, offered_date=None)
+            await _speak(session, missing_slot_prompt("book_appointment", "date", language=language))
+            return True
+        new_date = parse_date(text)
+        if new_date:
+            said = spoken_day_word(text)
+            if new_date == slots.get("date") and said == slots.get("date_said"):
+                # "হ্যাঁ, কালই" -- the same day again: that is a yes.
+                slots["date_checked"] = True
+            else:
+                # A different day ("না, পরশু"): calculated afresh, and a
+                # calculated day is rechecked again before it is used. It
+                # rejects the day just checked, so it counts.
+                slots["date_rejections"] = slots.get("date_rejections", 0) + 1
+                if slots["date_rejections"] >= _DATE_REJECTIONS_MAX:
+                    await _escalate_date(session, "book_appointment", language)
+                    return True
+                _apply_booking_date(slots, new_date, said or "date")
+            pending["retries"] = 0
+            await _next_booking_step(session, pending, language)
+            return True
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            logger.info("[%s] booking abandoned -- date not confirmed", session.call_id)
+            await _speak(session, BOOKING_NOT_CONFIRMED_BN)
+            return True
+        await _speak(session, booking_date_check_prompt(slots, language=language))
+        return True
+
+    if (is_negative(text) and awaiting not in ("confirm_booking", "confirm_date")
+            and pending.get("date_candidates") is None
+            and (pending.get("slots") or {}).get("date_candidates") is None):
         session.pending = None
         await _speak(session, "ঠিক আছে, অ্যাপয়েন্টমেন্ট বাদ থাক। আর কিছু জানতে চান?")
         return True
@@ -2165,7 +3380,8 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         if is_affirmative(text):
             slots = pending["slots"]
             session.pending = None
-            logger.info("[%s] booking confirmed by caller", session.call_id)
+            logger.info("[%s] booking confirmed by caller after %d caller turn(s)",
+                        session.call_id, pending.get("turns", 1))
             await _finish_booking(session, slots, confirmed=True, language=language)
             return True
 
@@ -2480,6 +3696,10 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                 session.pending = None
             return True
 
+        pending["date_rejections"] = pending.get("date_rejections", 0) + 1
+        if pending["date_rejections"] >= _DATE_REJECTIONS_MAX:
+            await _escalate_date(session, resume or "doctor_availability", language)
+            return True
         ask_state = ("availability_date" if resume == "doctor_availability"
                      else "department_date")
         pending["awaiting"] = ask_state
@@ -2506,7 +3726,9 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # guess -- an unparseable answer re-asks and then gives up to a fresh
         # classification, which is the same trust model every other state here
         # uses.
-        value = parse_date(text, offered_date=pending.get("offered_date"))
+        value = await _date_answer(session, pending, text, "doctor_availability", language)
+        if value == "":
+            return True
         if value is None:
             pending["retries"] += 1
             if pending["retries"] > 2:
@@ -2551,7 +3773,9 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # lookup with it, rather than dropping back to a cold LLM
         # classification of a bare date phrase (see this function's
         # docstring for why that silently loses context).
-        value = parse_date(text, offered_date=pending.get("offered_date"))
+        value = await _date_answer(session, pending, text, "doctors_by_department", language)
+        if value == "":
+            return True
         if value is None:
             pending["retries"] += 1
             if pending["retries"] > 2:
@@ -2599,20 +3823,115 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             session.pending = None
         return True
 
+    # E13-S7: "which doctor?" -- asked when the booking sentence named no
+    # doctor, named one clinic-api could not find, named two that fit, or the
+    # caller said the doctor was wrong at the readback. Before this there was
+    # no step here at all: the answer was never read, the question was asked
+    # three times and the booking died. The answer goes back through
+    # _open_booking, so it is checked with clinic-api exactly like a doctor
+    # named in the opening sentence, and the readback follows as soon as
+    # nothing else is missing.
+    if awaiting == "doctor_name":
+        candidates = pending.get("candidates")
+        spoken = text.strip()
+        if candidates:
+            chosen = _match_offered(text, candidates)
+            if chosen is None:
+                pending["retries"] += 1
+                if pending["retries"] > 2:
+                    session.pending = None
+                    await _speak(session, BOOKING_NOT_CONFIRMED_BN)
+                    return True
+                await _speak(session, near_match_prompt(candidates))
+                return True
+            spoken = chosen["name"]
+        slots = dict(pending["slots"])
+        slots["doctor_name"] = spoken
+        slots.pop("doctor_name_bn", None)
+        await _open_booking(session, slots, language, turns=pending.get("turns", 1),
+                            retries=pending.get("retries", 0),
+                            offered_date=pending.get("offered_date"))
+        return True
+
     # Remaining states (date / time_slot / patient_name / phone) all share
     # the same shape: parse the ONE field awaited, fill it in, ask for the
     # next missing one or finish the booking.
+    # "Caller names only a doctor": day+time and name+phone are asked
+    # together (_next_booking_step), so the answer to "date" may also carry
+    # the time, and the answer to "patient_name" the phone. Whatever half is
+    # found is kept; only a still-missing field is asked next.
+    slots = pending["slots"]
+
+    # "Caller asks for the earliest available appointment" (and a refused
+    # write's free alternatives): the answer may pick one of the slots just
+    # offered. It fills date + time; anything else is read as before.
+    offered_slots = pending.get("offered_slots")
+    if offered_slots and awaiting in ("date", "time_slot"):
+        chosen = _pick_offered_slot(text, offered_slots,
+                                    yes_takes_first=pending.get("offer_kind") != "taken")
+        if chosen is not None:
+            pending.pop("offered_slots", None)
+            _apply_booking_date(slots, chosen["date"])
+            slots["time_slot"] = chosen["time_slot"]
+            pending["retries"] = 0
+            await _open_booking(session, slots, language, turns=pending.get("turns", 1),
+                                offered_date=chosen["date"])
+            return True
+
+    # "Caller says tomorrow, ...": the answer to "do you mean X, or Y?".
+    if awaiting == "date" and slots.get("date_candidates") is not None:
+        chosen = _pick_date_candidate(text, slots["date_candidates"])
+        if chosen:
+            _apply_booking_date(slots, chosen)          # said back in the question
+            if not slots.get("time_slot") and parse_time(text):
+                slots["time_slot"] = parse_time(text)
+            pending["retries"] = 0
+            await _open_booking(session, slots, language, turns=pending.get("turns", 1),
+                                offered_date=pending.get("offered_date"))
+            return True
+        if is_negative(text):
+            slots.pop("date_candidates", None)
+            pending["retries"] = 0
+            await _speak(session, missing_slot_prompt("book_appointment", "date", language=language))
+            return True
+
+    # "সবচেয়ে তাড়াতাড়ি যেটা আছে" in answer to the day question: offer the
+    # earliest free slots, exactly as if it had been asked up front.
+    if (awaiting == "date" and slots.get("doctor_name") and wants_earliest(text)
+            and parse_date(text) is None):
+        await _offer_earliest(session, slots, language, turns=pending.get("turns", 1))
+        return True
+
     value = None
+    also = {}
+    took_offer = False
     if awaiting == "date":
         value = parse_date(text, offered_date=pending.get("offered_date"))
+        took_offer = value is not None and value == pending.get("offered_date") and is_affirmative(text)
+        if value is None and pending.get("offered_date") and _starts_affirmative(text):
+            # "হ্যাঁ, সকাল দশটায়" -- yes to the offered day, plus a time.
+            value, took_offer = pending["offered_date"], True
+        # A weekday named after "next week" means that weekday IN that week.
+        rng = slots.get("date_range")
+        said_day = spoken_day_word(text)
+        if value and rng and said_day in _EXPR_DAY_KEYS and said_day not in ("today", "tomorrow",
+                                                                              "day_after_tomorrow"):
+            first = datetime.date.fromisoformat(rng[0])
+            value = next((first + datetime.timedelta(days=i)).isoformat() for i in range(7)
+                         if (first + datetime.timedelta(days=i)).strftime("%A").lower() == said_day)
+        if not slots.get("time_slot"):
+            also["time_slot"] = parse_time(text)
     elif awaiting == "time_slot":
         value = parse_time(text)
     elif awaiting == "phone":
         value = parse_phone(text)
     elif awaiting == "patient_name":
-        value = _clean_patient_name(text)
+        value, phone = _split_name_and_phone(text)
+        if not slots.get("phone"):
+            also["phone"] = phone
+    also = {k: v for k, v in also.items() if v}
 
-    if value is None:
+    if value is None and not also:
         pending["retries"] += 1
         if pending["retries"] > 2:
             session.pending = None
@@ -2620,18 +3939,29 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         await _speak(session, missing_slot_prompt("book_appointment", awaiting, language=language))
         return True
 
-    pending["slots"][awaiting] = value
+    if awaiting == "date" and value is not None:
+        # E13-S7 follow-up: "কাল" answering "কোন দিন?" is calculated here
+        # (parse_date) and remembered with the word it came from, so it is
+        # rechecked before anything else is asked. A bare "হ্যাঁ" taking a
+        # day the AGENT offered is not a calculation and needs no recheck.
+        # The one rule: a date the caller gave is rechecked ("date" marks a
+        # calendar date); one the AGENT offered and they took is not.
+        _apply_booking_date(slots, value, None if took_offer else (spoken_day_word(text) or "date"))
+    elif value is not None:
+        slots[awaiting] = value
+    slots.update(also)
     pending["retries"] = 0
-    missing = _next_missing(pending["slots"])
-    if missing is None:
-        # Every field is filled, but nothing is written yet. Read the whole
-        # thing back and wait for a yes -- see the "confirm_booking" state
-        # above for why an affirmative is required rather than assumed.
-        pending["awaiting"] = "confirm_booking"
-        await _speak(session, booking_confirmation_prompt(pending["slots"], language=language))
+    # A new day or time goes back through _open_booking, so a day the doctor
+    # does not sit, or a time outside their hours, gets the nearest
+    # alternative now rather than a refused write after the readback.
+    if awaiting in ("date", "time_slot") and slots.get("doctor_name"):
+        await _open_booking(session, slots, language, turns=pending.get("turns", 1),
+                            offered_date=pending.get("offered_date"))
         return True
-    pending["awaiting"] = missing
-    await _speak(session, missing_slot_prompt("book_appointment", missing, language=language))
+    # Every field filled -> the readback (nothing is written until a yes --
+    # see the "confirm_booking" state above); else the recheck of a
+    # calculated date, then the next missing field.
+    await _next_booking_step(session, pending, language)
     return True
 
 
@@ -2791,6 +4121,16 @@ async def _answer_part(session: CallSession, text: str, part: dict) -> str:
         await _speak(session, "দুঃখিত, বুঝতে পারিনি। আবার একটু বলবেন?")
         return UNANSWERABLE
 
+    if intent == "reschedule_appointment":
+        # E4-S3. A question back to the caller, so any later part waits.
+        await _start_reschedule(session)
+        return INTERACTIVE
+
+    if intent == "cancel_appointment":
+        # E4-S4. Same: the caller is asked whether to cancel or move it.
+        await _start_cancel(session)
+        return INTERACTIVE
+
     try:
         if intent == "test_rate":
             if not slots.get("test_name"):
@@ -2815,6 +4155,10 @@ async def _answer_part(session: CallSession, text: str, part: dict) -> str:
         elif intent == "doctor_availability":
             if not slots.get("doctor_name"):
                 await _speak(session, missing_slot_prompt(intent, "doctor_name"))
+                return INTERACTIVE
+            if not (slots.get("date") or slots.get("date_expr")) and wants_earliest(text):
+                await _open_booking(session, {"doctor_name": slots["doctor_name"],
+                                              "want_earliest": True}, detect_language(text))
                 return INTERACTIVE
             # Default to TODAY, not "whenever next available": a bare
             # "ডাক্তার সেন আছেন?" with no date mentioned is a caller
@@ -2846,32 +4190,10 @@ async def _answer_part(session: CallSession, text: str, part: dict) -> str:
             #   single day -> answer it.
             #   absent     -> no day was mentioned; today is the question
             #                 the caller actually asked.
-            span = date_calc.resolve(text, slots.get("date_expr"))
-            if span.needs_confirmation:
-                logger.info("[%s] %s -> %s..%s, confirming the range",
-                            session.call_id, span.expression, span.start, span.end)
-                session.pending = {
-                    "awaiting": "confirm_date",
-                    "slots": {"doctor_name": slots["doctor_name"]},
-                    "candidates": None, "offered_date": span.start, "retries": 0,
-                    "resume_intent": "doctor_availability", "span_end": span.end,
-                }
-                await _speak(session, date_range_confirm_prompt(span.start, span.end))
+            date_iso = await _date_gate(session, text, slots, intent, {"doctor_name": slots["doctor_name"]},
+                                        detect_language(text))
+            if date_iso is None:
                 return INTERACTIVE
-            if span.source == date_calc.SOURCE_UNMAPPED:
-                logger.info("[%s] caller named a day the vocabulary cannot express "
-                            "-- asking instead of assuming", session.call_id)
-                session.pending = {
-                    "awaiting": "availability_date",
-                    "slots": {"doctor_name": slots["doctor_name"]},
-                    "candidates": None, "offered_date": None, "retries": 0,
-                }
-                await _speak(session, missing_slot_prompt(intent, "date"))
-                return INTERACTIVE
-            if span.source == SOURCE_INTERPRETED:
-                logger.info("[%s] date interpreted: %s -> %s",
-                            session.call_id, span.expression, span.start)
-            date_iso = span.start or datetime.date.today().isoformat()
             result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
             if await _speak_fact(session, intent, slots, result,
                                  doctor_availability_reply(slots, result),
@@ -2926,32 +4248,10 @@ async def _answer_part(session: CallSession, text: str, part: dict) -> str:
             #   single day -> answer it.
             #   absent     -> no day was mentioned; today is the question
             #                 the caller actually asked.
-            span = date_calc.resolve(text, slots.get("date_expr"))
-            if span.needs_confirmation:
-                logger.info("[%s] %s -> %s..%s, confirming the range",
-                            session.call_id, span.expression, span.start, span.end)
-                session.pending = {
-                    "awaiting": "confirm_date",
-                    "slots": {"department": slots["department"]},
-                    "candidates": None, "offered_date": span.start, "retries": 0,
-                    "resume_intent": "doctors_by_department", "span_end": span.end,
-                }
-                await _speak(session, date_range_confirm_prompt(span.start, span.end))
+            date_iso = await _date_gate(session, text, slots, intent, {"department": slots["department"]},
+                                        detect_language(text))
+            if date_iso is None:
                 return INTERACTIVE
-            if span.source == date_calc.SOURCE_UNMAPPED:
-                logger.info("[%s] caller named a day the vocabulary cannot express "
-                            "-- asking instead of assuming", session.call_id)
-                session.pending = {
-                    "awaiting": "department_date",
-                    "slots": {"department": slots["department"]},
-                    "candidates": None, "offered_date": None, "retries": 0,
-                }
-                await _speak(session, missing_slot_prompt(intent, "date"))
-                return INTERACTIVE
-            if span.source == SOURCE_INTERPRETED:
-                logger.info("[%s] date interpreted: %s -> %s",
-                            session.call_id, span.expression, span.start)
-            date_iso = span.start or datetime.date.today().isoformat()
             result = await _tools.get_doctors_by_department(slots["department"], date_iso)
             if await _speak_fact(session, intent, slots, result,
                                  doctors_by_department_reply(slots, result),
@@ -2996,89 +4296,18 @@ async def _answer_part(session: CallSession, text: str, part: dict) -> str:
             # Merge onto whatever session.pending already knows (e.g. a
             # doctor_name carried over from a doctor_availability or
             # doctors_by_department turn moments ago) rather than
-            # requiring every field in one utterance -- that all-or-
-            # nothing check was the other half of "pipeline breaking":
-            # a caller who gave the doctor and date in one sentence and
-            # the time in the next used to have the doctor/date silently
-            # discarded the moment ANY field was still missing.
-            merged = dict(session.pending["slots"]) if session.pending else {}
-            for field in _BOOKING_FIELDS:
-                if slots.get(field):
-                    merged[field] = slots[field]
-
-            # story title: The model never originates a fact
-            # user story: As a clinical lead, I want every price, date and identifier
-            #   to come from a verified system response, so that a wrong answer is a
-            #   data bug rather than a model bug.
-            # acceptance criteria: Every factual sentence is a template substitution
-            #   from a validated tool response and the model is never shown a figure
-            #   it could restate. An automated assertion on every commit proves no
-            #   model-composed span reaches synthesis on a factual intent.
+            # requiring every field in one utterance.
             #
-            # The booking path is the one place that ALREADY had a
-            # verifier: every field below is read back in full and an
-            # explicit হ্যাঁ is required before _finish_booking writes
-            # anything, so a mis-resolved date here is caught by the one
-            # party who knows what "কাল" meant. That readback is not
-            # touched by this story and must not be weakened by it.
-            #
-            # What this adds is removing the model from the loop wherever
-            # a deterministic parser can do the same job on the same
-            # words -- a date, a time and a phone number are all things
-            # slot_parse.py resolves in code. Only fields the model
-            # claimed from THIS utterance are corrected; a value carried
-            # over from an earlier turn was already parsed locally by
-            # _continue_pending and must not be re-derived from a
-            # transcript that no longer mentions it.
-            for field, parser in (("time_slot", parse_time), ("phone", parse_phone)):
-                if not slots.get(field):
-                    continue
-                parsed = parser(text)
-                if parsed and parsed != merged.get(field):
-                    logger.warning("[%s] %s disagreement: model=%s parsed=%s -- using parsed",
-                                   session.call_id, field, merged.get(field), parsed)
-                    merged[field] = parsed
-
-            # The date is not merged from `slots` at all any more, because
-            # `slots["date"]` now holds the caller's WORDS ("১৫ তারিখ"),
-            # not a calendar date -- llm.py stopped producing those. Only a
-            # value date_calc computed may be stored, or the API would be
-            # handed a Bengali phrase and _next_missing() would report the
-            # field as filled while holding something unusable.
-            #
-            # A RANGE is dropped rather than confirmed here: a booking is
-            # one slot on one day, so "আগামী সপ্তাহে অ্যাপয়েন্টমেন্ট চাই"
-            # has to become a specific day, and leaving the field empty
-            # makes _next_missing() ask for exactly that. The range
-            # confirmation belongs to the two read-only intents, which can
-            # actually answer about a span.
-            if slots.get("date") or slots.get("date_expr"):
-                span = date_calc.resolve(text, slots.get("date_expr"))
-                if span.start and not span.is_range:
-                    merged["date"] = span.start
-                else:
-                    merged.pop("date", None)
-
-            missing = _next_missing(merged)
-            if missing is None:
-                # Everything arrived in one utterance. That is the case
-                # MOST in need of a readback, not least: five fields pulled
-                # from a single sentence of phone audio is where a
-                # mishearing is likeliest and least visible. Route it
-                # through the same confirmation state as the slow path.
-                session.pending = {
-                    "awaiting": "confirm_booking", "slots": merged,
-                    "candidates": None,
-                    "offered_date": merged.get("date"), "retries": 0,
-                }
-                await _speak(session, booking_confirm_prompt(merged))
-                return INTERACTIVE
-
-            session.pending = {
-                "awaiting": missing, "slots": merged, "candidates": None,
-                "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
-            }
-            await _speak(session, missing_slot_prompt(intent, missing))
+            # E13-S7: the same two helpers as the main dispatcher, so a
+            # booking sentence is read identically whichever route it takes.
+            # The date/time/phone reading that used to live inline here
+            # (date_calc for the date, the local parsers for time and phone)
+            # is inside _booking_slots_from_turn, with one fix: the phone is
+            # found in the sentence, not taken as its last ten digits.
+            merged = _booking_slots_from_turn(
+                text, slots, session.pending["slots"] if session.pending else None)
+            await _open_booking(session, merged, detect_language(text),
+                                offered_date=(session.pending or {}).get("offered_date"))
             return INTERACTIVE
 
     except ToolCallError as e:
@@ -3214,7 +4443,14 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
         # caught -- the final readback faithfully reads back whatever was
         # captured, so a name misheard three turns earlier is confirmed by a
         # caller who hears their own answer echoed correctly.
-        skip_zones = ("confirm_transcript", "confirm_booking")
+        # E4-S3: resched_confirm is a yes/no to a full readback -- the same
+        # reason confirm_booking is exempt.
+        # E4-S4: so is cancel_confirm. NOT cancel_confirm_charge: agreeing to
+        # a charge on a doubtful transcript is echoed back first.
+        # E13-S7 follow-up: so is confirm_booking_date -- a yes to a date
+        # just read back in full.
+        skip_zones = ("confirm_transcript", "confirm_booking", "resched_confirm",
+                      "cancel_confirm", "confirm_booking_date", "confirm_date")
         already_confirming = bool(session.pending) and \
             session.pending.get("awaiting") in skip_zones
         if turn_zone == confidence.CONFIRM and not resumed_from_confirm \
@@ -3590,6 +4826,10 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 if not slots.get("doctor_name"):
                     await _speak(session, missing_slot_prompt(intent, "doctor_name", language=language))
                     return
+                if not (slots.get("date") or slots.get("date_expr")) and wants_earliest(text):
+                    await _open_booking(session, {"doctor_name": slots["doctor_name"],
+                                                  "want_earliest": True}, language)
+                    return
                 # Default to TODAY, not "whenever next available": a bare
                 # "ডাক্তার সেন আছেন?" with no date mentioned is a caller
                 # asking about right now, and the reply text below already
@@ -3598,7 +4838,10 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 # different question ("when next"), so a doctor who simply
                 # wasn't in today got reported by their NEXT sitting date
                 # instead of "not today, but they're on Tuesdays" etc.
-                date_iso = slots.get("date") or datetime.date.today().isoformat()
+                date_iso = await _date_gate(session, text, slots, intent,
+                                            {"doctor_name": slots["doctor_name"]}, language)
+                if date_iso is None:
+                    return
                 result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
                 await _speak(session, doctor_availability_reply(slots, result, language=language))
                 _remember_primary_entity(session, intent, slots, result)
@@ -3640,6 +4883,10 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 if not slots.get("doctor_name"):
                     await _speak(session, missing_slot_prompt(intent, "doctor_name", language=language))
                     return
+                if wants_earliest(text):
+                    await _open_booking(session, {"doctor_name": slots["doctor_name"],
+                                                  "want_earliest": True}, language)
+                    return
                 result = await _tools.get_doctor_schedule(slots["doctor_name"])
                 # UPDATED BY SOURAV -- KCD-385 near-match fix. clinic-api's
                 # doctor_schedule() endpoint now resolves the name through
@@ -3676,7 +4923,10 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 # every doctor the department has ever employed regardless
                 # of whether they sit this week. Only an EXPLICIT date
                 # bypasses this (used as-is below).
-                date_iso = slots.get("date") or datetime.date.today().isoformat()
+                date_iso = await _date_gate(session, text, slots, intent,
+                                            {"department": slots["department"]}, language)
+                if date_iso is None:
+                    return
                 result = await _tools.get_doctors_by_department(slots["department"], date_iso)
                 await _speak(session, doctors_by_department_reply(slots, result, language=language))
 
@@ -3714,6 +4964,17 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 else:
                     session.pending = None
 
+            elif intent == "reschedule_appointment":
+                # E4-S3. Checked BEFORE book_appointment: moving an existing
+                # appointment must never become a second booking.
+                await _start_reschedule(session)
+
+            elif intent == "cancel_appointment":
+                # E4-S4. Also BEFORE book_appointment. The model has only
+                # recognised the wish; the flow asks cancel-or-move first,
+                # and the charge comes from clinic-api's rules file.
+                await _start_cancel(session)
+
             elif intent == "book_appointment":
                 # Merge onto whatever session.pending already knows (e.g. a
                 # doctor_name carried over from a doctor_availability or
@@ -3723,31 +4984,17 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 # a caller who gave the doctor and date in one sentence and
                 # the time in the next used to have the doctor/date silently
                 # discarded the moment ANY field was still missing.
-                merged = dict(session.pending["slots"]) if session.pending else {}
-                for field in _BOOKING_FIELDS:
-                    if slots.get(field):
-                        merged[field] = slots[field]
-
-                missing = _next_missing(merged)
-                if missing is None:
-                    # A caller who gave all 5 fields in one breath still
-                    # gets the pre-write readback -- this is the SAME gap
-                    # the multi-turn flow had (see _continue_pending's
-                    # "confirm_booking" state): a single-shot utterance is
-                    # exactly as capable of a misheard phone digit as one
-                    # collected field-by-field.
-                    session.pending = {
-                        "awaiting": "confirm_booking", "slots": merged, "candidates": None,
-                        "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
-                    }
-                    await _speak(session, booking_confirmation_prompt(merged, language=language))
-                    return
-
-                session.pending = {
-                    "awaiting": missing, "slots": merged, "candidates": None,
-                    "offered_date": (session.pending or {}).get("offered_date"), "retries": 0,
-                }
-                await _speak(session, missing_slot_prompt(intent, missing, language=language))
+                #
+                # E13-S7 "Caller gives everything in one sentence": every
+                # field is read from THIS sentence (the date by date_calc --
+                # this branch used to copy the model's `date` words and
+                # ignore `date_expr`), the doctor is checked once, and only
+                # a missing or unbookable field is asked. With nothing
+                # missing, the caller hears the readback on this very turn.
+                merged = _booking_slots_from_turn(
+                    text, slots, session.pending["slots"] if session.pending else None)
+                await _open_booking(session, merged, language,
+                                    offered_date=(session.pending or {}).get("offered_date"))
 
             elif intent == "request_callback":
                 # ADDED BY SOURAV -- "Caller asks to be called back" story
@@ -3872,7 +5119,8 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
 # of intents that never get a real inline answer in a COMBINED turn,
 # regardless of slot completeness -- see _resolve_combinable_intent_fragment's
 # own docstring just below for why each is excluded rather than composed.
-_MULTI_INTENT_NEEDS_SEPARATE_FLOW = {"book_appointment", "report_status", "report_send"}
+_MULTI_INTENT_NEEDS_SEPARATE_FLOW = {"book_appointment", "report_status", "report_send",
+                                     "reschedule_appointment", "cancel_appointment"}
 _MULTI_INTENT_NO_FRAGMENT = {"smalltalk", "unclear"}
 
 
@@ -3985,7 +5233,9 @@ async def _resolve_combinable_intent_fragment(intent: str, slots: dict, language
     if intent == "doctor_availability":
         if not slots.get("doctor_name"):
             return multi_intent_missing_info_reply(language=language)
-        date_iso = slots.get("date") or datetime.date.today().isoformat()
+        if slots.get("date") or slots.get("date_expr"):
+            return multi_intent_needs_separate_flow_reply(language=language)
+        date_iso = datetime.date.today().isoformat()
         result = await _tools.get_doctor_availability(slots["doctor_name"], date_iso)
         return doctor_availability_reply(slots, result, language=language)
 
@@ -3998,7 +5248,9 @@ async def _resolve_combinable_intent_fragment(intent: str, slots: dict, language
     if intent == "doctors_by_department":
         if not slots.get("department"):
             return multi_intent_missing_info_reply(language=language)
-        date_iso = slots.get("date") or datetime.date.today().isoformat()
+        if slots.get("date") or slots.get("date_expr"):
+            return multi_intent_needs_separate_flow_reply(language=language)
+        date_iso = datetime.date.today().isoformat()
         result = await _tools.get_doctors_by_department(slots["department"], date_iso)
         return doctors_by_department_reply(slots, result, language=language)
 

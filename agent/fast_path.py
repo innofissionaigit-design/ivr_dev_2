@@ -145,7 +145,18 @@ _AVAIL_CUES = ("কখন", "বসবেন", "বসেন", "চেম্ব�
 # the difference, rather than silently keep guessing the wrong intent.
 _SCHEDULE_CUES = ("কবে", "সময়সূচি", "শিডিউল")
 _BOOK_CUES = ("বুক", "বুকিং", "অ্যাপয়েন্টমেন্ট", "অ্যাপয়েনমেন্ট", "সিরিয়াল",
-              "নাম লেখা", "স্লট")
+              "নাম লেখা", "স্লট",
+              # E4-S3 -- moving an existing appointment. Checked first, like
+              # every booking cue, so the fast path abstains. Without these,
+              # "ডাক্তার সেনের চেম্বারের সময়টা পিছিয়ে দিন" hits the
+              # availability cue চেম্বার plus doctor সেন and would be answered
+              # as an availability question.
+              "বদলাতে", "বদলানো", "পাল্টাতে", "পিছিয়ে", "এগিয়ে", "সরাতে", "সরিয়ে",
+              "রিশিডিউল", "রিসিডিউল",
+              # E4-S4 -- cancelling. Same reason: "ডাক্তার সেনের চেম্বারে কাল
+              # আসতে পারব না" carries an availability cue and a doctor, and
+              # must reach the model, which knows it is a cancellation.
+              "বাতিল", "ক্যানসেল", "ক্যান্সেল", "আসতে পারব না")
 _GREETING_CUES = ("নমস্কার", "নমষ্কার", "হ্যালো", "হ্যালো?", "শুভ সকাল", "আসসালামু")
 _THANKS_CUES = ("ধন্যবাদ", "থ্যাঙ্ক", "থ্যাংক")
 

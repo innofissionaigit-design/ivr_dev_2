@@ -42,13 +42,18 @@ from __future__ import annotations
 import logging
 
 import datetime
+import os
 import difflib
+import json
+import re
 import secrets
+import unicodedata
 import uuid
 
 from fastapi import FastAPI, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import match_band
@@ -71,7 +76,16 @@ from models import (
     InsuranceProvider, InsurancePolicy, PatientBilling,
     # ADDED BY SOURAV -- "Caller asks to be called back" story, below.
     CallbackRequest,
+    # E4-S3 "Caller moves an existing appointment" -- the move's history
+    # (which is also its idempotency record) and its queued confirmation.
+    AppointmentChange, NotificationOutbox,
+    # E4-S4 "Caller cancels an appointment" -- the cancellation and the
+    # charge it carried (also its idempotency record).
+    AppointmentCancellation,
 )
+# E4-S4: the admin's cancellation rules (cancellation_rules.txt), parsed and
+# applied by one pure module -- the only place a charge is ever computed.
+import charging_for_cancellation as charging
 # ADDED BY SOURAV -- "otp will not be hardcoded": how the freshly
 # generated code actually reaches the patient is a separate, pluggable
 # concern -- see this module's own docstring on the file below.
@@ -86,6 +100,14 @@ from report_delivery_config import build_report_link_url, send_report_link_via_p
 app = FastAPI(title="Kolkata Care Diagnostics -- Clinic Data API (dummy)")
 
 SLOT_STEP_MIN = 15
+
+# "Caller asks for the earliest available appointment": how many days ahead
+# the earliest-slot search looks, and how soon a slot TODAY may start (a slot
+# 10 minutes from now cannot be reached). Clinic settings, from the
+# environment; defaults 14 days (the same window _next_available_date uses)
+# and 30 minutes.
+EARLIEST_SLOT_HORIZON_DAYS = int(os.environ.get("EARLIEST_SLOT_HORIZON_DAYS", "14"))
+EARLIEST_SLOT_LEAD_MINUTES = int(os.environ.get("EARLIEST_SLOT_LEAD_MINUTES", "30"))
 
 
 @app.on_event("startup")
@@ -103,6 +125,11 @@ def _ensure_seeded():
     """
     from db import engine
     from models import Base, LabTest
+    # E4-S4: converts an existing appointments table (adds status, and
+    # replaces the full-table uq_doctor_slot with an index over active rows)
+    # BEFORE create_all, which can create new tables but never alter one.
+    import migrations
+    migrations.upgrade(engine)
     Base.metadata.create_all(engine)
     db = SessionLocal()
     try:
@@ -602,6 +629,7 @@ def _next_available_date(db: Session, doctor_id: int, from_date: datetime.date,
 
 @app.get("/api/v1/doctors/availability")
 def doctor_availability(name: str = Query(...), date: str | None = Query(None),
+                         time: str | None = Query(None, pattern=r"^\d{2}:\d{2}$"),
                          db: Session = Depends(get_db)):
     verdict, doctor, offered = _resolve_doctor(db, name)
     if verdict == match_band.AMBIGUOUS:
@@ -618,12 +646,24 @@ def doctor_availability(name: str = Query(...), date: str | None = Query(None),
             return {"found": False, "query": name}
         sched = _schedule_for_weekday(db, doctor.id, target.weekday())
         if sched:
-            return {
+            reply = {
                 "found": True, "doctor_name": doctor.name,
                 "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": target.isoformat(),
                 "available": True, "chamber_hours": f"{sched.start_time}-{sched.end_time}",
                 "next_available_date": None,
             }
+            # "Requested slot is already taken": with a time, also say
+            # whether that slot is free right now, and if not, what is.
+            if time:
+                now = datetime.datetime.now()
+                lead = now + datetime.timedelta(minutes=EARLIEST_SLOT_LEAD_MINUTES)
+                too_soon = target < now.date() or (
+                    target == now.date() and (lead.date() != target or time < lead.strftime("%H:%M")))
+                reply["slot_free"] = not too_soon and time in _free_slots(
+                    db, doctor.id, target.isoformat(), sched, limit=None)
+                if not reply["slot_free"]:
+                    reply.update(_slot_alternatives(db, doctor.id, target.isoformat(), time))
+            return reply
         next_date = _next_available_date(db, doctor.id, target + datetime.timedelta(days=1))
         return {
             "found": True, "doctor_name": doctor.name,
@@ -863,16 +903,20 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
 
     valid_slots = _generate_slots(sched.start_time, sched.end_time)
     if req.time_slot not in valid_slots:
-        return {"success": False, "reason": "slot_taken", "alternative_slots": valid_slots[:3]}
+        # Not one of his 15-minute slots. Used to return valid_slots[:3]
+        # with no check for bookings -- a booked slot could be offered.
+        return {"success": False, "reason": "slot_taken",
+                **_slot_alternatives(db, doctor.id, req.date, req.time_slot)}
 
     taken = {
         a.time_slot for a in db.query(Appointment).filter_by(
-            doctor_id=doctor.id, date=req.date,
+            # E4-S4: a cancelled appointment no longer holds its slot.
+            doctor_id=doctor.id, date=req.date, status="active",
         ).all()
     }
     if req.time_slot in taken:
-        free = [s for s in valid_slots if s not in taken][:3]
-        return {"success": False, "reason": "slot_taken", "alternative_slots": free}
+        return {"success": False, "reason": "slot_taken",
+                **_slot_alternatives(db, doctor.id, req.date, req.time_slot)}
 
     confirmation_id = f"KCD-{req.date.replace('-', '')}-{uuid.uuid4().hex[:4].upper()}"
     appt = Appointment(
@@ -881,7 +925,18 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
         created_at=datetime.datetime.now(),
     )
     db.add(appt)
-    db.commit()
+    # E4-S3: the "is it taken?" check above and this insert are two
+    # statements, so two callers can both pass the check. uq_doctor_slot then
+    # rejects the second insert -- which used to escape as an unhandled
+    # IntegrityError (HTTP 500), so the losing caller heard "cannot check
+    # right now" about a slot that was simply taken. Same root cause the
+    # reschedule swap below relies on, handled the same way.
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"success": False, "reason": "slot_taken",
+                **_slot_alternatives(db, doctor.id, req.date, req.time_slot)}
 
     return {
         "success": True, "confirmation_id": confirmation_id,
@@ -889,6 +944,611 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
         "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": req.date, "time_slot": req.time_slot,
     }
 
+
+# =============================================================================
+# E4-S3 -- Caller moves an existing appointment
+#
+#   GET   /api/v1/appointments/lookup?phone=&name=&reference=
+#   GET   /api/v1/appointments/{reference}/availability?date=
+#   PATCH /api/v1/appointments/{reference}
+#
+# story title: Caller moves an existing appointment
+# user story: As a patient whose plans changed, I want to move my appointment
+#   without cancelling it, so that I do not lose my place entirely.
+# acceptance criteria: The booking is found by contact number, name or
+#   reference. The new slot is swapped atomically, holding the old one until
+#   the new commits, and a failed swap leaves the original intact.
+#   Confirmation is sent on both channels.
+#
+# Plan and decisions D1-D6: docs/stories/E4-S3-reschedule-plan.md.
+# =============================================================================
+
+def _free_slots(db: Session, doctor_id: int, date_iso: str, sched: DoctorSchedule,
+                limit: int | None = 3) -> list[str]:
+    """The doctor's bookable slots on that date that nobody holds, earliest
+    first. Read fresh from the table, so it reflects every committed write.
+    limit=None -> all of them."""
+    taken = {a.time_slot for a in db.query(Appointment).filter_by(
+        doctor_id=doctor_id, date=date_iso, status="active").all()}  # E4-S4
+    return [s for s in _generate_slots(sched.start_time, sched.end_time)
+            if s not in taken][:limit]
+
+
+def _hhmm_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _slot_alternatives(db: Session, doctor_id: int, date_iso: str, time_slot: str) -> dict:
+    """"Requested slot is already taken" (docs/stories/slot-taken-alternatives-plan.md).
+
+    THE one definition of what may be offered instead of a taken (or
+    invalid) time, used by the booking write's refusals AND by the check
+    before the readback, so both say the same thing:
+      alternative_slots -- the 2 free slots that day nearest in minutes to
+                           the time asked (a tie goes to the earlier),
+                           in time order;
+      other_day_slot    -- the same time on the nearest other day (either
+                           side, never in the past, within the horizon) on
+                           which the doctor sits and that time is free. If
+                           the time asked is not a slot, the nearest slot
+                           time that day stands in for it.
+    Read from the ACTIVE appointments at call time. Today: nothing already
+    passed or inside the lead time. (A future slot hold -- E4-S1 -- belongs
+    here too: a held slot is not free.)
+    """
+    now = datetime.datetime.now()
+    today = now.date()
+    lead = now + datetime.timedelta(minutes=EARLIEST_SLOT_LEAD_MINUTES)
+    cut = lead.strftime("%H:%M") if lead.date() == today else "24:00"
+
+    def usable(day: datetime.date, t: str) -> bool:
+        return day > today or (day == today and t >= cut)
+
+    target = datetime.date.fromisoformat(date_iso)
+    asked = _hhmm_minutes(time_slot)
+    same, ref = [], time_slot
+    sched = _schedule_for_weekday(db, doctor_id, target.weekday())
+    if sched:
+        valid = _generate_slots(sched.start_time, sched.end_time)
+        free = [t for t in _free_slots(db, doctor_id, date_iso, sched, limit=None)
+                if t != time_slot and usable(target, t)]
+        nearest = sorted(free, key=lambda t: (abs(_hhmm_minutes(t) - asked), _hhmm_minutes(t)))[:2]
+        same = sorted(nearest)
+        if time_slot not in valid and valid:
+            ref = min(valid, key=lambda t: (abs(_hhmm_minutes(t) - asked), _hhmm_minutes(t)))
+
+    other = None
+    for dist in range(1, EARLIEST_SLOT_HORIZON_DAYS + 1):
+        for day in (target - datetime.timedelta(days=dist), target + datetime.timedelta(days=dist)):
+            if day < today or not usable(day, ref):
+                continue
+            day_sched = _schedule_for_weekday(db, doctor_id, day.weekday())
+            if day_sched and ref in _free_slots(db, doctor_id, day.isoformat(), day_sched, limit=None):
+                other = {"date": day.isoformat(), "time_slot": ref}
+                break
+        if other:
+            break
+    return {"alternative_slots": same, "other_day_slot": other}
+
+
+# =============================================================================
+# "Caller asks for the earliest available appointment"
+#
+#   GET /api/v1/doctors/earliest-slots?name=...&limit=3
+#
+# Read only. The doctor's first free slots, earliest first, walking forward
+# from today up to EARLIEST_SLOT_HORIZON_DAYS. Built from the SAME functions
+# the booking write uses to accept a slot (_schedule_for_weekday,
+# _generate_slots, _free_slots over ACTIVE appointments), so an offered slot
+# is one the write would accept at the moment it was read. Nothing is held:
+# the write re-checks, and refuses a slot taken in between.
+# Plan: docs/stories/earliest-appointment-plan.md.
+# =============================================================================
+@app.get("/api/v1/doctors/earliest-slots")
+def doctor_earliest_slots(name: str = Query(...), limit: int = Query(3, ge=1, le=10),
+                          db: Session = Depends(get_db)):
+    verdict, doctor, offered = _resolve_doctor(db, name)
+    if verdict == match_band.AMBIGUOUS:
+        return _ambiguous_reply(name, offered)
+    if not doctor:
+        return {"found": False, "query": name}
+
+    now = datetime.datetime.now()
+    today = now.date()
+    earliest_today = (now + datetime.timedelta(minutes=EARLIEST_SLOT_LEAD_MINUTES)).strftime("%H:%M")
+    slots = []
+    for offset in range(EARLIEST_SLOT_HORIZON_DAYS):
+        day = today + datetime.timedelta(days=offset)
+        sched = _schedule_for_weekday(db, doctor.id, day.weekday())
+        if not sched:
+            continue
+        # A lead time past midnight means nothing is left today.
+        if offset == 0 and (now + datetime.timedelta(minutes=EARLIEST_SLOT_LEAD_MINUTES)).date() != today:
+            continue
+        for t in _free_slots(db, doctor.id, day.isoformat(), sched, limit=None):
+            if offset == 0 and t < earliest_today:
+                continue
+            slots.append({"date": day.isoformat(), "time_slot": t,
+                          "chamber_hours": f"{sched.start_time}-{sched.end_time}"})
+            if len(slots) >= limit:
+                break
+        if len(slots) >= limit:
+            break
+
+    return {
+        "found": True, "doctor_name": doctor.name,
+        "doctor_name_bn": _first_alias_bn(doctor.aliases_bn),
+        "horizon_days": EARLIEST_SLOT_HORIZON_DAYS, "slots": slots,
+        "as_of": now.isoformat(timespec="seconds"),
+    }
+
+
+# [REASONED, not measured] How close a spoken patient name must be to the
+# stored one. Never decisive on its own: D1 below means a phone number or a
+# reference must ALSO agree, so a false accept needs two independent errors.
+# Calibrate on real ASR spellings of patient names before trusting it.
+NAME_MATCH_FLOOR = 0.75
+
+# DECISION D1 -- any TWO of {phone, name, reference} must point at the same
+# appointment before anything about it is returned. One factor alone is
+# refused, identically whether or not something would have matched, so the
+# endpoint cannot be used to probe. A stand-in for OTP (Blueprint 4.10,
+# E7-S2), which does not exist for bookings yet. One constant, not a design.
+MIN_IDENTITY_FACTORS = 2
+
+
+def _phone_key(s: str | None) -> str | None:
+    """Last 10 digits, or None. "+91 98765 43210" == "9876543210"."""
+    digits = re.sub(r"\D", "", s or "")
+    return digits[-10:] if len(digits) >= 10 else None
+
+
+def _name_key(s: str | None) -> str:
+    return " ".join(unicodedata.normalize("NFC", s or "").split()).strip().lower()
+
+
+def _reference_key(s: str | None) -> str:
+    return re.sub(r"[^0-9A-Z]", "", (s or "").upper())
+
+
+def _name_matches(spoken: str | None, stored: str | None) -> bool:
+    a, b = _name_key(spoken), _name_key(stored)
+    if not a or not b:
+        return False
+    if a == b or b in a:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= NAME_MATCH_FLOOR
+
+
+def _reference_matches(spoken: str | None, stored: str | None) -> bool:
+    """Tolerates stray letters around a spoken ID (stored contained in
+    spoken) and a dropped "KCD" prefix or a suffix-only answer (stored ends
+    with spoken). At least 4 characters, so "C" cannot match everything."""
+    a, b = _reference_key(spoken), _reference_key(stored)
+    if len(a) < 4 or not b:
+        return False
+    return b in a or b.endswith(a)
+
+
+def _appointment_summary(appt: Appointment) -> dict:
+    """EVERYTHING a caller may be told about an appointment. Phone and
+    patient name are never returned by any endpoint in this section."""
+    return {
+        "reference": appt.confirmation_id,
+        "doctor_name": appt.doctor.name,
+        "doctor_name_bn": _first_alias_bn(appt.doctor.aliases_bn),
+        "date": appt.date,
+        "time_slot": appt.time_slot,
+    }
+
+
+@app.get("/api/v1/appointments/lookup")
+def lookup_appointments(phone: str | None = Query(None), name: str | None = Query(None),
+                        reference: str | None = Query(None),
+                        db: Session = Depends(get_db)):
+    """AC1. Future appointments that at least MIN_IDENTITY_FACTORS of the
+    given factors agree on. Several matches are all returned (earliest
+    first); the agent asks which, and never takes the likeliest (E14-S4)."""
+    phone_k, name_k, ref_k = _phone_key(phone), _name_key(name), _reference_key(reference)
+    given = sum(1 for k in (phone_k, name_k, ref_k) if k)
+    if given < MIN_IDENTITY_FACTORS:
+        return {"found": False, "reason": "insufficient_identification", "matches": []}
+
+    today = datetime.date.today().isoformat()
+    rows = (db.query(Appointment)
+            .filter(Appointment.date >= today,
+                    Appointment.status == "active")  # E4-S4: never offer a cancelled one
+            .order_by(Appointment.date.asc(), Appointment.time_slot.asc())
+            .all())
+    matches = []
+    for appt in rows:
+        factors = 0
+        if phone_k and _phone_key(appt.phone) == phone_k:
+            factors += 1
+        if name_k and _name_matches(name, appt.patient_name):
+            factors += 1
+        if ref_k and _reference_matches(reference, appt.confirmation_id):
+            factors += 1
+        if factors >= MIN_IDENTITY_FACTORS:
+            matches.append(_appointment_summary(appt))
+    return {"found": bool(matches), "matches": matches}
+
+
+@app.get("/api/v1/appointments/{reference}/availability")
+def appointment_availability(reference: str, date: str = Query(...),
+                             db: Session = Depends(get_db)):
+    """Does THIS appointment's doctor sit on `date`?
+
+    Scoped to the appointment, never to a doctor NAME: re-matching by name
+    goes through match_band, which can land on a different doctor or come
+    back ambiguous (the seed has both "Dr. Sen" and "Dr. A. Sen"), and a
+    reschedule must only ever talk about the doctor it already has. Returns
+    no doctor and no patient field -- a reference alone reveals nothing but
+    chamber hours.
+    """
+    appt = db.query(Appointment).filter_by(confirmation_id=reference,
+                                           status="active").first()  # E4-S4
+    if appt is None:
+        return {"found": False, "query": reference}
+    try:
+        target = datetime.date.fromisoformat(date)
+    except ValueError:
+        return {"found": False, "query": reference}
+    sched = _schedule_for_weekday(db, appt.doctor_id, target.weekday())
+    if sched:
+        return {"found": True, "date": target.isoformat(), "available": True,
+                "chamber_hours": f"{sched.start_time}-{sched.end_time}",
+                "next_available_date": None}
+    return {"found": True, "date": target.isoformat(), "available": False,
+            "chamber_hours": None,
+            "next_available_date": _next_available_date(
+                db, appt.doctor_id, target + datetime.timedelta(days=1))}
+
+
+class RescheduleRequest(BaseModel):
+    new_date: str
+    new_time_slot: str
+    # The slot that was READ BACK to the caller. The move only happens if
+    # the appointment is still in it (see the conditional UPDATE below).
+    expected_date: str
+    expected_time_slot: str
+    # Blueprint 4.9: call_id + action id, so a retry can never move twice.
+    idempotency_key: str
+    call_id: str | None = None
+
+
+def _stored_result(db: Session, key: str) -> dict | None:
+    row = db.query(AppointmentChange).filter_by(idempotency_key=key).first()
+    return json.loads(row.result_json) if row else None
+
+
+_OUTBOX_FIELDS = ("reference", "doctor_name", "doctor_name_bn",
+                  "old_date", "old_time_slot", "new_date", "new_time_slot")
+
+
+def _record_change(db: Session, appt: Appointment, req: RescheduleRequest,
+                   result: dict) -> None:
+    """History + outbox rows, INSIDE the caller's transaction. Never commits."""
+    now = datetime.datetime.now()
+    db.add(AppointmentChange(
+        appointment_id=appt.id,
+        old_date=result["old_date"], old_time_slot=result["old_time_slot"],
+        new_date=result["new_date"], new_time_slot=result["new_time_slot"],
+        call_id=req.call_id, idempotency_key=req.idempotency_key,
+        result_json=json.dumps(result, ensure_ascii=False), created_at=now,
+    ))
+    db.add(NotificationOutbox(
+        appointment_id=appt.id, kind="reschedule_confirmation", channel="sms",
+        template_id="reschedule_confirmation_v1",
+        payload_json=json.dumps({k: result[k] for k in _OUTBOX_FIELDS}, ensure_ascii=False),
+        status="pending", created_at=now,
+    ))
+    db.flush()
+
+
+@app.patch("/api/v1/appointments/{reference}")
+def reschedule_appointment(reference: str, req: RescheduleRequest,
+                           db: Session = Depends(get_db)):
+    """AC2 -- the atomic swap.
+
+    Every refusal below returns BEFORE any write, so the original is
+    untouched. The write itself is one transaction: a conditional UPDATE of
+    the appointment row (it matches only if the row is still in the slot
+    that was read back), the history row and the outbox row. The row keeps
+    its old slot until COMMIT; uq_doctor_slot makes the new slot exclusive;
+    any failure rolls all three back together. The doctor is ALWAYS
+    appt.doctor_id -- never re-matched by name (D4).
+    """
+    stored = _stored_result(db, req.idempotency_key)
+    if stored is not None:
+        return stored
+
+    # E4-S4: a cancelled appointment cannot be moved -- it reads as not found.
+    appt = db.query(Appointment).filter_by(confirmation_id=reference, status="active").first()
+    if appt is None:
+        return {"success": False, "reason": "not_found"}
+
+    today = datetime.date.today()
+    if appt.date < today.isoformat():
+        return {"success": False, "reason": "past"}
+    if (appt.date, appt.time_slot) != (req.expected_date, req.expected_time_slot):
+        return {"success": False, "reason": "conflict",
+                "current_date": appt.date, "current_time_slot": appt.time_slot}
+    try:
+        target = datetime.date.fromisoformat(req.new_date)
+    except ValueError:
+        return {"success": False, "reason": "invalid_date"}
+    if target < today:  # D3: date-level only, no minimum notice
+        return {"success": False, "reason": "past"}
+    if (req.new_date, req.new_time_slot) == (appt.date, appt.time_slot):
+        return {"success": False, "reason": "same_slot"}
+
+    sched = _schedule_for_weekday(db, appt.doctor_id, target.weekday())
+    if not sched:
+        return {"success": False, "reason": "doctor_not_available_that_day",
+                "next_available_date": _next_available_date(
+                    db, appt.doctor_id, target + datetime.timedelta(days=1))}
+    if req.new_time_slot not in _generate_slots(sched.start_time, sched.end_time):
+        return {"success": False, "reason": "slot_taken",
+                "alternative_slots": _free_slots(db, appt.doctor_id, req.new_date, sched)}
+
+    # Built BEFORE the update, while the ORM object still holds the old slot.
+    result = {
+        "success": True, **_appointment_summary(appt),
+        "old_date": appt.date, "old_time_slot": appt.time_slot,
+        "new_date": req.new_date, "new_time_slot": req.new_time_slot,
+        "date": req.new_date, "time_slot": req.new_time_slot,
+    }
+    appt_id, doctor_id = appt.id, appt.doctor_id
+
+    try:
+        moved = db.execute(
+            update(Appointment)
+            .where(Appointment.id == appt_id,
+                   Appointment.status == "active",  # E4-S4: not cancelled meanwhile
+                   Appointment.date == req.expected_date,
+                   Appointment.time_slot == req.expected_time_slot)
+            .values(date=req.new_date, time_slot=req.new_time_slot)
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        if moved != 1:
+            # Changed between our read and our write. Say so; never overwrite.
+            db.rollback()
+            stored = _stored_result(db, req.idempotency_key)
+            if stored is not None:
+                return stored
+            current = db.get(Appointment, appt_id)
+            return {"success": False, "reason": "conflict",
+                    "current_date": current.date if current else None,
+                    "current_time_slot": current.time_slot if current else None}
+        _record_change(db, appt, req, result)
+        db.commit()
+    except IntegrityError:
+        # uq_doctor_slot: somebody holds the new slot. Or a concurrent retry
+        # of THIS request won the idempotency_key -- then replay its answer.
+        db.rollback()
+        stored = _stored_result(db, req.idempotency_key)
+        if stored is not None:
+            return stored
+        return {"success": False, "reason": "slot_taken",
+                "alternative_slots": _free_slots(db, doctor_id, req.new_date, sched)}
+    except Exception:
+        db.rollback()
+        raise
+    return result
+
+
+# =============================================================================
+# E4-S4 -- Caller cancels an appointment
+#
+#   GET  /api/v1/appointments/{reference}/cancellation-quote
+#   POST /api/v1/appointments/{reference}/cancel
+#
+# story title: Caller cancels an appointment
+# user story: As a patient who cannot attend, I want to cancel and be told any
+#   charge clearly, so that I am not surprised by a deduction later.
+# acceptance criteria: Cancellation applies the configured window rules and
+#   states refund eligibility from policy, never improvised. A cancellation
+#   within a charging window is confirmed explicitly with the charge stated
+#   before it is applied.
+#
+# The rules are the admin's text file (cancellation_rules.txt), applied by
+# charging_for_cancellation.py. The quote the caller HEARS and the charge that
+# is RECORDED both come from _quote_now() below -- and the cancel endpoint
+# computes it AGAIN at commit, refusing if it differs from what the caller
+# was told. Plan and decisions: docs/stories/E4-S4-cancel-plan.md.
+# =============================================================================
+
+def _now() -> datetime.datetime:
+    """The only clock the cancellation rules see (tests replace it)."""
+    return datetime.datetime.now(charging.CLINIC_TZ)
+
+
+def _cancellation_policy(now: datetime.datetime):
+    """The admin's rules, read fresh on EVERY request -- a saved edit applies
+    to the next caller with no restart. None whenever they cannot be used:
+    missing, not understood, unapproved, or not yet in force. None means
+    nothing is cancelled by phone; a charge is never guessed."""
+    path = os.environ.get("CANCELLATION_RULES_PATH", charging.DEFAULT_RULES_PATH)
+    try:
+        policy = charging.load_policy(path)
+    except charging.PolicyError as e:
+        logging.getLogger("clinic-api").error("cancellation rules unusable: %s", e)
+        return None
+    if not charging.is_in_force(policy, now):
+        logging.getLogger("clinic-api").warning(
+            "cancellation rules %s start on %s -- not in force yet",
+            policy.version, policy.effective_from)
+        return None
+    return policy
+
+
+def _quote_now(appt: Appointment, policy, now: datetime.datetime) -> dict:
+    start = charging.appointment_start(appt.date, appt.time_slot)
+    return charging.quote_cancellation(policy, start, now).to_dict()
+
+
+# Every key a quote can carry, so both shapes of a found=true response have
+# the same keys (null where they do not apply) and the agent's contract can
+# require all of them.
+_EMPTY_QUOTE = {"cancellable": False, "reason": None, "window_id": None, "hours_before": None,
+                "charge_inr": 0, "refund_eligibility": None, "refund_percent": None,
+                "policy_version": None}
+
+
+@app.get("/api/v1/appointments/{reference}/cancellation-quote")
+def cancellation_quote(reference: str, db: Session = Depends(get_db)):
+    """What cancelling THIS appointment NOW would cost, under the rules.
+
+    Writes nothing. Returns no doctor, date, phone or name: the agent already
+    holds the appointment it identified through the two-factor lookup."""
+    appt = db.query(Appointment).filter_by(confirmation_id=reference).first()
+    if appt is None:
+        return {"found": False, "reason": "not_found", "query": reference}
+    if appt.status != "active":
+        return {"found": False, "reason": "already_cancelled", "query": reference}
+    now = _now()
+    policy = _cancellation_policy(now)
+    if policy is None:
+        return {"found": True, "reference": reference,
+                **_EMPTY_QUOTE, "reason": "policy_unavailable"}
+    return {"found": True, "reference": reference, **_quote_now(appt, policy, now)}
+
+
+class CancelRequest(BaseModel):
+    # The slot that was READ BACK to the caller.
+    expected_date: str
+    expected_time_slot: str
+    # The quote that was SPOKEN to the caller. The cancel only happens if
+    # the rules, applied now, still give exactly this.
+    expected_window_id: str
+    expected_charge_inr: int
+    policy_version: str
+    # True only after the caller explicitly agreed to a stated charge.
+    charge_confirmed: bool = False
+    # Blueprint 4.9: call_id + action id, so a retry can never cancel -- or
+    # charge -- twice.
+    idempotency_key: str
+    call_id: str | None = None
+
+
+def _stored_cancellation(db: Session, key: str) -> dict | None:
+    row = db.query(AppointmentCancellation).filter_by(idempotency_key=key).first()
+    return json.loads(row.result_json) if row else None
+
+
+_CANCEL_OUTBOX_FIELDS = ("reference", "doctor_name", "doctor_name_bn", "date", "time_slot",
+                         "charge_inr", "charge_status", "refund_eligibility",
+                         "refund_percent", "policy_version")
+
+
+def _record_cancellation(db: Session, appointment_id: int, req: CancelRequest,
+                         quote: dict, result: dict) -> None:
+    """Cancellation + outbox rows, INSIDE the caller's transaction. Never
+    commits. The outbox payload carries no phone and no patient name."""
+    now = datetime.datetime.now()
+    db.add(AppointmentCancellation(
+        appointment_id=appointment_id, policy_version=quote["policy_version"],
+        window_id=quote["window_id"], hours_before=quote["hours_before"],
+        charge_inr=quote["charge_inr"], charge_status=result["charge_status"],
+        refund_eligibility=quote["refund_eligibility"], refund_percent=quote["refund_percent"],
+        call_id=req.call_id, idempotency_key=req.idempotency_key,
+        result_json=json.dumps(result, ensure_ascii=False), created_at=now,
+    ))
+    db.add(NotificationOutbox(
+        appointment_id=appointment_id, kind="cancellation_confirmation", channel="sms",
+        template_id="cancellation_confirmation_v1",
+        payload_json=json.dumps({k: result[k] for k in _CANCEL_OUTBOX_FIELDS}, ensure_ascii=False),
+        status="pending", created_at=now,
+    ))
+    db.flush()
+
+
+@app.post("/api/v1/appointments/{reference}/cancel")
+def cancel_appointment(reference: str, req: CancelRequest, db: Session = Depends(get_db)):
+    """AC1 + AC2, enforced here and not only in the dialogue.
+
+    Every refusal returns BEFORE any write. The write is one transaction: a
+    conditional UPDATE (matches only while the row is still active and still
+    in the slot that was read back), the cancellation row with its charge,
+    and the outbox row. Any failure rolls all three back together.
+    """
+    stored = _stored_cancellation(db, req.idempotency_key)
+    if stored is not None:
+        return stored
+
+    appt = db.query(Appointment).filter_by(confirmation_id=reference).first()
+    if appt is None:
+        return {"success": False, "reason": "not_found"}
+    if appt.status != "active":
+        return {"success": False, "reason": "already_cancelled"}
+    if (appt.date, appt.time_slot) != (req.expected_date, req.expected_time_slot):
+        return {"success": False, "reason": "conflict",
+                "current_date": appt.date, "current_time_slot": appt.time_slot}
+
+    now = _now()
+    policy = _cancellation_policy(now)
+    if policy is None:
+        return {"success": False, "reason": "policy_unavailable"}
+    quote = _quote_now(appt, policy, now)
+    if not quote["cancellable"]:
+        return {"success": False, "reason": quote["reason"], "quote": quote}
+    # The caller agreed to what they HEARD. If a window boundary passed, or
+    # the admin changed the rules, while they were answering, that is no
+    # longer the charge -- never apply a charge the caller did not hear.
+    if (quote["window_id"], quote["charge_inr"], quote["policy_version"]) != (
+            req.expected_window_id, req.expected_charge_inr, req.policy_version):
+        return {"success": False, "reason": "quote_changed", "quote": quote}
+    if quote["charge_inr"] > 0 and not req.charge_confirmed:
+        return {"success": False, "reason": "charge_not_confirmed", "quote": quote}
+
+    # Built BEFORE the update, while the ORM object still holds the slot.
+    result = {
+        "success": True, **_appointment_summary(appt),
+        "charge_inr": quote["charge_inr"],
+        "charge_status": "pending_collection" if quote["charge_inr"] > 0 else "none",
+        "refund_eligibility": quote["refund_eligibility"],
+        "refund_percent": quote["refund_percent"],
+        "window_id": quote["window_id"], "policy_version": quote["policy_version"],
+    }
+    appt_id = appt.id
+
+    try:
+        cancelled = db.execute(
+            update(Appointment)
+            .where(Appointment.id == appt_id,
+                   Appointment.status == "active",
+                   Appointment.date == req.expected_date,
+                   Appointment.time_slot == req.expected_time_slot)
+            # Naive clinic wall time, like every other DateTime column here.
+            .values(status="cancelled", cancelled_at=now.replace(tzinfo=None))
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        if cancelled != 1:
+            # Changed between our read and our write. Say so; never overwrite.
+            db.rollback()
+            stored = _stored_cancellation(db, req.idempotency_key)
+            if stored is not None:
+                return stored
+            current = db.get(Appointment, appt_id)
+            if current is None or current.status != "active":
+                return {"success": False, "reason": "already_cancelled"}
+            return {"success": False, "reason": "conflict",
+                    "current_date": current.date, "current_time_slot": current.time_slot}
+        _record_cancellation(db, appt_id, req, quote, result)
+        db.commit()
+    except IntegrityError:
+        # A concurrent retry of THIS request won the idempotency key.
+        db.rollback()
+        stored = _stored_cancellation(db, req.idempotency_key)
+        if stored is not None:
+            return stored
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    return result
 
 # =============================================================================
 # Tool 5: GET /api/v1/reports/status?phone=...&test_name=... (optional)

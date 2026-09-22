@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime
 import re
+import unicodedata
 
 _BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 
@@ -45,6 +46,39 @@ _RELATIVE_DAYS = {
     "কাল": 1, "আগামীকাল": 1, "কালকে": 1,
     "পরশু": 2, "পরশুদিন": 2,
 }
+
+# E13-S7 follow-up: the same three days said in Latin script -- English, and
+# the Banglish/Hinglish spellings a code-switching caller (or the ASR) uses.
+# Matched as whole words with \b, which IS reliable for Latin script (the
+# Bengali-aware boundary below exists because \b is not). "kal" here means
+# tomorrow: this parser only ever reads a day for something being booked or
+# asked about ahead, never a day gone by.
+_RELATIVE_DAYS_LATIN = {
+    "today": 0, "aaj": 0, "aj": 0, "aajke": 0, "ajke": 0,
+    "tomorrow": 1, "kal": 1, "kaal": 1, "kalke": 1, "agamikal": 1,
+    "day after tomorrow": 2, "porshu": 2, "porshudin": 2, "parso": 2, "parson": 2,
+}
+
+# "Caller says tomorrow, day after, or next Monday": weekday names in Latin
+# script (English, Hinglish, Banglish) are read by code too, so a Latin-script
+# caller's day can be checked against the model's reading. Like the Bengali
+# names they mean the COMING one; a qualifier ("next", "agle") is not read
+# here on purpose -- where the model reads it as "a week later", the two
+# readings differ and the caller is asked (docs/stories/relative-dates-plan.md).
+_WEEKDAYS_LATIN = {
+    "monday": 0, "somvaar": 0, "somvar": 0, "sombar": 0,
+    "tuesday": 1, "mangalvaar": 1, "mangalvar": 1, "mongolbar": 1,
+    "wednesday": 2, "budhvaar": 2, "budhvar": 2, "budhbar": 2,
+    "thursday": 3, "guruvaar": 3, "guruvar": 3, "brihaspativaar": 3, "brihospotibar": 3,
+    "friday": 4, "shukravaar": 4, "shukravar": 4, "shukrobar": 4,
+    "saturday": 5, "shanivaar": 5, "shanivar": 5, "shonibar": 5,
+    "sunday": 6, "ravivaar": 6, "ravivar": 6, "itvaar": 6, "robibar": 6,
+}
+
+# What a day word MEANS, as a key the reply templates can say in any
+# language ("tomorrow" -> "আগামীকাল" / "Tomorrow" / "Kal"), for the recheck.
+_RELATIVE_KEY = {0: "today", 1: "tomorrow", 2: "day_after_tomorrow"}
+_WEEKDAY_KEY = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 # Kept deliberately small and exact-match only (see is_affirmative /
 # is_negative below) -- these gate whole-utterance decisions like "abandon
@@ -162,6 +196,41 @@ def _bn_bounded(word: str, text: str) -> bool:
     return re.search(rf"(?<!{_BN_CHAR}){re.escape(word)}(?!{_BN_CHAR})", text) is not None
 
 
+def _match_day_word(t: str) -> tuple[str, int] | None:
+    """-> ("relative", days from today) or ("weekday", 0-6), for the FIRST
+    kind found: a relative day word (Bengali, then Latin script) before a
+    weekday name, longest word first -- the order parse_date always used."""
+    for word in sorted(_RELATIVE_DAYS, key=len, reverse=True):
+        if _bn_bounded(word, t):
+            return "relative", _RELATIVE_DAYS[word]
+    lowered = t.lower()
+    for word in sorted(_RELATIVE_DAYS_LATIN, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(word)}\b", lowered):
+            return "relative", _RELATIVE_DAYS_LATIN[word]
+    for word in sorted(_WEEKDAYS_BN, key=len, reverse=True):
+        if _bn_bounded(word, t):
+            return "weekday", _WEEKDAYS_BN[word]
+    for word in sorted(_WEEKDAYS_LATIN, key=len, reverse=True):
+        if re.search(rf"\b{word}\b", lowered):
+            return "weekday", _WEEKDAYS_LATIN[word]
+    return None
+
+
+def spoken_day_word(text: str) -> str | None:
+    """-> what the caller's day word MEANS ("today" | "tomorrow" |
+    "day_after_tomorrow" | "monday" .. "sunday"), or None when the sentence
+    names no such word (an explicit "১৫ তারিখ", or no day at all).
+
+    E13-S7 follow-up. A date the agent CALCULATED from one of these words is
+    read back to the caller with the word and the weekday ("আগামীকাল মানে
+    রবিবার, ...") before it is used -- see main.py's _apply_booking_date."""
+    matched = _match_day_word(_nfc(text or "").translate(_BN_DIGITS))
+    if matched is None:
+        return None
+    kind, n = matched
+    return _RELATIVE_KEY[n] if kind == "relative" else _WEEKDAY_KEY[n]
+
+
 def parse_date(text: str, today: datetime.date | None = None,
                 offered_date: str | None = None) -> str | None:
     """-> ISO date string, or None if not confident.
@@ -204,16 +273,18 @@ def parse_date(text: str, today: datetime.date | None = None,
     # "no Bengali character adjacent" instead does what \b was meant to do.
     #
     # Longest key first so a shorter key can never consume part of a longer
-    # one -- "কাল" must not fire inside "আগামীকাল".
-    for word in sorted(_RELATIVE_DAYS, key=len, reverse=True):
-        if _bn_bounded(word, t):
-            return (today + datetime.timedelta(days=_RELATIVE_DAYS[word])).isoformat()
-
-    for word in sorted(_WEEKDAYS_BN, key=len, reverse=True):
-        if _bn_bounded(word, t):
-            days_ahead = (_WEEKDAYS_BN[word] - today.weekday()) % 7
-            days_ahead = days_ahead or 7  # naming today's weekday means NEXT week's
-            return (today + datetime.timedelta(days=days_ahead)).isoformat()
+    # one -- "কাল" must not fire inside "আগামীকাল". The matching itself now
+    # lives in _match_day_word(), shared with spoken_day_word() below, so the
+    # word that is CONFIRMED with the caller is always the word the date was
+    # computed from.
+    matched = _match_day_word(t)
+    if matched is not None:
+        kind, n = matched
+        if kind == "relative":
+            return (today + datetime.timedelta(days=n)).isoformat()
+        days_ahead = (n - today.weekday()) % 7
+        days_ahead = days_ahead or 7  # naming today's weekday means NEXT week's
+        return (today + datetime.timedelta(days=days_ahead)).isoformat()
 
     # Explicit ISO date (e.g. carried over from an earlier LLM extraction).
     m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", t)
@@ -381,6 +452,46 @@ _DIGIT_WORDS = {
 _DIGIT_WORD_RE = re.compile(r"\b(" + "|".join(_DIGIT_WORDS) + r")\b", re.IGNORECASE)
 
 
+# E4-S3. NFC so "য়" arrives in one encoding whether it came from the ASR or
+# from a literal in this file -- it has two, and they do not compare equal.
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+
+# Single digits as a Bengali caller reads a number aloud, including the
+# English words said in Bengali script. Matched as WHOLE TOKENS only (see
+# _tokens), which is why these are not folded into _DIGIT_WORD_RE: \b does
+# not behave on Bengali vowel signs.
+_BN_DIGIT_WORDS = {_nfc(k): v for k, v in {
+    "শূন্য": "0", "জিরো": "0",
+    "এক": "1", "ওয়ান": "1",
+    "দুই": "2", "দু": "2", "টু": "2",
+    "তিন": "3", "থ্রি": "3",
+    "চার": "4", "ফোর": "4",
+    "পাঁচ": "5", "ফাইভ": "5",
+    "ছয়": "6", "ছ": "6", "সিক্স": "6",
+    "সাত": "7", "সেভেন": "7",
+    "আট": "8", "এইট": "8",
+    "নয়": "9", "নাইন": "9",
+}.items()}
+
+# How a Latin letter in a confirmation reference is spoken. The reverse of
+# bn_normalize._LETTER_BN, kept local so this module stays a leaf; a
+# round-trip test against bn_normalize.spell_out() catches any divergence.
+_LETTER_WORDS = {_nfc(k): v for k, v in {
+    "এ": "A", "বি": "B", "সি": "C", "ডি": "D", "ই": "E", "এফ": "F", "জি": "G",
+    "এইচ": "H", "আই": "I", "জে": "J", "কে": "K", "এল": "L", "এম": "M",
+    "এন": "N", "ও": "O", "পি": "P", "কিউ": "Q", "আর": "R", "এস": "S",
+    "টি": "T", "ইউ": "U", "ভি": "V", "ডব্লিউ": "W", "এক্স": "X", "ওয়াই": "Y", "জেড": "Z",
+}.items()}
+
+_RE_TOKEN_SPLIT = re.compile(r"[\s,।\-–—.:/]+")
+
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in _RE_TOKEN_SPLIT.split(_nfc(text).translate(_BN_DIGITS)) if t]
+
+
 def parse_phone(text: str) -> str | None:
     """-> a 10-digit phone number, or None if the utterance doesn't
     contain enough digits to be one.
@@ -427,14 +538,116 @@ def parse_phone(text: str) -> str | None:
     re-prompt... rather than guess"). Flagged in this story's test report,
     not silently absorbed.
     """
-    translated = text.translate(_BN_DIGITS)
+    # E4-S3: Bengali single-digit words too ("নয় আট সাত ..."), resolved
+    # TOKEN BY TOKEN so a digit word is never pulled out of the middle of an
+    # unrelated word. Compound numbers ("নিরানব্বই" = 99) are deliberately
+    # not recognised: a number read in pairs yields too few digits and the
+    # caller is asked again -- the same fail-closed rule as "eight zeros".
+    #
+    # NUMERALS WIN. "9876543210 এক মিনিট দাঁড়ান" ("... one minute, wait")
+    # carries a digit WORD after a complete number. Folding every digit word
+    # in turned that into 98765432101 and the last ten into 8765432101 -- a
+    # different person's number, in flows (report status, billing, callback)
+    # that identify the caller by phone alone. So when the caller already
+    # said ten numerals, digit words are ignored and the result is exactly
+    # what this function returned before E4-S3.
+    translated = _nfc(text).translate(_BN_DIGITS)
+    numerals = re.sub(r"\D", "", translated)
+    if len(numerals) >= 10:
+        return numerals[-10:]  # tolerate a spoken +91 / leading 0 trunk prefix
+
     words_resolved = _DIGIT_WORD_RE.sub(
         lambda m: _DIGIT_WORDS[m.group(1).lower()], translated,
     )
-    digits = re.sub(r"\D", "", words_resolved)
-    if len(digits) < 10:
+    digits = "".join(_BN_DIGIT_WORDS.get(tok) or re.sub(r"\D", "", tok)
+                     for tok in _tokens(words_resolved))
+    if len(digits) == 10:
+        return digits
+    # A number read as WORDS has no boundary a stray "one"/"এক" cannot cross.
+    # More than ten digits is only accepted as a known trunk prefix -- a
+    # leading 0, or 91 -- never by guessing which end the extra digit is on.
+    if len(digits) == 11 and digits.startswith("0"):
+        return digits[1:]
+    if len(digits) == 12 and digits.startswith("91"):
+        return digits[2:]
+    return None
+
+
+# story title: Caller moves an existing appointment (E4-S3)
+# user story: As a patient whose plans changed, I want to move my appointment
+#   without cancelling it, so that I do not lose my place entirely.
+# acceptance criteria: The booking is found by contact number, name or
+#   reference. The new slot is swapped atomically, holding the old one until
+#   the new commits, and a failed swap leaves the original intact.
+#   Confirmation is sent on both channels.
+#
+# The two parsers below serve the reschedule flow: a spoken confirmation
+# reference ("the booking is found by ... reference") and a choice out of the
+# two or three appointments just read out (E14-S4: several matches are
+# resolved by asking, never by taking the likeliest). Same trust model as
+# everything above -- None when not sure.
+
+def parse_reference(text: str) -> str | None:
+    """-> a confirmation reference as uppercase letters and digits (e.g.
+    "KCD202609154F0C"), or None if not confident.
+
+    Built from the longest run of consecutive letter/digit tokens, so filler
+    around it ("আমার নম্বর ...") is dropped. bn_normalize.spell_out() reads
+    an ID in comma-separated groups, and commas split tokens here, so a
+    reference read back the way the agent says it parses back whole.
+
+    Requires at least one letter AND at least four digits: a bare phone
+    number has no letter, and a stray word has no digits, so neither is ever
+    read as a reference. clinic-api still requires a second identifying
+    factor to agree before it returns anything.
+    """
+    best, run = "", []
+    for tok in _tokens(text) + [""]:
+        if tok in _BN_DIGIT_WORDS:
+            run.append(_BN_DIGIT_WORDS[tok])
+        elif tok.lower() in _DIGIT_WORDS:
+            run.append(_DIGIT_WORDS[tok.lower()])
+        elif tok in _LETTER_WORDS:
+            run.append(_LETTER_WORDS[tok])
+        elif tok and re.fullmatch(r"[0-9A-Za-z]+", tok):
+            run.append(tok.upper())
+        else:
+            candidate = "".join(run)
+            if len(candidate) > len(best):
+                best = candidate
+            run = []
+    if sum(c.isdigit() for c in best) >= 4 and any(c.isalpha() for c in best):
+        return best
+    return None
+
+
+_ORDINALS = {_nfc(k): v for k, v in {
+    "প্রথম": 1, "এক": 1, "1": 1,
+    "দ্বিতীয়": 2, "দুই": 2, "2": 2,
+    "তৃতীয়": 3, "তিন": 3, "3": 3,
+    "শেষ": -1, "শেষের": -1,
+}.items()}
+_ORDINAL_SUFFIXES = ("টাই", "টা", "টি")
+
+
+def parse_ordinal(text: str, count: int) -> int | None:
+    """-> 0-based index of the option the caller picked out of `count`
+    options just read to them ("দ্বিতীয়টা", "প্রথম", "শেষেরটা"), or None if
+    no single option is named or it is out of range. "প্রথম না দ্বিতীয়"
+    names two, so it is None -- asked again, never guessed."""
+    picked = set()
+    for tok in _tokens(text):
+        for suffix in _ORDINAL_SUFFIXES:
+            if tok.endswith(suffix) and tok[:-len(suffix)] in _ORDINALS:
+                tok = tok[:-len(suffix)]
+                break
+        if tok in _ORDINALS:
+            n = _ORDINALS[tok]
+            picked.add(count - 1 if n == -1 else n - 1)
+    if len(picked) != 1:
         return None
-    return digits[-10:]  # tolerate a spoken +91 / leading 0 trunk prefix
+    index = picked.pop()
+    return index if 0 <= index < count else None
 
 
 def parse_otp(text: str) -> str | None:
@@ -522,3 +735,127 @@ _CALLBACK_WORDS = (
 def looks_like_callback_preference(text: str) -> bool:
     lowered = (text or "").lower()
     return any(w in lowered for w in _CALLBACK_WORDS)
+
+
+# story title: Caller cancels an appointment (E4-S4)
+# user story: As a patient who cannot attend, I want to cancel and be told any
+#   charge clearly, so that I am not surprised by a deduction later.
+# acceptance criteria: Cancellation applies the configured window rules and
+#   states refund eligibility from policy, never improvised. A cancellation
+#   within a charging window is confirmed explicitly with the charge stated
+#   before it is applied.
+#
+# Two local readers for the cancel flow in main.py. Neither consults the
+# model: each answers one question the agent just asked.
+
+# "Move it instead" -- hands the caller to the E4-S3 reschedule flow. Checked
+# BEFORE yes/no, because "না, অন্য দিনে সরাতে চাই" is a request to move, not
+# a refusal of everything.
+_MOVE_CUES = tuple(_nfc(c) for c in (
+    "সরাতে", "সরিয়ে", "সরান", "সরাব", "পিছিয়ে", "এগিয়ে", "বদলাতে", "বদলে", "পাল্টাতে",
+    "অন্য দিন", "অন্যদিন", "অন্য সময়", "রিশিডিউল", "রিসিডিউল",
+    "reschedule", "shift", "move", "postpone", "onno din", "sorate", "change",
+))
+_CANCEL_CUES = tuple(_nfc(c) for c in ("বাতিল", "ক্যানসেল", "ক্যান্সেল", "cancel", "batil"))
+# "বাতিল করবেন না" names the action AND refuses it.
+_NEGATION_TOKENS = {_nfc(t) for t in (
+    "না", "নাহ", "নয়", "নি", "no", "not", "don't", "dont", "nahi", "na")}
+
+
+def parse_cancel_choice(text: str) -> str | None:
+    """-> "move" | "cancel" | "keep" | None, for the answer to "cancel it,
+    or move it to another day?". None means neither was said clearly: the
+    question is asked again, never guessed."""
+    key = _nfc(text or "").lower()
+    if any(cue in key for cue in _MOVE_CUES):
+        return "move"
+    if is_negative(text):
+        return "keep"
+    if is_affirmative(text) or is_explicit_consent(text):
+        return "cancel"
+    if any(cue in key for cue in _CANCEL_CUES):
+        words = {t.strip("?!;").lower() for t in _tokens(text)}
+        return "keep" if words & _NEGATION_TOKENS else "cancel"
+    return None
+
+
+# Agreement to a stated CHARGE. Deliberately narrower than _AFFIRMATIVE:
+# "হুম", "ওকে", "হবে", "চলবে", "সেদিন" are fine for confirming a readback,
+# but a grunt or a date word must never count as agreeing to pay. Every
+# phrase here names the action or the agreement, and the charge question
+# tells the caller exactly what to say (reply_templates.cancel_charge_prompt).
+# Exact membership, so "রাজি না" and "বাতিল করবেন না" are not consent.
+# DECISION D4 (needs a human sign-off): this exact list.
+_EXPLICIT_CONSENT = {_nfc(phrase) for phrase in (
+    # Bengali
+    "হ্যাঁ বাতিল করুন", "হ্যা বাতিল করুন", "বাতিল করুন", "বাতিল করে দিন",
+    "হ্যাঁ বাতিল করে দিন", "রাজি", "রাজি আছি", "হ্যাঁ রাজি", "হ্যাঁ রাজি আছি",
+    "চার্জ দিতে রাজি", "হ্যাঁ চার্জ দিতে রাজি",
+    # English
+    "yes cancel", "yes cancel it", "cancel it", "i agree", "yes i agree",
+    # Hinglish / Banglish
+    "haan cancel karo", "cancel karo", "cancel kore din", "haan cancel kore din",
+    "raji", "raji achi",
+)}
+
+
+def is_explicit_consent(text: str) -> bool:
+    key = _nfc(text or "").lower()
+    key = re.sub(r"[।!?.,;]+", " ", key)
+    return re.sub(r"\s+", " ", key).strip() in _EXPLICIT_CONSENT
+
+
+# story title: Caller gives everything in one sentence (E13-S7)
+# user story: As a caller who already knows what I want, I want to say it all
+#   at once and only confirm, so that a simple booking takes one exchange
+#   rather than five.
+# acceptance criteria: A caller who states doctor, day, time and patient name
+#   in the opening utterance is asked only to confirm. Every slot is filled
+#   from that single turn and no question already answered is asked again.
+#
+# parse_phone() is built for a turn that answers "what is your number?", so
+# it takes the LAST ten digits it hears. In a whole booking sentence that is
+# wrong: "আমার নম্বর ৯৮৭৬৫৪৩২১০, কাল সকাল ১০:৩০ এ" gave 5432101030, because
+# the time's digits came last. This reads a sentence instead: exactly ONE run
+# of digits (spaces or hyphens allowed inside it) that is a phone number, or
+# nothing. Two different numbers is nothing too -- the caller is asked.
+_RE_DIGIT_RUN = re.compile(r"\d(?:[ \-]?\d)*")
+
+
+def find_phone_in_sentence(text: str) -> str | None:
+    t = _nfc(text or "").translate(_BN_DIGITS)
+    found = set()
+    for run in _RE_DIGIT_RUN.findall(t):
+        digits = re.sub(r"\D", "", run)
+        if (len(digits) == 10 or (len(digits) == 11 and digits.startswith("0"))
+                or (len(digits) == 12 and digits.startswith("91"))):
+            found.add(digits[-10:])
+    if len(found) == 1:
+        return found.pop()
+    if found:
+        return None
+    # No numeral phone. A number spoken as digit WORDS ("নয় আট সাত ...") is
+    # read by parse_phone, with every numeral run (a time, a date) removed
+    # first so their digits cannot be counted into it.
+    return parse_phone(_RE_DIGIT_RUN.sub(" ", t))
+
+
+# "Caller asks for the earliest available appointment". Code, not the model,
+# notices that the caller wants the FIRST free slot rather than a day they
+# name. Bengali words match at a word start (so "তাড়াতাড়িই" still counts);
+# Latin words as whole words. Checked by main.py only on a booking /
+# availability turn that names no day.
+_EARLIEST_BN = ("তাড়াতাড়ি", "তারাতারি", "তাড়াতারি", "শীঘ্র", "সবচেয়ে আগে",
+                "সব থেকে আগে", "সবার আগে", "প্রথম খালি", "আর্লিয়েস্ট")
+_EARLIEST_LATIN = re.compile(
+    r"\b(?:earliest|soonest|asap|as soon as possible|first available|"
+    r"jaldi|jaldi se jaldi|sabse pehle|taratari|taratary|tarataari|shighro|"
+    r"shob theke age|sobcheye age|sobar age)\b",
+    re.IGNORECASE)
+
+
+def wants_earliest(text: str) -> bool:
+    t = _nfc(text or "")
+    if any(re.search(rf"(?<!{_BN_CHAR}){re.escape(_nfc(w))}", t) for w in _EARLIEST_BN):
+        return True
+    return _EARLIEST_LATIN.search(t) is not None

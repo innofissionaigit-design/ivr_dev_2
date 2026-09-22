@@ -55,6 +55,9 @@ from sqlalchemy import (
     DateTime,
     UniqueConstraint,
     Text,
+    # E4-S4: the partial unique index on appointments (active rows only).
+    Index,
+    text,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -1165,6 +1168,24 @@ class Appointment(Base):
         nullable=False,
     )
 
+    # E4-S4 "Caller cancels an appointment". A cancelled appointment is KEPT,
+    # marked "cancelled" -- never deleted: foreign keys are ON and E4-S3's
+    # history and outbox rows point at it, and it is the record of what the
+    # caller was charged. Every query that means "live bookings" filters
+    # status == "active". An existing database gains these two columns
+    # through clinic-api/migrations.py (create_all cannot add them).
+    status = Column(
+        String,
+        nullable=False,
+        default="active",
+        server_default="active",
+    )
+
+    cancelled_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
     doctor = relationship(
         "Doctor",
     )
@@ -1174,12 +1195,21 @@ class Appointment(Base):
         back_populates="appointments",
     )
 
+    # E4-S4: was UniqueConstraint(doctor_id, date, time_slot, name=
+    # "uq_doctor_slot") over EVERY row, which would let a cancelled
+    # appointment hold its slot for ever. Now unique over ACTIVE rows only,
+    # so a cancelled slot can be booked again -- and a second ACTIVE row in
+    # a slot is still refused by the database itself, which the booking
+    # race and the reschedule swap (E4-S3) both rely on.
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_doctor_slot_active",
             "doctor_id",
             "date",
             "time_slot",
-            name="uq_doctor_slot",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
         ),
     )
 
@@ -1265,3 +1295,112 @@ class CallbackRequest(Base):
         DateTime,
         nullable=False,
     )
+
+# ============================================================================
+# APPOINTMENT CHANGES + NOTIFICATION OUTBOX
+# ============================================================================
+#
+# story title: Caller moves an existing appointment (E4-S3)
+# user story: As a patient whose plans changed, I want to move my appointment
+#   without cancelling it, so that I do not lose my place entirely.
+# acceptance criteria: The booking is found by contact number, name or
+#   reference. The new slot is swapped atomically, holding the old one until
+#   the new commits, and a failed swap leaves the original intact.
+#   Confirmation is sent on both channels.
+#
+# TWO NEW TABLES, AND DELIBERATELY NO NEW COLUMN ON `appointments`.
+# clinic-api builds its schema with Base.metadata.create_all(), which creates
+# MISSING TABLES but never adds a column to a table that already exists. With
+# no migration tool (E0-S4 is absent), a new column would silently not exist
+# in the live /workspace/clinic.db. New tables are created on the next start.
+#
+# Both rows are written in the SAME transaction as the move itself (see
+# clinic-api/main.py's reschedule_appointment()), so a history row or a
+# queued confirmation can never exist for a move that rolled back, and can
+# never be missing for one that committed.
+class AppointmentChange(Base):
+    """One committed move. Append-only.
+
+    Doubles as the IDEMPOTENCY RECORD (Blueprint 4.9): `idempotency_key` is
+    unique, and `result_json` is the exact response the first request got,
+    so a retry of the same request replays it instead of moving twice.
+    """
+    __tablename__ = "appointment_changes"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    old_date = Column(String, nullable=False)
+    old_time_slot = Column(String, nullable=False)
+    new_date = Column(String, nullable=False)
+    new_time_slot = Column(String, nullable=False)
+    call_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=False, unique=True)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+
+
+class NotificationOutbox(Base):
+    """A confirmation waiting to be sent on a non-voice channel.
+
+    NOTHING READS THIS TABLE YET. There is no SMS gateway and no
+    DLT-registered template (E1-S10 is absent), so rows stay "pending". The
+    voice agent therefore never says a message was sent.
+
+    `payload_json` carries field values only -- NO phone and NO patient name.
+    A sender joins `appointment_id` for the number at send time, so the
+    queue is not a second copy of the patient's contact details.
+    """
+    __tablename__ = "notification_outbox"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    kind = Column(String, nullable=False)          # "reschedule_confirmation"
+    channel = Column(String, nullable=False)       # "sms"
+    template_id = Column(String, nullable=False)   # "reschedule_confirmation_v1"
+    payload_json = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="pending")
+    created_at = Column(DateTime, nullable=False)
+
+
+# ============================================================================
+# E4-S4 -- Caller cancels an appointment
+# ============================================================================
+#
+# story title: Caller cancels an appointment
+# user story: As a patient who cannot attend, I want to cancel and be told any
+#   charge clearly, so that I am not surprised by a deduction later.
+# acceptance criteria: Cancellation applies the configured window rules and
+#   states refund eligibility from policy, never improvised. A cancellation
+#   within a charging window is confirmed explicitly with the charge stated
+#   before it is applied.
+#
+# Written in the SAME transaction as the status change (see clinic-api/
+# main.py's cancel_appointment()), with a NotificationOutbox row, so a
+# charge can never be recorded for a cancellation that rolled back, and can
+# never be missing for one that committed.
+class AppointmentCancellation(Base):
+    """One committed cancellation and the charge it carried. Append-only.
+
+    There is no payment system: `charge_status` is "none" or
+    "pending_collection" and nothing moves it yet. `refund_eligibility` is
+    what the rules said the caller is entitled to -- not a payment.
+
+    Doubles as the IDEMPOTENCY RECORD (Blueprint 4.9): `idempotency_key` is
+    unique, and `result_json` is the exact response the first request got,
+    so a retry replays it instead of cancelling -- or charging -- twice.
+    """
+    __tablename__ = "appointment_cancellations"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    policy_version = Column(String, nullable=False)   # the rules file's `version`
+    window_id = Column(String, nullable=False)        # e.g. "0-12h"
+    hours_before = Column(Float, nullable=False)
+    charge_inr = Column(Integer, nullable=False)
+    charge_status = Column(String, nullable=False)    # "none" | "pending_collection"
+    refund_eligibility = Column(String, nullable=False)   # "full" | "partial" | "none"
+    refund_percent = Column(Integer, nullable=True)
+    call_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=False, unique=True)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
