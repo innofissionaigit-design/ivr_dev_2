@@ -1486,6 +1486,99 @@ def booking_correction_prompt(language: str = "bengali") -> str:
         return "ঠিক আছে, কোনটা ঠিক করে দেব - ডাক্তার, তারিখ, সময়, নাম, নাকি ফোন নম্বর?"
 
 
+# ADDED BY SOURAV -- "The agent accepts a correction and restates" story
+# (Epic: Answer Quality and Grounding).
+# story title: The agent accepts a correction and restates
+# user story: As a caller correcting the agent, I want the correction
+#   taken and confirmed, so that I am not arguing with a machine.
+# acceptance criteria: A correction updates the named value, is
+#   acknowledged explicitly and the corrected value is restated. The
+#   agent never defends a previous answer. Corrections are tested at
+#   every point in every flow.
+#
+# THE GAP THIS CLOSES: KCD-448's own correction path (booking_correction_
+# prompt() above, callback_correction_prompt() below) asks which field is
+# wrong, then goes STRAIGHT to re-asking for it -- the exact same question
+# ("Would you like today or another day?") used the very first time that
+# field was ever collected. Nothing ever confirmed the correction was
+# heard before asking again; the caller only ever found out it landed by
+# hearing the WHOLE booking read back a second time, at the very end. This
+# function is the missing middle step: one short sentence, said the
+# instant a corrected value is captured (see main.py/main_pcm.py's
+# `_correcting_field` bookkeeping and the new spontaneous-correction
+# checks threaded through _continue_pending), naming the field and
+# restating the new value -- BEFORE whatever comes next (the next missing
+# field, or the full readback) is spoken, concatenated into that same
+# turn's one reply rather than a separate turn of its own.
+#
+# NEVER DEFENDS A PREVIOUS ANSWER: every one of these sentences opens with
+# a plain acknowledgment (an equivalent of "got it" / "ঠিক আছে") and never
+# references what was said before, why it was wrong, or who was at fault
+# -- there is no "but you said..." shape anywhere in this function, in any
+# language, and tests/test_correction_flow.py asserts that stays true.
+#
+# Field values are dropped in with the SAME raw-passthrough discipline
+# booking_confirmation_prompt() above already uses (ISO date, 24h
+# "HH:MM", raw phone digits, no reformatting here) -- agent/tts.py's
+# synthesize() runs bn_normalize.verbalize() on the composed sentence
+# before it reaches the caller's ear, same as every other factual value
+# already spoken by this module. The doctor field is the one exception,
+# routed through _spoken_doctor_name() like every other doctor mention in
+# this file, so the honorific matches the sentence's language and a
+# seeded Bengali alias is preferred exactly where it already is elsewhere.
+_CORRECTION_FIELD_LABEL = {
+    "english": {
+        "doctor_name": "doctor", "date": "date", "time_slot": "time",
+        "patient_name": "name", "phone": "phone number",
+        "callback_time_window": "time",
+    },
+    "hinglish": {
+        "doctor_name": "doctor", "date": "date", "time_slot": "time",
+        "patient_name": "naam", "phone": "phone number",
+        "callback_time_window": "time",
+    },
+    "banglish": {
+        "doctor_name": "doctor", "date": "date", "time_slot": "time",
+        "patient_name": "naam", "phone": "phone number",
+        "callback_time_window": "time",
+    },
+    "bengali": {
+        "doctor_name": "ডাক্তার", "date": "তারিখ", "time_slot": "সময়",
+        "patient_name": "নাম", "phone": "ফোন নম্বর",
+        "callback_time_window": "সময়",
+    },
+}
+
+
+def correction_acknowledged_reply(field: str, slots: dict, language: str = "bengali") -> str:
+    """Spoken the instant a correction is captured -- names `field` and
+    restates its new value, read straight off `slots` (never a second
+    parameter for the value itself, so this can never drift from what was
+    actually stored: the call site sets slots[field] BEFORE calling this,
+    same ordering as every other reply function in this module that reads
+    the value it speaks off the slots dict it was just handed).
+
+    `field` is one of "doctor_name", "date", "time_slot", "patient_name",
+    "phone" (booking), or "callback_time_window" (request_callback) --
+    "phone" doubles for both flows' phone field since the spoken label
+    ("phone number") is identical either way.
+    """
+    label = _CORRECTION_FIELD_LABEL[language][field]
+    if field == "doctor_name":
+        value = _spoken_doctor_name(slots, {}, language=language)
+    else:
+        value = slots.get(field) or ""
+
+    if language == "english":
+        return f"Got it -- {label} updated to {value}."
+    elif language == "hinglish":
+        return f"Theek hai -- {label} update kar diya, ab {value} hai."
+    elif language == "banglish":
+        return f"Thik ache -- {label} update kore dilam, akhon {value}."
+    else:  # bengali
+        return f"ঠিক আছে -- {label} পরিবর্তন করে {value} করে দিলাম।"
+
+
 def doctors_by_department_reply(slots: dict, result: dict, language: str = "bengali") -> str:
     if not result.get("found"):
         if language == "english":
@@ -2362,6 +2455,88 @@ def out_of_scope_counter_reply(language: str = "bengali") -> str:
         return "Thik ache, erjonyo shorashori amader counter-e jogajog korun. Aro kichu jante chan?"
     else:  # bengali
         return "ঠিক আছে, এর জন্য সরাসরি আমাদের কাউন্টারে যোগাযোগ করুন। আর কিছু জানতে চান?"
+
+
+# =============================================================================
+# ADDED BY SOURAV -- "Caller asks whether their result is dangerous" story
+# (Epic: Conversation -- Difficult, Sensitive and Edge Cases). See
+# agent/clinical_safety.py's own module docstring for WHY this is caught
+# before the classifier ever runs, rather than left to a prompt
+# instruction -- this pair of functions is only the spoken half of that
+# story; the routing guarantee lives entirely in that other module and in
+# main.py/main_pcm.py's _resolve_intent().
+#
+# Deliberately fixed, non-branching text with no dynamic value of any
+# kind, in either function -- unlike almost everything else in this file,
+# there is no `result` dict here at all to render, because there is
+# nothing this system could honestly compute a clinical answer FROM: the
+# LabReport table this codebase's own report-status story built has no
+# column that could ever hold a clinical value (see report_status_reply()'s
+# own docstring, immediately above this file's report-flow section, for
+# the full "there is nothing here that COULD leak one" reasoning) -- and
+# even where a caller quotes a real number off their own report, this
+# system's catalogue carries no reference range to compare it against.
+# A caller asking this question is asking one this assistant has no
+# truthful basis to answer, not one it is choosing not to -- same
+# discipline as compare_options_reply()'s clinical-advice boundary
+# elsewhere in this file, applied here to a much more personal question.
+# =============================================================================
+
+def clinical_interpretation_reply(language: str = "bengali") -> str:
+    """The one, fixed, gentle offer every clinical-interpretation question
+    gets -- "is my result dangerous", "am I dying", "what does this
+    number mean", however it was actually phrased. States plainly that a
+    DOCTOR (never "an expert" or "our staff", the generic phrasing
+    out_of_scope_reply()/human_fallback_reply() use elsewhere in this
+    file) is who explains a lab report, and offers to connect one right
+    now rather than refusing outright -- the caller is worried, not
+    asking for a service this clinic simply doesn't offer, and the reply
+    has to sound like the difference.
+
+    English wording is the story's own, verbatim. The other three
+    languages are original translations in the same gentle register, not
+    reuses of out_of_scope_reply()'s wording -- this is a different kind
+    of moment and deliberately does not share a script with a caller
+    asking about home delivery of medicine.
+    """
+    if language == "english":
+        return ("I understand your concern about your results. A doctor is in the "
+                 "best position to explain your lab report clinically. Would you "
+                 "like me to connect you with our clinician right now?")
+    elif language == "hinglish":
+        return ("Aapke result ko lekar jo chinta hai, main samajh sakta hoon. Aapki "
+                 "lab report clinically sirf ek doctor hi sahi tarike se samjha "
+                 "sakte hain. Kya main abhi aapko hamare clinician se connect kar doon?")
+    elif language == "banglish":
+        return ("Apnar result niye je chinta hocche, ta ami bujhte parchi. Apnar lab "
+                 "report clinically shudhu ekjon doctor-i thik moto bujhiye dite "
+                 "parben. Ami ki ekhoni apnake amader clinician-er sathe connect "
+                 "kore debo?")
+    else:  # bengali
+        return ("আপনার রিপোর্ট নিয়ে যে চিন্তা হচ্ছে, তা আমি বুঝতে পারছি। আপনার ল্যাব "
+                 "রিপোর্ট ক্লিনিক্যালি একজন ডাক্তারই ঠিকভাবে বুঝিয়ে দিতে পারবেন। আমি কি "
+                 "এখনই আপনাকে আমাদের ডাক্তারের সাথে সংযুক্ত করে দেব?")
+
+
+def clinical_interpretation_decline_reply(language: str = "bengali") -> str:
+    """Caller declined the connect-to-a-doctor offer above. Mirrors
+    out_of_scope_counter_reply()'s own "close the loop, then reopen the
+    floor" shape, but keeps the door open specifically to a doctor rather
+    than the counter -- a caller who just said no to talking to someone
+    about a health worry right this second may still want to later, and
+    the counter is not who explains a lab report."""
+    if language == "english":
+        return ("Alright, no problem. If you change your mind, just ask and I'll "
+                 "connect you with a doctor. Is there anything else I can help with?")
+    elif language == "hinglish":
+        return ("Theek hai, koi baat nahi. Agar baad mein mann badle toh bataiye, "
+                 "main aapko doctor se connect kar dunga. Aur kuch madad chahiye?")
+    elif language == "banglish":
+        return ("Thik ache, kono problem nei. Pore mon change korle bolben, ami "
+                 "apnake doctor-er sathe connect kore debo. Aro kichu jante chan?")
+    else:  # bengali
+        return ("ঠিক আছে, কোনো সমস্যা নেই। পরে মত পাল্টালে বলবেন, আমি আপনাকে "
+                 "ডাক্তারের সাথে সংযুক্ত করে দেব। আর কিছু জানতে চান?")
 
 
 # =============================================================================

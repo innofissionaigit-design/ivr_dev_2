@@ -63,7 +63,7 @@ import main  # noqa: E402
 import main_pcm  # noqa: E402
 from agent.reply_templates import (  # noqa: E402
     booking_confirm_prompt, booking_confirmation_prompt, booking_correction_prompt,
-    missing_slot_prompt, _spoken_doctor_name,
+    missing_slot_prompt, _spoken_doctor_name, correction_acknowledged_reply,
 )
 from agent.slot_parse import parse_correction_field, is_affirmative, is_negative  # noqa: E402
 
@@ -233,8 +233,19 @@ def test_a_corrected_booking_is_read_back_in_full_again(wired):
     # calls -- it was moved onto the newer, 4-language
     # booking_confirmation_prompt() when that function was built for this
     # same story. The all-Bengali-digits final turn detects as "bengali".
-    assert session.said[-1] == booking_confirmation_prompt(
-        session.pending["slots"], language="bengali")
+    #
+    # UPDATED AGAIN BY SOURAV -- "The agent accepts a correction and
+    # restates" story. That AC requires the correction to be "acknowledged
+    # explicitly" before the value is restated -- this round-trip's re-
+    # collected value (phone) now gets an explicit correction_acknowledged_
+    # reply() prefix ahead of the same full readback, instead of going
+    # straight back to the readback with no acknowledgment at all. The
+    # phone field is the one actually corrected in this test, so that is
+    # the field the acknowledgment names.
+    assert session.said[-1] == (
+        correction_acknowledged_reply("phone", session.pending["slots"], language="bengali")
+        + " " + booking_confirmation_prompt(session.pending["slots"], language="bengali")
+    )
 
     _turn(session, "হ্যাঁ")
     assert len(wired) == 1 and wired[0]["slots"]["phone"] == "9123456789"

@@ -151,11 +151,25 @@ class _AsyncNoOp:
 
 
 def make_session(pending=None):
+    # UPDATED BY SOURAV -- KCD-448 test cleanup. This stub had fallen
+    # behind the real Session object, same gap already fixed for the same
+    # reason in tests/test_booking_readback.py and tests/test_request_
+    # callback.py (see either file's own "UPDATED BY SOURAV" comment on
+    # make_session): _dispatch_turn_inner() reads session.utt_seq and
+    # session.call_state directly, purely to log the turn, before any
+    # intent-specific code runs -- a bare SimpleNamespace missing either
+    # crashed every dispatch test in this file with an AttributeError,
+    # masked in the logs as "turn crashed -- answering as unreachable".
+    from agent.state import DialogueState as _DS
     return types.SimpleNamespace(
         call_id="test-call-1",
         pending=pending,
         dispatch_lock=asyncio.Lock(),
         send_json=_AsyncNoOp(),
+        state=_DS(),
+        utt_seq=1,
+        call_state=None,
+        confirm_attempts=0,
     )
 
 
@@ -169,6 +183,18 @@ class FakeASRResult:
     # the fake utterance is kept in Bengali to match -- language variation
     # itself is covered separately in tests/test_language_detection_dispatch.py.
     text = "টেস্টের স্যাম্পল জানতে চাই"
+    # UPDATED BY SOURAV -- KCD-448 test cleanup. A bare result with no
+    # decoder-agreement fields reads to agent/confidence.py::zone() as "no
+    # comparison was made", which routes to the CONFIRM zone instead of
+    # PROCEED -- same gap, same fix, as tests/test_request_callback.py's
+    # own FakeASRResult (see that file's "UPDATED BY SOURAV -- KCD-448"
+    # comment). Without this, every dispatch here got stuck asking "আমি
+    # শুনলাম -- ... ঠিক বলেছি?" instead of ever reaching the test_sample
+    # branch at all.
+    decoder_used = "ctc"
+    decoder_agreement = 1.0
+    ctc_words = 5
+    rnnt_words = 5
 
 
 class FakeASR:

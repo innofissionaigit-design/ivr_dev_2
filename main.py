@@ -118,6 +118,15 @@ from agent.reply_templates import (
     # "connect me to a human" branch -- these two are only the new
     # initial-offer and declined-offer replies.
     out_of_scope_reply, out_of_scope_counter_reply,
+    # ADDED BY SOURAV -- "Caller asks whether their result is dangerous"
+    # story (Epic: Conversation -- Difficult, Sensitive and Edge Cases).
+    # Fixed, non-generative offer/decline pair -- human_fallback_reply
+    # above is reused verbatim for the "yes, connect me" branch, same
+    # pattern as out_of_scope_reply/out_of_scope_counter_reply just above.
+    # See agent/reply_templates.py's own header comment on these two
+    # functions, and agent/clinical_safety.py's module docstring, for why
+    # this reply is never model-composed.
+    clinical_interpretation_reply, clinical_interpretation_decline_reply,
     # ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
     # These three back _resolve_combinable_intent_fragment()'s three
     # non-fabricating fallback fragments below -- every OTHER fragment in
@@ -141,8 +150,18 @@ from agent.reply_templates import (
     # ADDED BY SOURAV -- KCD-448 correction path for request_callback, same
     # discipline as booking_correction_prompt above.
     callback_correction_prompt,
+    # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+    # story (Epic: Answer Quality and Grounding). One shared acknowledgment
+    # function for both booking and callback corrections -- see its own
+    # docstring in agent/reply_templates.py.
+    correction_acknowledged_reply,
 )
 from agent.compare_flow import build_comparison
+# ADDED BY SOURAV -- "The agent accepts a correction and restates" story.
+# Pure, transport-agnostic "is this a correction, and to what" detection --
+# see this module's own docstring for why it lives here rather than
+# duplicated inline in both main.py and main_pcm.py.
+from agent.correction_flow import detect_booking_correction, detect_callback_correction
 # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
 # answer" story. Cross-turn entity memory (pronoun/elliptical follow-up
 # resolution) -- see agent/state.py's own module docstring for the full
@@ -206,6 +225,18 @@ from agent.outcomes import (
     # missing_booking_write_fields() exactly -- see that function's own
     # docstring in agent/outcomes.py.
     missing_callback_write_fields,
+    # ADDED BY SOURAV -- "Caller asks for a person immediately" story
+    # (Epic: Conversation -- Difficult, Sensitive and Edge Cases).
+    # record_turn_attempt() is called once per dispatched turn (see this
+    # story's own comment at the top of _dispatch_turn_inner below) so
+    # immediate_human_escalation_rate() has a genuine denominator;
+    # record_immediate_human_handoff() is the zero-negotiation escalation
+    # itself. See agent/outcomes.py's own module comment on this section
+    # for why the rate is computed from the existing handoff counter
+    # rather than a second, driftable one.
+    record_turn_attempt,
+    record_immediate_human_handoff,
+    immediate_human_escalation_rate,
 )
 # ADDED BY SOURAV -- "Caller asks to be called back" story. Pure
 # availability-check/context-building logic -- see that module's own
@@ -224,6 +255,22 @@ from agent.report_flow import (
     interpret_report_status_result, interpret_delivery_request_result,
     interpret_otp_verify_result, match_candidate_report,
 )
+# ADDED BY SOURAV -- "Caller asks whether their result is dangerous" story
+# (Epic: Conversation -- Difficult, Sensitive and Edge Cases). Deterministic,
+# pre-LLM, pre-fast-path phrase/pattern detector -- see this module's own
+# docstring for why it must run BEFORE _fast_path and BEFORE extract_intent
+# inside _resolve_intent(), rather than living as an LLM prompt instruction
+# or a fast_path.py catalogue entry: a smalltalk misclassification of a
+# safety-panic question must be made structurally impossible, not merely
+# unlikely.
+from agent.clinical_safety import is_clinical_interpretation
+# ADDED BY SOURAV -- "Caller asks for a person immediately" story (Epic:
+# Conversation -- Difficult, Sensitive and Edge Cases). Deterministic,
+# pre-LLM, pre-fast-path phrase matcher -- see this module's own docstring
+# for why it must run BEFORE _fast_path and BEFORE extract_intent inside
+# _resolve_intent(), AND again at the very top of _continue_pending(),
+# ahead of every in-progress flow's own field parsing.
+from agent.human_fast_path import is_immediate_human_request
 # STORY [Answer Quality and Grounding]
 # As a patient, I want to hear the whole sentence, so that I am
 # not left guessing what the agent tried to say.
@@ -941,6 +988,60 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
     """Semantic cache in front of the LLM. A hit skips Ollama entirely --
     the slowest hop in the turn -- but the clinic lookup that follows still
     runs live, so a cached intent can never serve a stale price."""
+    # ADDED BY SOURAV -- "Caller asks for a person immediately" story
+    # (Epic: Conversation -- Difficult, Sensitive and Edge Cases). Checked
+    # FIRST, even ahead of the clinical-interpretation guard just below --
+    # a caller explicitly demanding a human, right now, is the more
+    # absolute, zero-tolerance-for-negotiation request of the two, and an
+    # utterance that could plausibly read as either is safest resolved as
+    # immediate escalation rather than an offer to connect. Same reasoning
+    # as clinical_interpretation's own placement: checked before fast_path,
+    # before the semantic cache, and before Ollama, so a caller asking for
+    # a human can never be misclassified as smalltalk, out_of_scope (which
+    # OFFERS a choice rather than escalating outright), or anything else
+    # that would ask a follow-up question first. See
+    # agent/human_fast_path.py's module docstring for the full reasoning,
+    # including why this same check also has to run again inside
+    # _continue_pending() for a caller who asks mid-flow.
+    if is_immediate_human_request(text):
+        logger.info("[%s] immediate-human-request guard fired -- no LLM call",
+                    session.call_id)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None}
+        return {
+            "intent": "human_direct_request",
+            "slots": slots,
+            "parts": [{"intent": "human_direct_request", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
+    # ADDED BY SOURAV -- "Caller asks whether their result is dangerous"
+    # story (Epic: Conversation -- Difficult, Sensitive and Edge Cases).
+    # Checked BEFORE fast_path and BEFORE the semantic cache/LLM, not
+    # alongside them: a safety-panic question must never be able to land in
+    # "smalltalk" (whether via a fast-path greeting hit, a stale semantic
+    # cache entry, or an LLM misclassification under pressure) and get the
+    # model's own free-composed text spoken with zero downstream check --
+    # see agent/clinical_safety.py's module docstring for the full "smalltalk
+    # loophole" this closes structurally. `slots` mirrors
+    # agent/fast_path.py's _empty_slots() shape -- this intent never carries
+    # any slot value -- and `direct_reply_bn` is left None (never a
+    # model-or-guard-composed string) so _validate()'s existing strip-for-
+    # non-smalltalk rule is not even the thing keeping this reply honest;
+    # the reply text itself always comes from
+    # agent.reply_templates.clinical_interpretation_reply(), never from here.
+    if is_clinical_interpretation(text):
+        logger.info("[%s] clinical-interpretation guard fired -- no LLM call",
+                    session.call_id)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None}
+        return {
+            "intent": "clinical_interpretation",
+            "slots": slots,
+            "parts": [{"intent": "clinical_interpretation", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
     # Tier 1: decide it locally if we can. For a fixed catalogue the
     # entity is a string-matching problem with a 0.32 confidence margin,
     # where the embedding route had 0.03 -- see agent/fast_path.py. This
@@ -986,6 +1087,25 @@ def _next_missing_callback(slots: dict) -> str | None:
     if not slots.get("phone"):
         return "callback_phone"
     return None
+
+
+# ADDED BY SOURAV -- "The agent accepts a correction and restates" story.
+# Callback's own analogue of _booking_correction_parsers() above -- ONLY
+# "phone" (keyed by SLOT key, not the "callback_phone" awaiting name --
+# see _next_missing_callback's own comment on that distinction).
+#
+# "callback_time_window" is deliberately NOT included, for the identical
+# reason "patient_name" is excluded from _booking_correction_parsers()
+# above: it is free text with no grammar of its own, so a bare non-empty-
+# string check cannot tell "the caller is naming this field" from "the
+# caller is also giving its new value" -- tests/test_request_callback.py's
+# own pre-existing test_naming_time_window_reenters_its_collection_with_
+# phone_kept caught exactly this when an earlier version of this
+# function DID include it. See agent/correction_flow.py's own module
+# docstring (point 2) for the full writeup; the time window keeps the
+# deliberate, pre-existing two-step path instead.
+def _callback_correction_parsers() -> dict:
+    return {"phone": parse_phone}
 
 
 def _match_offered(text: str, candidates: list[dict]) -> dict | None:
@@ -1111,6 +1231,37 @@ def _clean_patient_name(text: str) -> str | None:
             t = t[len(prefix):].strip()
             break
     return t or None
+
+
+# ADDED BY SOURAV -- "The agent accepts a correction and restates" story.
+# The THREE booking fields with a genuine, structurally-validating parser
+# -- used both by agent/correction_flow.detect_booking_correction() (the
+# spontaneous, cue-gated mid-collection check) and by the "confirm_
+# correction" state's own "field + value in one breath" shortcut below --
+# bundled once here rather than re-built at each call site.
+#
+# "patient_name" is deliberately NOT included, and this is a fix, not an
+# oversight: an earlier version of this dict DID include it (mapped to
+# _clean_patient_name), and tests/test_booking_readback.py's own pre-
+# existing test_the_named_field_is_the_one_re_collected caught the real
+# bug that caused -- _clean_patient_name() has no grammar to reject a
+# non-name with, so a caller merely NAMING "patient_name" as the field to
+# fix ("রোগীর নাম", "the patient's name") was itself accepted as though it
+# WERE the new name. See agent/correction_flow.py's own module docstring
+# (point 2) for the full writeup; patient_name keeps the deliberate,
+# pre-existing two-step path instead (name the field, then a separate
+# turn gives the value).
+#
+# parse_date's `offered_date` context comes from THIS pending dict, same
+# as the ordinary "date" collection branch further down uses -- a
+# spontaneous date correction is held to the same "hmm/yes confirms the
+# date I already said out loud" rule as an original date answer would be.
+def _booking_correction_parsers(pending: dict) -> dict:
+    return {
+        "date": lambda t: parse_date(t, offered_date=pending.get("offered_date")),
+        "time_slot": parse_time,
+        "phone": parse_phone,
+    }
 
 
 async def _finish_booking(session: CallSession, slots: dict, *, confirmed: bool = False,
@@ -1765,6 +1916,30 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     # they said several turns ago when the flow started.
     language = detect_language(text)
 
+    # ADDED BY SOURAV -- "Caller asks for a person immediately" story
+    # (Epic: Conversation -- Difficult, Sensitive and Edge Cases). Checked
+    # here, FIRST, before `awaiting` is even read -- ahead of every
+    # flow-specific branch below, including the universal "না" escape
+    # hatch and the "confirm_transcript" echo-back. Without this, a caller
+    # mid-booking (or mid-OTP-verification, or being asked to confirm what
+    # was heard) who says "just connect me to a person" would have that
+    # sentence parsed as an attempted answer to whatever field happened to
+    # be pending -- misreading the one sentence that most needs to be
+    # heard as itself, and the literal shape of "feeling trapped" this
+    # story's own user narrative names. See agent/human_fast_path.py's
+    # module docstring for the full reasoning. Whatever flow was in
+    # progress is simply abandoned, with no attempt to finish it, resume
+    # it, or ask why -- the same zero-negotiation contract the AC asks
+    # for, regardless of which pending state this turn interrupts.
+    if is_immediate_human_request(text):
+        logger.info("[%s] immediate human request interrupted an in-progress "
+                    "flow (awaiting=%s) -- abandoning it, escalating now",
+                    session.call_id, pending.get("awaiting"))
+        session.pending = None
+        record_immediate_human_handoff(call_id=session.call_id)
+        await _speak(session, human_fallback_reply(language=language))
+        return True
+
     awaiting = pending["awaiting"]
 
     # NOTE: confirm_booking/confirm_correction are handled below, together
@@ -1979,6 +2154,23 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             session.pending = None
             await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
             return True
+        # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+        # story. Same spontaneous-cross-field check as the booking flow's
+        # own generic tail -- the caller is asked for the time window but
+        # may instead be correcting the phone number they already gave a
+        # moment ago ("actually, my number is..."). See agent/
+        # correction_flow.py's own module docstring for the cue-gated,
+        # never-guess design.
+        correction = detect_callback_correction(
+            text, pending["slots"], awaiting, _callback_correction_parsers())
+        if correction is not None:
+            field, new_value = correction
+            logger.info("[%s] spontaneous callback correction: %s -> %r (still awaiting %s)",
+                        session.call_id, field, new_value, awaiting)
+            pending["slots"][field] = new_value
+            ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+            await _speak(session, ack + " " + missing_slot_prompt('request_callback', 'callback_time_window', language=language))
+            return True
         window = text.strip()
         if not window:
             pending["retries"] += 1
@@ -1987,21 +2179,39 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                 return False
             await _speak(session, missing_slot_prompt("request_callback", "callback_time_window", language=language))
             return True
+        was_correction = pending.pop("_correcting_field", None) == "callback_time_window"
         pending["slots"]["callback_time_window"] = window
         pending["retries"] = 0
+        prefix = ""
+        if was_correction:
+            prefix = correction_acknowledged_reply("callback_time_window", pending["slots"], language=language) + " "
         missing = _next_missing_callback(pending["slots"])
         if missing is None:
             pending["awaiting"] = "confirm_callback"
-            await _speak(session, callback_confirmation_prompt(pending["slots"], language=language))
+            await _speak(session, prefix + callback_confirmation_prompt(pending["slots"], language=language))
             return True
         pending["awaiting"] = missing
-        await _speak(session, missing_slot_prompt("request_callback", missing, language=language))
+        await _speak(session, prefix + missing_slot_prompt("request_callback", missing, language=language))
         return True
 
     if awaiting == "callback_phone":
         if is_negative(text):
             session.pending = None
             await _speak(session, "ঠিক আছে, তাহলে থাক। আর কিছু জানতে চান?")
+            return True
+        # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+        # story. Mirrors the "callback_time_window" branch above: the
+        # caller is asked for the phone number but may be correcting the
+        # time window they already gave.
+        correction = detect_callback_correction(
+            text, pending["slots"], awaiting, _callback_correction_parsers())
+        if correction is not None:
+            field, new_value = correction
+            logger.info("[%s] spontaneous callback correction: %s -> %r (still awaiting %s)",
+                        session.call_id, field, new_value, awaiting)
+            pending["slots"][field] = new_value
+            ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+            await _speak(session, ack + " " + missing_slot_prompt('request_callback', 'callback_phone', language=language))
             return True
         phone = parse_phone(text)
         if phone is None:
@@ -2011,15 +2221,19 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                 return False
             await _speak(session, missing_slot_prompt("request_callback", "callback_phone", language=language))
             return True
+        was_correction = pending.pop("_correcting_field", None) == "phone"
         pending["slots"]["phone"] = phone
         pending["retries"] = 0
+        prefix = ""
+        if was_correction:
+            prefix = correction_acknowledged_reply("phone", pending["slots"], language=language) + " "
         missing = _next_missing_callback(pending["slots"])
         if missing is None:
             pending["awaiting"] = "confirm_callback"
-            await _speak(session, callback_confirmation_prompt(pending["slots"], language=language))
+            await _speak(session, prefix + callback_confirmation_prompt(pending["slots"], language=language))
             return True
         pending["awaiting"] = missing
-        await _speak(session, missing_slot_prompt("request_callback", missing, language=language))
+        await _speak(session, prefix + missing_slot_prompt("request_callback", missing, language=language))
         return True
 
     if awaiting == "confirm_callback":
@@ -2046,6 +2260,22 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             pending["awaiting"] = "confirm_callback_correction"
             pending["retries"] = 0
             await _speak(session, callback_correction_prompt(language=language))
+            return True
+
+        # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+        # story. Same direct-correction shortcut as "confirm_booking"
+        # above: the caller need not say "no" first if they just correct
+        # the readback outright.
+        correction = detect_callback_correction(
+            text, pending["slots"], None, _callback_correction_parsers())
+        if correction is not None:
+            field, new_value = correction
+            logger.info("[%s] correcting callback %s directly from the readback "
+                        "(no menu needed)", session.call_id, field)
+            pending["slots"][field] = new_value
+            pending["retries"] = 0
+            ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+            await _speak(session, ack + " " + callback_confirmation_prompt(pending['slots'], language=language))
             return True
 
         # Neither a clear yes nor a clear no -- bounded retries of the
@@ -2096,8 +2326,35 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # slots dict itself still keys the value as plain "phone".
         slot_key = "phone" if field == "callback_phone" else field
         pending["slots"].pop(slot_key, None)
+
+        # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+        # story. If the caller names the field AND gives its new value in
+        # the same breath ("the phone number -- actually it's..."), apply
+        # it immediately with an explicit acknowledgment instead of a
+        # second round trip.
+        parser = _callback_correction_parsers().get(slot_key)
+        new_value = parser(text) if parser else None
+        if new_value is not None:
+            pending["slots"][slot_key] = new_value
+            pending["retries"] = 0
+            missing = _next_missing_callback(pending["slots"])
+            ack = correction_acknowledged_reply(slot_key, pending["slots"], language=language)
+            if missing is None:
+                pending["awaiting"] = "confirm_callback"
+                await _speak(session, ack + " " + callback_confirmation_prompt(pending['slots'], language=language))
+            else:
+                pending["awaiting"] = missing
+                await _speak(session, ack + " " + missing_slot_prompt('request_callback', missing, language=language))
+            return True
+
         pending["awaiting"] = field
         pending["retries"] = 0
+        # Marks this re-collection as a CORRECTION (keyed by SLOT name,
+        # matching what the "callback_time_window"/"callback_phone" tails
+        # above check), so the acknowledgment is spoken once the new
+        # value actually arrives instead of silently repeating the exact
+        # same question a first-time collection would ask.
+        pending["_correcting_field"] = slot_key
         await _speak(session, missing_slot_prompt("request_callback", field, language=language))
         return True
 
@@ -2238,6 +2495,32 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         await _speak(session, out_of_scope_reply(language=language))
         return True
 
+    if awaiting == "clinical_interpretation_choice":
+        # ADDED BY SOURAV -- "Caller asks whether their result is
+        # dangerous" story (Epic: Conversation -- Difficult, Sensitive and
+        # Edge Cases). Mirrors "out_of_scope_choice" immediately above,
+        # including its retry-then-fall-through-to-a-fresh-classification
+        # shape -- the AC's "routed to a human by policy" is this affirmative
+        # branch reusing human_fallback_reply()/record_human_handoff()
+        # verbatim, the exact same escalation path "out_of_scope" and
+        # "unclear" already use, just tagged with its own intent string so
+        # the three stay distinguishable in the shared escalation ledger.
+        if is_affirmative(text):
+            session.pending = None
+            record_human_handoff("clinical_interpretation", call_id=session.call_id)
+            await _speak(session, human_fallback_reply(language=language))
+            return True
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, clinical_interpretation_decline_reply(language=language))
+            return True
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            return False  # give a fresh LLM classification a chance instead
+        await _speak(session, clinical_interpretation_reply(language=language))
+        return True
+
     # Universal escape hatch, checked before any field-specific parsing:
     # a caller mid-flow who says "না" / "থাক" is abandoning the booking,
     # not answering whichever question was pending.
@@ -2299,6 +2582,28 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             await _speak(session, booking_correction_prompt(language=language))
             return True
 
+        # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+        # story. A caller does not always say "no" first -- hearing the
+        # readback, they may just correct it directly ("actually, my phone
+        # number is..."). Checked only once neither yes nor no matched, so
+        # a plain "না"/"no" still opens the existing, separately-tested
+        # two-step "which one is wrong?" menu untouched; this is a
+        # SHORTCUT for when the caller volunteers the field and the new
+        # value together, needing no menu at all. `awaiting=None` because
+        # every field is already known here -- none of the five is "the
+        # current field" the way it is mid-collection.
+        correction = detect_booking_correction(
+            text, pending["slots"], None, _booking_correction_parsers(pending))
+        if correction is not None:
+            field, new_value = correction
+            logger.info("[%s] correcting %s directly from the readback (no menu needed)",
+                        session.call_id, field)
+            pending["slots"][field] = new_value
+            pending["retries"] = 0
+            ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+            await _speak(session, ack + " " + booking_confirmation_prompt(pending['slots'], language=language))
+            return True
+
         pending["retries"] += 1
         if pending["retries"] > 2:
             # Three unclear answers to a yes/no question is a handoff, not a
@@ -2351,9 +2656,110 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # test_naming_phone_reenters_phone_collection_with_others_kept's
         # own expectation.
         pending["slots"].pop(field, None)
+
+        # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+        # story. If the caller names the field AND gives its new value in
+        # the same breath ("the date -- actually make it Friday"), apply
+        # it immediately with an explicit acknowledgment rather than
+        # asking a question they have already answered. Not attempted for
+        # "doctor_name": validating a doctor needs an async catalogue
+        # call, which this synchronous field-naming turn cannot make --
+        # see the dedicated `awaiting == "doctor_name"` branch below,
+        # which is where a doctor correction is actually validated.
+        parser = _booking_correction_parsers(pending).get(field)
+        new_value = parser(text) if parser else None
+        if new_value is not None:
+            pending["slots"][field] = new_value
+            pending["retries"] = 0
+            missing = _next_missing(pending["slots"])
+            ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+            if missing is None:
+                pending["awaiting"] = "confirm_booking"
+                await _speak(session, ack + " " + booking_confirmation_prompt(pending['slots'], language=language))
+            else:
+                pending["awaiting"] = missing
+                await _speak(session, ack + " " + missing_slot_prompt('book_appointment', missing, language=language))
+            return True
+
         pending["awaiting"] = field
         pending["retries"] = 0
+        # Marks this re-collection as a CORRECTION, not an original ask,
+        # so the generic date/time_slot/patient_name/phone tail (and the
+        # doctor_name branch) below knows to acknowledge once the new
+        # value actually arrives, instead of silently repeating the exact
+        # same question a first-time collection would ask.
+        pending["_correcting_field"] = field
         await _speak(session, missing_slot_prompt("book_appointment", field, language=language))
+        return True
+
+    # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+    # story. FIXES A REAL DEAD END: booking_correction_prompt() above
+    # names "the doctor" as a correctable field, and parse_correction_
+    # field() (agent/slot_parse.py) dutifully recognises it -- but until
+    # this branch existed, nothing ever matched `awaiting == "doctor_name"`
+    # in the generic date/time_slot/patient_name/phone tail further down,
+    # so whatever the caller said next fell straight through to "value is
+    # None" every single time. Three retries later the WHOLE booking --
+    # the four still-correct values included -- was silently discarded for
+    # a fresh LLM classification, and the caller's request to fix the
+    # doctor was never actually honoured. See agent/correction_flow.py's
+    # own module docstring for the full writeup of this gap.
+    #
+    # Unlike date/time_slot/patient_name/phone, a doctor's name cannot be
+    # accepted as free text -- it has to be validated against the real
+    # catalogue, the same way every other doctor-name entry point in this
+    # codebase already does (get_doctor_availability() doubles as both
+    # "is this doctor real" and "are they sitting on this date").
+    if awaiting == "doctor_name":
+        # No explicit is_negative() check here -- unlike the other named
+        # states above this point in the function, this one is reached
+        # AFTER the universal "না" escape hatch (it sits between
+        # "confirm_booking" and here), which already catches a plain
+        # rejection for any awaiting value other than "confirm_booking".
+        candidate_name = text.strip()
+        if not candidate_name:
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                session.pending = None
+                return False
+            await _speak(session, missing_slot_prompt("book_appointment", "doctor_name", language=language))
+            return True
+        date_iso = pending.get("offered_date") or pending["slots"].get("date") or datetime.date.today().isoformat()
+        try:
+            result = await _tools.get_doctor_availability(candidate_name, date_iso)
+        except ToolCallError as e:
+            logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+            session.pending = None
+            await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+            return True
+        if not result.get("found"):
+            pending["retries"] += 1
+            if pending["retries"] > 2:
+                # Same graceful-degradation shape as every other repair
+                # ladder in this function: nothing was written, and a
+                # fourth attempt at the same unresolved name is a worse
+                # outcome than letting a fresh classification try.
+                session.pending = None
+                logger.info("[%s] doctor correction abandoned -- name never resolved",
+                            session.call_id)
+                return False
+            await _speak(session, "দুঃখিত, এই নামে কোনো ডাক্তার খুঁজে পাচ্ছি না। আবার নাম বলবেন?")
+            return True
+
+        was_correction = pending.pop("_correcting_field", None) == "doctor_name"
+        pending["slots"]["doctor_name"] = result.get("doctor_name") or candidate_name
+        pending["slots"]["doctor_name_bn"] = result.get("doctor_name_bn")
+        pending["retries"] = 0
+        prefix = ""
+        if was_correction:
+            prefix = correction_acknowledged_reply("doctor_name", pending["slots"], language=language) + " "
+        missing = _next_missing(pending["slots"])
+        if missing is None:
+            pending["awaiting"] = "confirm_booking"
+            await _speak(session, prefix + booking_confirmation_prompt(pending["slots"], language=language))
+            return True
+        pending["awaiting"] = missing
+        await _speak(session, prefix + missing_slot_prompt("book_appointment", missing, language=language))
         return True
 
     # story title: Near matches are offered rather than guessed or refused
@@ -2725,6 +3131,31 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
     # Remaining states (date / time_slot / patient_name / phone) all share
     # the same shape: parse the ONE field awaited, fill it in, ask for the
     # next missing one or finish the booking.
+    #
+    # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+    # story. Before treating this turn as an answer to whatever field is
+    # currently awaited, check whether it is instead a correction to a
+    # DIFFERENT field collected earlier in this same booking -- e.g. the
+    # caller is asked for the time slot but says "actually, make the date
+    # Friday instead." Gated behind an explicit correction cue (see
+    # agent/correction_flow.py's own module docstring for why: these are
+    # the same deterministic parsers used for original collection, and
+    # running them unconditionally against every turn would risk silently
+    # reinterpreting an ordinary answer as a correction to something
+    # else). The field still being asked for is left untouched -- the
+    # caller is asked for it again in the SAME breath as the
+    # acknowledgment, so nothing about the current question is lost.
+    correction = detect_booking_correction(
+        text, pending["slots"], awaiting, _booking_correction_parsers(pending))
+    if correction is not None:
+        field, new_value = correction
+        logger.info("[%s] spontaneous correction: %s -> %r (still awaiting %s)",
+                    session.call_id, field, new_value, awaiting)
+        pending["slots"][field] = new_value
+        ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+        await _speak(session, ack + " " + missing_slot_prompt('book_appointment', awaiting, language=language))
+        return True
+
     value = None
     if awaiting == "date":
         value = parse_date(text, offered_date=pending.get("offered_date"))
@@ -2743,18 +3174,28 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         await _speak(session, missing_slot_prompt("book_appointment", awaiting, language=language))
         return True
 
+    # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+    # story. True only when this exact field's re-collection was opened
+    # BY a correction (see the "confirm_correction" state above, which
+    # sets this marker only on its no-immediate-value fallback path) --
+    # an ordinary, first-time collection of this field never sets it, so
+    # this acknowledgment is never spoken for a plain original answer.
+    was_correction = pending.pop("_correcting_field", None) == awaiting
     pending["slots"][awaiting] = value
     pending["retries"] = 0
+    prefix = ""
+    if was_correction:
+        prefix = correction_acknowledged_reply(awaiting, pending["slots"], language=language) + " "
     missing = _next_missing(pending["slots"])
     if missing is None:
         # Every field is filled, but nothing is written yet. Read the whole
         # thing back and wait for a yes -- see the "confirm_booking" state
         # above for why an affirmative is required rather than assumed.
         pending["awaiting"] = "confirm_booking"
-        await _speak(session, booking_confirmation_prompt(pending["slots"], language=language))
+        await _speak(session, prefix + booking_confirmation_prompt(pending["slots"], language=language))
         return True
     pending["awaiting"] = missing
-    await _speak(session, missing_slot_prompt("book_appointment", missing, language=language))
+    await _speak(session, prefix + missing_slot_prompt("book_appointment", missing, language=language))
     return True
 
 
@@ -3247,6 +3688,16 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
                 os.remove(utterance_wav)
 
         text = asr_result.text.strip()
+
+        # ADDED BY SOURAV -- "Caller asks for a person immediately" story
+        # (Epic: Conversation -- Difficult, Sensitive and Edge Cases). The
+        # denominator for immediate_human_escalation_rate() -- counted
+        # once per dispatched turn, BEFORE the empty-ASR check just below,
+        # so a turn nothing could be transcribed from still belongs in
+        # "total turns attempted" rather than being quietly excluded from
+        # the rate's own base.
+        record_turn_attempt()
+
         if not text:
             logger.info("[%s] ASR returned empty text", session.call_id)
             await _speak(session, "দুঃখিত, শুনতে পাইনি। আবার বলবেন?", fallback_reason="asr_empty")
@@ -3274,21 +3725,22 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
         # lie the sentinel used to tell.
         #
         # FIXED BY SOURAV -- pre-existing bug, unrelated to KCD-379, found
-        # while verifying that story. Mirrors the identical fix in
-        # main_pcm.py (see that file's own comment on this same block for
-        # the full writeup): these four fields were read with a direct
-        # attribute access, unlike agent/confidence.py's own zone()
-        # (called just above), which reads decoder_used and
+        # while verifying that story: these four fields were read with a
+        # direct attribute access, unlike agent/confidence.py's own
+        # zone() (called just above), which reads decoder_used and
         # decoder_agreement off the same asr_result with getattr(...,
-        # None). Every dispatch-level test's FakeASRResult in this suite
-        # predates the decoder-agreement shape and defines only `.text`,
-        # so this raised AttributeError on every real turn through this
-        # transport too, crashing it as "unreachable" before any reply
-        # template was reached. Defaults mirror agent/asr.py's real
-        # ASRResult dataclass defaults exactly (decoder_agreement: None,
-        # ctc_words/rnnt_words: 0) -- a value the real ASR pipeline
-        # actually produces is unaffected; only a fixture/object missing
-        # the field now degrades gracefully instead of crashing.
+        # None). Any ASR result object that doesn't carry the full
+        # decoder-agreement dataclass shape -- every dispatch-level test's
+        # FakeASRResult in this suite predates that shape and defines only
+        # `.text` -- raised AttributeError here on every real turn,
+        # crashing the turn as "unreachable" (see main_pcm.py's own
+        # try/except around _dispatch_turn_inner) before a single reply
+        # template was ever reached. Defaults mirror agent/asr.py's real
+        # ASRResult dataclass field defaults exactly (decoder_agreement:
+        # None, ctc_words/rnnt_words: 0) so a value actually produced by
+        # the real ASR pipeline is completely unaffected by this change --
+        # only a fixture/object missing the field now degrades gracefully
+        # instead of crashing.
         _agree = getattr(asr_result, "decoder_agreement", None)
         logger.info("[%s] asr agreement=%s decoder=%s words=%d/%d zone=%s",
                     session.call_id,
@@ -3499,6 +3951,45 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
             # "out_of_scope_choice" branch below.
             await _speak(session, out_of_scope_reply(language=language))
             session.pending = {"awaiting": "out_of_scope_choice", "retries": 0}
+            return
+
+        if intent == "clinical_interpretation":
+            # ADDED BY SOURAV -- "Caller asks whether their result is
+            # dangerous" story (Epic: Conversation -- Difficult, Sensitive
+            # and Edge Cases). Mirrors the "out_of_scope" branch immediately
+            # above: a fixed, code-level offer is spoken (never anything the
+            # model composed -- see agent/reply_templates.py's
+            # clinical_interpretation_reply()), and the caller's yes/no is
+            # resolved next turn by the "clinical_interpretation_choice"
+            # branch in _continue_pending below. There is deliberately no
+            # `try`/tools-client lookup here: unlike every intent in the
+            # block below, this one never depends on a clinic-api result --
+            # LabReport has no clinical-value column for any lookup to
+            # return (see clinic-api/models.py), so there is nothing to
+            # fetch and nothing that could leak a clinical judgment even by
+            # accident.
+            await _speak(session, clinical_interpretation_reply(language=language))
+            session.pending = {"awaiting": "clinical_interpretation_choice", "retries": 0}
+            return
+
+        if intent == "human_direct_request":
+            # ADDED BY SOURAV -- "Caller asks for a person immediately"
+            # story (Epic: Conversation -- Difficult, Sensitive and Edge
+            # Cases). Deliberately the SIMPLEST branch in this whole
+            # if/elif chain: no offer, no choice, no `session.pending` set
+            # afterward -- the AC's "no retention attempt and no question
+            # about why" means there is nothing left to ask. This escalates
+            # on the SAME turn, unconditionally, the moment the guard in
+            # _resolve_intent() (or _continue_pending(), for a caller
+            # mid-flow) fires -- contrast with "out_of_scope" and
+            # "clinical_interpretation" just above, which both OFFER a
+            # connection and wait for a yes/no next turn. human_fallback_
+            # reply() is reused verbatim (the same "connecting you now"
+            # line "unclear" already speaks) rather than a new template,
+            # because it already says nothing but "connecting you" -- no
+            # question, no negotiation -- which is exactly this AC's bar.
+            record_immediate_human_handoff(call_id=session.call_id)
+            await _speak(session, human_fallback_reply(language=language))
             return
 
         try:
@@ -4056,7 +4547,23 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
 # of intents that never get a real inline answer in a COMBINED turn,
 # regardless of slot completeness -- see _resolve_combinable_intent_fragment's
 # own docstring just below for why each is excluded rather than composed.
-_MULTI_INTENT_NEEDS_SEPARATE_FLOW = {"book_appointment", "report_status", "report_send"}
+_MULTI_INTENT_NEEDS_SEPARATE_FLOW = {
+    "book_appointment", "report_status", "report_send",
+    # ADDED BY SOURAV -- "Caller asks whether their result is dangerous"
+    # story. Even without this explicit entry, the function's own
+    # defensive fallback below (any intent not otherwise handled) already
+    # routes this here -- but it is listed explicitly, matching this
+    # codebase's "no implicit intent" documentation style, and because a
+    # safety-critical intent should never depend on falling through to a
+    # catch-all to behave correctly.
+    "clinical_interpretation",
+    # ADDED BY SOURAV -- "Caller asks for a person immediately" story.
+    # Same reasoning as clinical_interpretation just above -- listed
+    # explicitly even though the guard's own whole-utterance short-circuit
+    # in _resolve_intent() means a solo "give me a human" turn never
+    # actually reaches the multi-intent LLM path at all.
+    "human_direct_request",
+}
 _MULTI_INTENT_NO_FRAGMENT = {"smalltalk", "unclear"}
 
 

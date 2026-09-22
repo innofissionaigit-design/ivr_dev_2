@@ -47,7 +47,14 @@ from agent.reply_templates import (  # noqa: E402
     # a function this file did not previously import at all.
     ambiguous_reference_reply, billing_balance_reply, booking_confirmation_prompt,
     callback_confirmation_prompt, callback_correction_prompt, callback_scheduled_reply,
-    callback_unavailable_reply, clinic_info_reply, compare_options_reply,
+    callback_unavailable_reply, clinic_info_reply,
+    # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+    # story (Epic: Answer Quality and Grounding).
+    correction_acknowledged_reply,
+    # ADDED BY SOURAV -- "Caller asks whether their result is dangerous"
+    # story (Epic: Conversation -- Difficult, Sensitive and Edge Cases).
+    clinical_interpretation_decline_reply, clinical_interpretation_reply,
+    compare_options_reply,
     delivery_blocked_reply, delivery_declined_reply, doctor_schedule_reply,
     health_package_reply, health_packages_list_reply, human_fallback_reply,
     insurance_coverage_reply, multi_intent_missing_info_reply,
@@ -320,6 +327,11 @@ def _replies():
     yield "out-of-scope/offer", out_of_scope_reply()
     yield "out-of-scope/counter", out_of_scope_counter_reply()
 
+    # ADDED BY SOURAV -- "Caller asks whether their result is dangerous"
+    # story (Epic: Conversation -- Difficult, Sensitive and Edge Cases).
+    yield "clinical-interpretation/offer", clinical_interpretation_reply()
+    yield "clinical-interpretation/decline", clinical_interpretation_decline_reply()
+
     yield "walkin/not-found", walkin_eligibility_reply(
         {"test_name": "কিছু"}, {"found": False, "query": "কিছু"})
     yield "walkin/policy-unavailable", walkin_eligibility_reply(
@@ -433,6 +445,16 @@ def _replies():
         {"success": True, "callback_id": "CB-20260915-A1B2"})
     yield "callback/scheduled-failure", callback_scheduled_reply({}, {"success": False})
 
+    # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+    # story (Epic: Answer Quality and Grounding). One case per field this
+    # function ever names -- the five booking fields plus the callback
+    # flow's own time-window field (see agent/reply_templates.py's own
+    # _CORRECTION_FIELD_LABEL dict for why "phone" doubles for both flows).
+    _CORRECTION_SLOTS = dict(BOOKING, callback_time_window="সকাল ১০টা থেকে দুপুর ১টা")
+    for field in ("doctor_name", "date", "time_slot", "patient_name", "phone",
+                  "callback_time_window"):
+        yield f"correction/{field}", correction_acknowledged_reply(field, _CORRECTION_SLOTS)
+
     for intent in ("test_rate", "doctor_availability", "doctors_by_department",
                    "book_appointment"):
         for field in ("test_name", "doctor_name", "department", "date",
@@ -472,7 +494,15 @@ def test_the_gate_covers_every_public_reply_function():
         "ambiguous_reference_reply", "billing_balance_reply",
         "booking_confirmation_prompt", "callback_confirmation_prompt",
         "callback_correction_prompt", "callback_scheduled_reply",
-        "callback_unavailable_reply", "clinic_info_reply", "compare_options_reply",
+        "callback_unavailable_reply", "clinic_info_reply",
+        # ADDED BY SOURAV -- "The agent accepts a correction and restates"
+        # story (Epic: Answer Quality and Grounding).
+        "correction_acknowledged_reply",
+        # ADDED BY SOURAV -- "Caller asks whether their result is
+        # dangerous" story (Epic: Conversation -- Difficult, Sensitive and
+        # Edge Cases).
+        "clinical_interpretation_decline_reply", "clinical_interpretation_reply",
+        "compare_options_reply",
         "delivery_blocked_reply", "delivery_declined_reply", "doctor_schedule_reply",
         "health_package_reply", "health_packages_list_reply", "human_fallback_reply",
         "insurance_coverage_reply", "multi_intent_missing_info_reply",

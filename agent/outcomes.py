@@ -206,19 +206,33 @@ def insufficient_verified_information_counts(intent: str | None = None) -> dict[
 _handoff_counts: dict[str, int] = {}
 
 
-def record_human_handoff(intent: str, call_id: str | None = None) -> None:
-    """Records one "query unresolved -> hand off to a human" event: bumps
-    the per-intent count and appends a JSON line to the same
-    ESCALATION_LOG_PATH ledger record_insufficient_verified_information()
-    above writes to (distinguished by "event": "human_handoff", so the two
-    outcomes remain greppable apart in one shared, durable file)."""
+def record_human_handoff(intent: str, call_id: str | None = None,
+                          reason: str = "query_unresolved_or_low_confidence") -> None:
+    """Records one "-> hand off to a human" event: bumps the per-intent
+    count and appends a JSON line to the same ESCALATION_LOG_PATH ledger
+    record_insufficient_verified_information() above writes to
+    (distinguished by "event": "human_handoff", so the two outcomes remain
+    greppable apart in one shared, durable file).
+
+    `reason` defaults to this function's original, and still overwhelmingly
+    common, story: "unclear"/"out_of_scope"/"clinical_interpretation" all
+    hand off because the query itself was confusing, ambiguous, or outside
+    what this system can answer. ADDED BY SOURAV -- "Caller asks for a
+    person immediately" story (Epic: Conversation -- Difficult, Sensitive
+    and Edge Cases): that default reason is actively WRONG for this new
+    story's own handoff -- the caller was perfectly understood and simply
+    asked for a human, so the ledger must say that plainly rather than
+    implying confusion that never happened. See
+    record_immediate_human_handoff() below for the caller that passes an
+    explicit reason.
+    """
     with _lock:
         _handoff_counts[intent] = _handoff_counts.get(intent, 0) + 1
         record = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event": "human_handoff",
             "intent": intent,
-            "reason": "query_unresolved_or_low_confidence",
+            "reason": reason,
             "call_id": call_id,
         }
         log_dir = os.path.dirname(ESCALATION_LOG_PATH)
@@ -238,11 +252,101 @@ def human_handoff_counts(intent: str | None = None) -> dict[str, int] | int:
         return dict(_handoff_counts)
 
 
+# =============================================================================
+# ADDED BY SOURAV -- "Caller asks for a person immediately" story (Epic:
+# Conversation -- Difficult, Sensitive and Edge Cases). AC: "A request for a
+# human in any supported language escalates on the same turn with no
+# retention attempt and no question about why... the rate is reported as a
+# quality signal rather than something to minimise."
+#
+# WHY THIS NEEDED A NEW DENOMINATOR THIS MODULE'S OWN DOCSTRING SAID DIDN'T
+# EXIST: constraint 2 up top ("NO FAKE RATE... nothing in this codebase
+# counts attempts per intent today") was written for the insufficient-
+# verified-information outcome, where no denominator was needed yet and
+# fabricating one would have been dishonest. This story's AC explicitly asks
+# for a rate, so the missing piece -- a genuine attempts counter -- is built
+# here, exactly along the upgrade path that docstring already pointed to
+# ("dividing by a future attempts-counter... is a one-line change against
+# this function"). _total_turns is that counter: main.py/main_pcm.py call
+# record_turn_attempt() once per dispatched caller turn (see
+# _dispatch_turn_inner's own first line in both files), before any intent is
+# even resolved, so it is a true count of turns attempted, not of only the
+# turns that happened to reach this intent.
+#
+# WHY THE RATE IS COMPUTED FROM _handoff_counts RATHER THAN A SEPARATE
+# COUNTER: a second counter incremented alongside record_human_handoff()
+# would eventually drift from it (two numbers meant to always agree, kept in
+# two places, is exactly the "two files that look like duplicates aren't
+# automatically in sync" trap this codebase's own report_flow.py module
+# docstring warns about for a different pair of files). human_handoff_counts
+# ("human_direct_request") is already the authoritative count of this
+# story's escalations; the rate is a read-only division on top of it.
+_total_turns = 0
+
+HUMAN_DIRECT_REQUEST_INTENT = "human_direct_request"
+_HUMAN_DIRECT_REQUEST_REASON = "caller_requested_human_directly"
+
+
+def record_turn_attempt() -> None:
+    """Denominator for immediate_human_escalation_rate() below. Called once
+    per caller turn dispatched, regardless of what intent it resolves to --
+    a turn that never reaches human_direct_request still belongs in the
+    denominator, or the rate would only ever measure "escalations per
+    escalation-adjacent turn", not "escalations per turn" as the AC asks."""
+    global _total_turns
+    with _lock:
+        _total_turns += 1
+
+
+def total_turns() -> int:
+    """The current denominator. Exposed mainly for tests and for whatever
+    eventually reads immediate_human_escalation_rate() -- see this
+    section's own module comment on why no dashboard/metrics endpoint
+    exists in this codebase to read it FROM yet."""
+    with _lock:
+        return _total_turns
+
+
+def record_immediate_human_handoff(call_id: str | None = None) -> None:
+    """The zero-negotiation escalation event itself: records a handoff
+    under HUMAN_DIRECT_REQUEST_INTENT with a reason that honestly reflects
+    what happened (the caller was understood perfectly and asked for a
+    human -- see record_human_handoff()'s own docstring for why its default
+    reason string would be wrong here). Thin wrapper so main.py/main_pcm.py
+    call one function instead of repeating the intent name and reason
+    string at each dispatch site."""
+    record_human_handoff(HUMAN_DIRECT_REQUEST_INTENT, call_id=call_id,
+                          reason=_HUMAN_DIRECT_REQUEST_REASON)
+
+
+def immediate_human_escalation_rate() -> dict:
+    """The quality signal itself: how often a caller turn ended in an
+    immediate, zero-negotiation human handoff, out of every turn attempted.
+    Returned as a dict (count/denominator/rate) rather than a bare float so
+    a log line or a future dashboard can show the numbers the rate was
+    built from, not just the ratio -- the AC calls this "a quality signal
+    rather than something to minimise", and a rate with no visible
+    denominator invites exactly that minimising ("just push the number
+    down") instead of the intended reading ("this many people needed a
+    human, unfiltered").
+    """
+    handoffs = human_handoff_counts(HUMAN_DIRECT_REQUEST_INTENT)
+    turns = total_turns()
+    rate = (handoffs / turns) if turns > 0 else 0.0
+    return {
+        "immediate_human_handoffs": handoffs,
+        "total_turns": turns,
+        "immediate_human_escalation_rate": round(rate, 4),
+    }
+
+
 def _reset_for_testing() -> None:
     """Test-only: clear the in-process counters between test cases. Never
     called from production code -- tests import and call this explicitly
     in a fixture, the same pattern as clearing any other module-level
     cache in a test suite."""
+    global _total_turns
     with _lock:
         _counts.clear()
         _handoff_counts.clear()
+        _total_turns = 0

@@ -113,11 +113,30 @@ class _AsyncNoOp:
 
 
 def make_session():
+    # UPDATED BY SOURAV -- KCD-448 test cleanup. Same gap already fixed
+    # for the same reason in tests/test_booking_readback.py, tests/test_
+    # request_callback.py and tests/test_test_sample_intent.py's own
+    # make_session: _dispatch_turn_inner() reads session.utt_seq and
+    # session.call_state directly, purely to log the turn, before any
+    # intent-specific code runs.
+    # _speak_fact() (the "same question, same answer within one call"
+    # gate -- see agent/answer_ledger.py) reads session.answer_ledger
+    # directly too, same missing-attribute shape as utt_seq/call_state
+    # above; test_rate's ordinary dispatch path goes through _speak_fact,
+    # unlike the intents most other dispatch-test files in this suite
+    # cover, so this attribute was never needed there.
+    import main_pcm as _main_pcm
+    from agent.state import DialogueState as _DS
     return types.SimpleNamespace(
         call_id="live-price-demo-call",
         pending=None,
         dispatch_lock=asyncio.Lock(),
         send_json=_AsyncNoOp(),
+        state=_DS(),
+        utt_seq=1,
+        call_state=None,
+        confirm_attempts=0,
+        answer_ledger=_main_pcm.answer_ledger.AnswerLedger(),
     )
 
 
@@ -133,6 +152,21 @@ def _dispatch_test_rate(monkeypatch, tools, test_name, tmp_path):
         # below still matches this codebase's own default/fallback
         # language, exactly as it did before that fix.
         text = "পরীক্ষাটার রেট কত?"
+        # UPDATED BY SOURAV -- fixes the "SEPARATE PRE-EXISTING ISSUE"
+        # this class's own docstring flagged: main_pcm.py's dispatch reads
+        # `asr_result.decoder_agreement` directly (unlike agent/
+        # confidence.py's own zone(), which uses getattr with a default),
+        # so a FakeASRResult missing it crashed the turn with an
+        # AttributeError before ever reaching test_rate's own dispatch
+        # branch -- every assertion in this class was silently checking
+        # SYSTEM_UNREACHABLE_BN instead of the real reply. Same fix
+        # already applied for the identical reason in tests/test_booking_
+        # readback.py, tests/test_request_callback.py and tests/test_
+        # test_sample_intent.py's own FakeASRResult.
+        decoder_used = "ctc"
+        decoder_agreement = 1.0
+        ctc_words = 5
+        rnnt_words = 5
 
     class FakeASR:
         async def transcribe_utterance(self, wav_path):
