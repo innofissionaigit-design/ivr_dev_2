@@ -1,0 +1,4 @@
+{"timestamp": "2026-09-21T16:17:30.963371+00:00", "event": "human_handoff", "intent": "doctor_availability", "reason": "query_unresolved_or_low_confidence", "call_id": "call-dates"}
+{"timestamp": "2026-09-21T16:17:32.377515+00:00", "event": "human_handoff", "intent": "book_appointment", "reason": "query_unresolved_or_low_confidence", "call_id": "call-dates"}
+{"timestamp": "2026-09-21T16:19:08.803969+00:00", "event": "human_handoff", "intent": "doctor_availability", "reason": "query_unresolved_or_low_confidence", "call_id": "call-dates"}
+{"timestamp": "2026-09-21T16:19:09.544598+00:00", "event": "human_handoff", "intent": "book_appointment", "reason": "query_unresolved_or_low_confidence", "call_id": "call-dates"}
