@@ -219,7 +219,14 @@ class _AsyncNoOp:
 
 
 class FakeASRResult:
+    # FIXED BY SOURAV -- same pre-existing stale-fixture gap fixed in
+    # tests/test_compare_options.py's own FakeASRResult -- see that
+    # comment for the full explanation.
     text = "কিছু একটা বললাম"
+    decoder_used = "ctc"
+    decoder_agreement = 1.0
+    ctc_words = 4
+    rnnt_words = 4
 
 
 class FakeASR:
@@ -228,9 +235,22 @@ class FakeASR:
 
 
 def make_session(pending=None):
+    # FIXED BY SOURAV -- pre-existing stale-fixture bug found while
+    # investigating live reports of "insurance/package/compare replies
+    # fail". This SimpleNamespace was missing utt_seq/call_state/
+    # confirm_attempts, which _dispatch_turn_inner's turn_log.record()
+    # call reads unconditionally on every turn -- real CallSession (see
+    # main.py's own __init__) always sets all three, so no live call was
+    # ever actually broken this way; only this test double never
+    # exercised the real dispatch code at all, crashing to the generic
+    # "can't check this right now" apology before reaching this file's
+    # own compare/insurance-specific assertions. Mirrors the corrected
+    # make_session() already used in tests/test_doctor_personal_request.py.
     return types.SimpleNamespace(
         call_id="test-call-1", pending=pending,
         dispatch_lock=asyncio.Lock(), send_json=_AsyncNoOp(),
+        call_state=main.call_state_mod.build(), utt_seq=1,
+        confirm_attempts=0,
     )
 
 

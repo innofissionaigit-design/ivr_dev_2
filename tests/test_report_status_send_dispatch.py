@@ -88,16 +88,51 @@ class _AsyncNoOp:
 
 
 def make_session(pending=None):
+    # FIXED BY SOURAV -- pre-existing stale-fixture bug, same class
+    # already found and fixed in tests/test_phase1_intents_and_dispatch.py
+    # /test_phase1_end_to_end_integration.py/test_compare_options.py/
+    # test_health_package_and_clinic_info_dispatch.py during an earlier,
+    # unrelated bug investigation (see the delivered
+    # "Insurance_package_compare_bug_investigation_report.txt"): this
+    # SimpleNamespace was missing utt_seq/call_state/confirm_attempts,
+    # which _dispatch_turn_inner's turn_log.record() call reads
+    # unconditionally on every FRESH turn (a real CallSession always
+    # sets all three). Found here while adding Story 5's tests -- every
+    # test in this file that goes through dispatch_with_intent() (i.e.
+    # a fresh _dispatch_turn(), not a _continue_pending() on an
+    # already-established flow) was crashing before ever reaching
+    # report_status/report_send dispatch at all, unrelated to Story 5's
+    # own authorization logic. Not a live-call bug (main_pcm.py's real
+    # CallSession.__init__ already sets these), only a test double that
+    # predates this field trio.
     return types.SimpleNamespace(
         call_id="test-call-1",
         pending=pending,
         dispatch_lock=asyncio.Lock(),
         send_json=_AsyncNoOp(),
+        call_state=main_pcm.call_state_mod.build(), utt_seq=1,
+        confirm_attempts=0,
     )
 
 
 class FakeASRResult:
+    # FIXED BY SOURAV -- same pre-existing stale-fixture gap already
+    # found and fixed in tests/test_compare_options.py /
+    # test_phase1_intents_and_dispatch.py / test_phase1_end_to_end_
+    # integration.py / test_health_package_and_clinic_info_dispatch.py
+    # (see the delivered "Insurance_package_compare_bug_investigation_
+    # report.txt"): missing decoder_agreement/decoder_used/ctc_words/
+    # rnnt_words made main_pcm.py treat every ASR result here as
+    # carrying NO confidence evidence, routing every fresh turn into
+    # the "did I hear you right?" echo-confirmation flow instead of
+    # ever reaching report_status/report_send dispatch. Found here
+    # while adding Story 5's tests, unrelated to Story 5's own
+    # authorization logic.
     text = "ignored -- _resolve_intent is stubbed directly"
+    decoder_used = "ctc"
+    decoder_agreement = 1.0
+    ctc_words = 4
+    rnnt_words = 4
 
 
 class FakeASR:
@@ -140,6 +175,12 @@ def continue_pending(session, text):
 READY_ENABLED = {
     "patient_found": True, "found": True, "status": "READY",
     "delivery_enabled": True, "report_number": "RPT-A", "test_name": "CBC",
+    # ADDED BY SOURAV -- Story 5: clinic-api's real report_status()
+    # response now always carries this (see clinic-api/main.py's
+    # _report_summary()) -- agent/report_access_control.py's
+    # authorize_report_access() gate requires it to be present and
+    # self-consistent before anything about the report is disclosed.
+    "patient_id": 1001,
 }
 
 
@@ -252,17 +293,22 @@ class TestPatientOrReportNotFound:
 # --------------------------------------------------------------------- #
 
 class TestWhichReportDisambiguation:
+    # ADDED BY SOURAV -- Story 5: "patient_id" added to every candidate,
+    # and to the AMBIGUOUS response's own top level below, matching
+    # clinic-api's real shape (all candidates belong to the SAME
+    # phone-resolved patient) -- see READY_ENABLED's own comment above.
+    PATIENT_ID = 4004
     CANDIDATES = [
         {"report_number": "RPT-10004", "test_name": "CBC", "status": "READY",
-         "delivery_enabled": True},
+         "delivery_enabled": True, "patient_id": PATIENT_ID},
         {"report_number": "RPT-10010", "test_name": "TSH", "status": "READY",
-         "delivery_enabled": True},
+         "delivery_enabled": True, "patient_id": PATIENT_ID},
     ]
 
     def test_ambiguous_result_parks_in_which_report_state(self, monkeypatch, env, tmp_path):
         env.tools.get_report_status_response = {
             "patient_found": True, "found": False, "reason": "AMBIGUOUS",
-            "candidates": self.CANDIDATES,
+            "candidates": self.CANDIDATES, "patient_id": self.PATIENT_ID,
         }
         session = dispatch_with_intent(
             monkeypatch, "report_status", {"test_name": None, "phone": "9000000004"}, tmp_path,
@@ -300,6 +346,7 @@ class TestWhichReportDisambiguation:
     ):
         env.tools.request_report_delivery_response = {
             "success": True, "reason": "OTP_REQUIRED", "masked_phone": "xxxxx04",
+            "patient_id": self.PATIENT_ID,
         }
         session = make_session(pending={
             "awaiting": "which_report", "flow": "report_send",

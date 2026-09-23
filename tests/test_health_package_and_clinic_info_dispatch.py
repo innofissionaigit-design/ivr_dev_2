@@ -66,11 +66,18 @@ class _AsyncNoOp:
 
 
 def make_session():
+    # FIXED BY SOURAV -- pre-existing stale-fixture bug found while
+    # investigating a live report of "women's health package says not
+    # listed" -- see tests/test_compare_options.py's own make_session()
+    # comment for the full explanation. Real CallSession always sets
+    # utt_seq/call_state/confirm_attempts; only this test double did not.
     return types.SimpleNamespace(
         call_id="test-health-package-clinic-info-call",
         pending=None,
         dispatch_lock=asyncio.Lock(),
         send_json=_AsyncNoOp(),
+        call_state=main_pcm.call_state_mod.build(), utt_seq=1,
+        confirm_attempts=0,
     )
 
 
@@ -78,7 +85,17 @@ class FakeASRResult:
     # Real Bengali text -- see test_doctor_schedule_dispatch.py's own
     # FakeASRResult comment for why this must not be the old English
     # placeholder now that dispatch calls detect_language() on it.
+    #
+    # FIXED BY SOURAV -- same pre-existing stale-fixture gap fixed in
+    # tests/test_compare_options.py's own FakeASRResult (missing
+    # decoder_agreement/decoder_used/ctc_words/rnnt_words diverted every
+    # turn in this file into the "did I hear you right?" echo instead of
+    # ever reaching the health-package/clinic-info logic this file tests).
     text = "হেলথ প্যাকেজ সম্পর্কে জানতে চাই"
+    decoder_used = "ctc"
+    decoder_agreement = 1.0
+    ctc_words = 4
+    rnnt_words = 4
 
 
 class FakeASR:

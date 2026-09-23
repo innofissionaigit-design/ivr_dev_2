@@ -93,7 +93,14 @@ class _AsyncNoOp:
 
 
 class FakeASRResult:
+    # FIXED BY SOURAV -- same pre-existing stale-fixture gap fixed in
+    # tests/test_compare_options.py's own FakeASRResult -- see that
+    # comment for the full explanation.
     text = "some utterance"  # marker-free Latin text -> detect_language() = "english"
+    decoder_used = "ctc"
+    decoder_agreement = 1.0
+    ctc_words = 2
+    rnnt_words = 2
 
 
 class FakeASR:
@@ -102,9 +109,16 @@ class FakeASR:
 
 
 def make_session(pending=None):
+    # FIXED BY SOURAV -- same pre-existing stale-fixture bug fixed in
+    # tests/test_compare_options.py and tests/test_phase1_intents_and_
+    # dispatch.py's own make_session() -- see that comment for the full
+    # explanation. Real CallSession always sets utt_seq/call_state/
+    # confirm_attempts; only this test double was missing them.
     return types.SimpleNamespace(
         call_id="test-call-e2e", pending=pending,
         dispatch_lock=asyncio.Lock(), send_json=_AsyncNoOp(),
+        call_state=main.call_state_mod.build(), utt_seq=1,
+        confirm_attempts=0,
     )
 
 

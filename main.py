@@ -100,6 +100,12 @@ from agent.reply_templates import (
     # through agent/report_flow.py's interpret_*() functions -- see that
     # module for why the decision logic itself lives there and not here).
     delivery_declined_reply, otp_disclosure_refusal_reply,
+    # ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+    # report" / privacy gateway enforcement). Spoken ONLY by
+    # _apply_report_outcome() below, whenever agent/report_flow.py's
+    # interpret_*() functions return the "__report_access_denied__"
+    # sentinel -- see that module and agent/report_access_control.py.
+    report_access_denied_reply,
     # ADDED BY SOURAV -- "Caller asks about a health package" combined
     # with "Caller asks opening hours, address or directions".
     health_package_reply, health_packages_list_reply, clinic_info_reply,
@@ -270,6 +276,12 @@ from agent.outcomes import (
     # own docstring in agent/outcomes.py for why it never logs the
     # complaint text itself.
     record_complaint_filed,
+    # ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+    # report" / privacy gateway enforcement). Own "report_access_denied"
+    # event in the same shared ledger -- see its own docstring in
+    # agent/outcomes.py for exactly what it logs and (just as
+    # importantly) what it never logs.
+    record_report_access_denied,
 )
 # ADDED BY SOURAV -- "Caller asks to be called back" story. Pure
 # availability-check/context-building logic -- see that module's own
@@ -287,6 +299,10 @@ from agent.callback_config import CALLBACKS_ENABLED
 from agent.report_flow import (
     interpret_report_status_result, interpret_delivery_request_result,
     interpret_otp_verify_result, match_candidate_report,
+    # ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+    # report"). The sentinel _apply_report_outcome() below checks for --
+    # see agent/report_flow.py's own module-level comment on it.
+    REPORT_ACCESS_DENIED_AWAITING,
 )
 # ADDED BY SOURAV -- "Caller asks whether their result is dangerous" story
 # (Epic: Conversation -- Difficult, Sensitive and Edge Cases). Deterministic,
@@ -1650,6 +1666,51 @@ async def _finish_doctor_personal_request(session: CallSession, language: str = 
     await _speak(session, doctor_personal_request_reply(availability["available"], language=language))
 
 
+# ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+# report" / privacy gateway enforcement). The ONE place every
+# interpret_*() call in this report flow funnels its (text, pending)
+# result through, so the "__report_access_denied__" sentinel
+# agent/report_flow.py's authorize_report_access() gate can produce is
+# recognized and handled in exactly one spot, not duplicated at each of
+# the four call sites that consume one of these results (see
+# report_flow.py's own module docstring on why duplicating this kind of
+# logic across call sites is exactly how this codebase's drift bugs
+# happen). Every pre-existing behavior for every OTHER outcome is
+# unchanged: `phone` is still carried forward onto the next pending
+# dict exactly as each call site already did it, and the reply text (if
+# any) is still spoken.
+async def _apply_report_outcome(session: CallSession, text: str | None, pending: dict | None,
+                                 phone: str, language: str, intent: str) -> None:
+    if pending is not None and pending.get("awaiting") == REPORT_ACCESS_DENIED_AWAITING:
+        # AC3: a clear, fixed decline, never report_status_reply() or
+        # anything else that would confirm or deny what was actually
+        # found. AC4: audited -- but see the try/except below: an audit
+        # failure must never turn this denial into a disclosure, so the
+        # decline is spoken and pending is cleared REGARDLESS of whether
+        # the audit write below succeeds.
+        try:
+            record_report_access_denied(
+                intent=intent, reason=pending.get("reason", "AUTHORIZATION_FAILED"),
+                call_id=session.call_id, turn_index=getattr(session, "utt_seq", None),
+                patient_id=pending.get("patient_id"),
+            )
+        except Exception as e:
+            logger.error("[%s] failed to record report_access_denied audit event (denial still enforced): %s",
+                         session.call_id, e)
+        session.pending = None
+        await _speak(session, report_access_denied_reply(language=language))
+        return
+    if pending is not None:
+        # phone is never something the caller re-supplies mid-flow (RULE 15
+        # -- identity was already resolved) -- carry it forward on every
+        # pending dict this story introduces so later states never need to
+        # re-ask for it.
+        pending["phone"] = phone
+    session.pending = pending
+    if text:
+        await _speak(session, text)
+
+
 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
 # (previously two separate stories, "is my report ready" / "send my
 # report"). These two helpers are the only NEW glue _dispatch_turn and
@@ -1678,6 +1739,10 @@ async def _finish_report_flow(session: CallSession, phone: str, result: dict, fl
         # an OTP rather than asking "shall I send it?" first (that offer
         # question is only for flow == "report_status").
         report_number = pending["report_number"]
+        # ADDED BY SOURAV -- Story 5: carried forward from this SAME
+        # flow's own first turn (interpret_report_status_result put it
+        # on this exact pending dict) -- see agent/report_access_control.py.
+        verified_patient_id = pending.get("verified_patient_id")
         try:
             delivery_result = await _tools.request_report_delivery(phone, report_number)
         except ToolCallError as e:
@@ -1686,16 +1751,9 @@ async def _finish_report_flow(session: CallSession, phone: str, result: dict, fl
             await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                          fallback_reason="tool_failure")
             return
-        text, pending = interpret_delivery_request_result(delivery_result, report_number, language=language)
-    if pending is not None:
-        # phone is never something the caller re-supplies mid-flow (RULE 15
-        # -- identity was already resolved) -- carry it forward on every
-        # pending dict this story introduces so later states never need to
-        # re-ask for it.
-        pending["phone"] = phone
-    session.pending = pending
-    if text:
-        await _speak(session, text)
+        text, pending = interpret_delivery_request_result(
+            delivery_result, report_number, language=language, verified_patient_id=verified_patient_id)
+    await _apply_report_outcome(session, text, pending, phone, language, flow)
 
 
 async def _handle_report_lookup(session: CallSession, phone: str, test_name: str | None, flow: str,
@@ -2637,6 +2695,23 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         # status read in an already-rare multi-report case.
         chosen = next(c for c in candidates if c["report_number"] == report_number)
         result = {"patient_found": True, "found": True, **chosen}
+        # ADDED BY SOURAV -- Story 5: carry the identity this flow was
+        # ALREADY verified/authorized as (established on the earlier
+        # turn that produced this "which_report" pending state) forward
+        # into the reconstructed result, so interpret_report_status_result's
+        # authorize_report_access() gate checks it against `chosen`'s OWN
+        # patient_id (from _report_summary()) rather than trivially
+        # comparing a value to itself -- see agent/report_access_control.py.
+        # Only set the key when a real value is known: interpret_report_
+        # status_result() treats an ABSENT "verified_patient_id" as "this
+        # is the flow's origin, trust this lookup's own patient_id" (see
+        # its own docstring) -- explicitly setting it to None here would
+        # instead read as "verification already happened and produced no
+        # identity," which would wrongly deny a which_report resumption
+        # built from a pending dict that predates this key.
+        verified_patient_id = pending.get("verified_patient_id")
+        if verified_patient_id is not None:
+            result["verified_patient_id"] = verified_patient_id
         await _finish_report_flow(session, pending.get("phone"), result, pending["flow"],
                                    language=language)
         return True
@@ -2654,11 +2729,9 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                              fallback_reason="tool_failure")
                 return True
             text_out, new_pending = interpret_delivery_request_result(
-                delivery_result, report_number, language=language)
-            if new_pending is not None:
-                new_pending["phone"] = phone
-            session.pending = new_pending
-            await _speak(session, text_out)
+                delivery_result, report_number, language=language,
+                verified_patient_id=pending.get("verified_patient_id"))
+            await _apply_report_outcome(session, text_out, new_pending, phone, language, "report_delivery")
             return True
         if is_negative(text):
             session.pending = None
@@ -2710,11 +2783,10 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
                          fallback_reason="tool_failure")
             return True
-        text_out, new_pending = interpret_otp_verify_result(result, report_number, language=language)
-        if new_pending is not None:
-            new_pending["phone"] = phone
-        session.pending = new_pending
-        await _speak(session, text_out)
+        text_out, new_pending = interpret_otp_verify_result(
+            result, report_number, language=language,
+            verified_patient_id=pending.get("verified_patient_id"))
+        await _apply_report_outcome(session, text_out, new_pending, phone, language, "report_delivery")
         return True
 
     # ADDED BY SOURAV -- "Caller asks something the agent does not cover"

@@ -63,6 +63,9 @@ from agent.reply_templates import (  # noqa: E402
     out_of_scope_counter_reply, out_of_scope_reply, patient_not_found_reply,
     prescription_requirements_reply, report_ambiguous_reply, report_not_found_reply,
     report_status_reply, sample_type_reply,
+    # ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+    # report" / privacy gateway enforcement).
+    report_access_denied_reply,
     # Aliased for the same reason test_rate_reply already was above --
     # a name starting with "test_" gets collected by pytest itself as a
     # test FUNCTION, not spoken as data, and both of these have required
@@ -277,6 +280,9 @@ def _replies():
 
     yield "patient/not-found", patient_not_found_reply()
     yield "report/not-found", report_not_found_reply()
+    # ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+    # report" / privacy gateway enforcement).
+    yield "report/access-denied", report_access_denied_reply()
     yield "report/ambiguous", report_ambiguous_reply(
         {"candidates": [{"test_name": "CBC"}, {"test_name": "Lipid Profile"}]})
 
@@ -559,6 +565,9 @@ def test_the_gate_covers_every_public_reply_function():
         "out_of_scope_counter_reply", "out_of_scope_reply", "patient_not_found_reply",
         "prescription_requirements_reply", "report_ambiguous_reply",
         "report_not_found_reply", "report_status_reply", "sample_type_reply",
+        # ADDED BY SOURAV -- Story 5 ("Caller asks about another
+        # person's report" / privacy gateway enforcement).
+        "report_access_denied_reply",
         "test_duration_reply", "test_preparation_reply", "walkin_eligibility_reply",
         # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation
         # -- Difficult, Sensitive and Edge Cases). See the three yields

@@ -1718,6 +1718,29 @@ def report_not_found_reply(language: str = "bengali") -> str:
         return "আপনার সাথে মেলে এমন কোনো রিপোর্ট খুঁজে পাইনি। দয়া করে কাউন্টারে খোঁজ নিন।"
 
 
+def report_access_denied_reply(language: str = "bengali") -> str:
+    """ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+    report"). Spoken ONLY when agent/report_access_control.py's
+    authorize_report_access() returns False (see agent/report_flow.py's
+    "__report_access_denied__" sentinel and main.py's
+    _apply_report_outcome()). Deliberately fixed and generic: unlike
+    patient_not_found_reply()/report_not_found_reply() above, this
+    reply is never allowed to confirm or deny that a specific report,
+    or a specific registered patient, exists at all -- it says nothing
+    that would let a caller distinguish "wrong patient" from "no such
+    patient" from "report not ready" from anything else. Per this
+    story's own explicit instruction, kept separate in wording from
+    both of those "not found" replies, not merged with either."""
+    if language == "english":
+        return "I'm not able to share that over the phone. Please visit the clinic counter with valid ID for this."
+    elif language == "hinglish":
+        return "Main yeh phone par nahi bata sakta. Iske liye please valid ID ke saath clinic counter par jayiye."
+    elif language == "banglish":
+        return "Ami eta phone e bolte parbo na. Erjonno please valid ID niye clinic counter e jaan."
+    else:  # bengali
+        return "এটা আমি ফোনে জানাতে পারব না। এর জন্য দয়া করে বৈধ পরিচয়পত্র নিয়ে ক্লিনিকের কাউন্টারে যোগাযোগ করুন।"
+
+
 def report_ambiguous_reply(result: dict, language: str = "bengali") -> str:
     """RULE 13: multiple reports match -- ask, using SAFE identifying
     information (test name only, per the plan's own suggestion), never

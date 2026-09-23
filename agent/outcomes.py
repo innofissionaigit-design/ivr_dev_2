@@ -429,6 +429,96 @@ def call_abandoned_count() -> int:
         return _abandonment_count
 
 
+# =============================================================================
+# ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+# report" / privacy gateway enforcement). AC: "The unauthorised attempt
+# is audited."
+#
+# A SIXTH event in the same ESCALATION_LOG_PATH ledger, distinguished
+# from every other event here by its own "event": "report_access_denied"
+# value -- same discipline record_call_abandoned() above already
+# established: one shared, durable, greppable JSONL file, one
+# process-wide lock, its own counter dict (_denied_counts) kept SEPARATE
+# from every other counter here so no two different things are ever
+# added together.
+#
+# Called from main.py's/main_pcm.py's report-flow dispatch, exactly
+# once, at the single point agent/report_flow.py's interpret_*()
+# functions signal a denial via the "__report_access_denied__" sentinel
+# (see that module and main.py's _apply_report_outcome()). Deliberately
+# logs ONLY identifiers and a fixed reason code -- per this story's own
+# explicit instruction, and matching record_complaint_filed()'s already-
+# established discipline in this exact file, report STATUS, report
+# VALUES, and any caller free text are never written to this ledger.
+# `patient_id` is the one patient-identifying field logged, and even
+# that is an internal database id, never a name, phone number, or any
+# spoken value.
+# =============================================================================
+
+REPORT_ACCESS_DENIED_EVENT = "report_access_denied"
+
+_denied_counts: dict[str, int] = {}
+
+
+def record_report_access_denied(intent: str, reason: str, call_id: str | None = None,
+                                 turn_index: int | None = None,
+                                 patient_id: int | None = None) -> None:
+    """Records one "-> report access denied by the authorization gate"
+    event. Bumps a per-intent count (report_access_denied_counts()
+    below) and appends one JSON line to the shared ESCALATION_LOG_PATH
+    ledger.
+
+    `intent` is whichever of "report_status"/"report_send"/
+    "report_delivery" the denial happened under (see main.py's call
+    sites -- the delivery/OTP continuation states do not track which
+    original intent started the flow, so they log the generic
+    "report_delivery"). `reason` is a fixed, non-sensitive code such as
+    "VERIFIED_IDENTITY_MISMATCH" -- never a sentence built from caller
+    speech.
+
+    CALLER RESPONSIBILITY, not enforced here by design: main.py/
+    main_pcm.py must call this AFTER already deciding to speak the
+    fixed decline (agent/reply_templates.report_access_denied_reply())
+    and clear session.pending, and must wrap this call in its own
+    try/except -- see main.py's _apply_report_outcome(). This function
+    intentionally does not swallow its own exceptions: a caller that
+    wraps it can log a warning and continue; a caller that does NOT
+    wrap it would surface the failure loudly rather than silently, and
+    either way the decision to deny access was already made in pure,
+    I/O-free code (agent/report_flow.py) before this function is ever
+    reached -- a failure HERE can at worst mean a denial goes
+    unrecorded, never that it gets turned into a grant. This mirrors
+    every other record_*() function in this file, none of which are
+    ever allowed to influence the outcome they are only recording.
+    """
+    with _lock:
+        _denied_counts[intent] = _denied_counts.get(intent, 0) + 1
+        record = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "event": REPORT_ACCESS_DENIED_EVENT,
+            "intent": intent,
+            "reason": reason,
+            "patient_id": patient_id,
+            "call_id": call_id,
+            "turn_index": turn_index,
+        }
+        log_dir = os.path.dirname(ESCALATION_LOG_PATH)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(ESCALATION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def report_access_denied_counts(intent: str | None = None) -> dict[str, int] | int:
+    """Per-intent report-access-denial occurrence COUNTS -- mirrors
+    human_handoff_counts() above exactly, but reads the separate
+    _denied_counts dict, never _counts or _handoff_counts."""
+    with _lock:
+        if intent is not None:
+            return _denied_counts.get(intent, 0)
+        return dict(_denied_counts)
+
+
 def _reset_for_testing() -> None:
     """Test-only: clear the in-process counters between test cases. Never
     called from production code -- tests import and call this explicitly
@@ -438,5 +528,6 @@ def _reset_for_testing() -> None:
     with _lock:
         _counts.clear()
         _handoff_counts.clear()
+        _denied_counts.clear()
         _total_turns = 0
         _abandonment_count = 0

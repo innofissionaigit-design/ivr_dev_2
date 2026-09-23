@@ -53,7 +53,25 @@ from agent.reply_templates import (
     delivery_blocked_reply,
     otp_requested_reply,
     otp_verify_reply,
+    report_access_denied_reply,
 )
+from agent.report_access_control import resolve_verified_patient_id, authorize_report_access
+
+# ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
+# report"). The sentinel main.py/main_pcm.py recognize, the exact same
+# way they already recognize "__request_delivery_now__" below: "pure
+# function says do exactly this next," here meaning "stop, this must
+# not be disclosed." See main.py's _apply_report_outcome() for the one
+# place this sentinel is ever handled -- audit the denial (best-effort;
+# see agent/outcomes.record_report_access_denied()'s own docstring on
+# why an audit failure must never change the decision) and speak
+# report_access_denied_reply(), never report_status_reply() or any
+# other reply that would confirm or deny what was actually found.
+REPORT_ACCESS_DENIED_AWAITING = "__report_access_denied__"
+
+
+def _denied(reason: str, patient_id: int | None) -> dict:
+    return {"awaiting": REPORT_ACCESS_DENIED_AWAITING, "reason": reason, "patient_id": patient_id}
 
 # Pending "awaiting" values this module introduces, mirroring the
 # existing booking flow's convention (see main_pcm.py's
@@ -93,6 +111,24 @@ def interpret_report_status_result(result: dict, flow: str, language: str = "ben
         # RULE 1's identity equivalent: never guess who the caller is.
         return patient_not_found_reply(language), None
 
+    # ADDED BY SOURAV -- Story 5's AC1/AC4 gateway: verification
+    # (resolve_verified_patient_id -- phone-to-patient resolution,
+    # clinic-api's job, never the model's) and authorization
+    # (authorize_report_access -- a SEPARATE, explicit check) both run
+    # here, in code, BEFORE anything about the report is spoken.
+    # `verified_patient_id` either comes from the CALLER (main.py
+    # carries it forward on `result["verified_patient_id"]` when this
+    # is a "which_report" disambiguation re-entry -- see that pending
+    # dict below and main.py's own comment at that call site) or, on a
+    # flow's first turn, IS this same lookup's own patient_id -- see
+    # agent/report_access_control.py's docstring for exactly what this
+    # can and cannot catch under today's schema, and why it is still a
+    # real, separate, tested gate rather than a no-op.
+    resolved_patient_id = result.get("patient_id")
+    verified_patient_id = result.get("verified_patient_id", resolved_patient_id)
+    if not authorize_report_access(verified_patient_id, resolved_patient_id):
+        return None, _denied("VERIFIED_IDENTITY_MISMATCH", resolved_patient_id)
+
     if not result.get("found"):
         reason = result.get("reason")
         if reason == "AMBIGUOUS":
@@ -100,6 +136,7 @@ def interpret_report_status_result(result: dict, flow: str, language: str = "ben
             return report_ambiguous_reply(result, language), {
                 "awaiting": AWAITING_WHICH_REPORT, "flow": flow,
                 "candidates": result.get("candidates") or [], "retries": 0,
+                "verified_patient_id": verified_patient_id,
             }
         return report_not_found_reply(language), None  # RULE 1.
 
@@ -129,7 +166,8 @@ def interpret_report_status_result(result: dict, flow: str, language: str = "ben
         # -- that I/O step cannot live in this pure function. This
         # sentinel pending tells the transport file exactly one thing to
         # do next, so there is nothing left to branch on there either.
-        return None, {"awaiting": "__request_delivery_now__", "report_number": result["report_number"]}
+        return None, {"awaiting": "__request_delivery_now__", "report_number": result["report_number"],
+                       "verified_patient_id": verified_patient_id}
 
     # flow == "report_status": offer, don't send yet (RULE 4 -- OTP/
     # delivery only ever starts after an explicit yes, tracked by
@@ -147,10 +185,12 @@ def interpret_report_status_result(result: dict, flow: str, language: str = "ben
         "report_number": result["report_number"],
         "test_name": result.get("test_name"),
         "retries": 0,
+        "verified_patient_id": verified_patient_id,
     }
 
 
-def interpret_delivery_request_result(result: dict, report_number: str, language: str = "bengali") -> tuple[str, dict | None]:
+def interpret_delivery_request_result(result: dict, report_number: str, language: str = "bengali",
+                                       verified_patient_id: int | None = None) -> tuple[str, dict | None]:
     """Called after tools_client.request_report_delivery() returns --
     either because the caller said yes to the AWAITING_CONFIRM_DELIVERY
     offer, or because interpret_report_status_result() above returned
@@ -161,9 +201,27 @@ def interpret_delivery_request_result(result: dict, report_number: str, language
     clinic-api/main.py's request_report_delivery(): it only ever returns
     success/reason/masked_phone), so the caller here is the only place
     that still knows which report this request was for; it has to carry
-    that value forward into the next pending state itself."""
+    that value forward into the next pending state itself.
+
+    `verified_patient_id` -- ADDED BY SOURAV, Story 5 -- is the id
+    interpret_report_status_result() established (or re-confirmed) on
+    this same flow's earlier turn(s), carried forward on the pending
+    dict's own "verified_patient_id" key (see main.py's
+    _apply_report_outcome()). Optional and defaulting to None purely so
+    every pre-existing caller/test of this function keeps working
+    unchanged; when it IS given, the SAME authorize_report_access()
+    gate interpret_report_status_result() already ran is re-asserted
+    here, right before an OTP is even requested -- see
+    agent/report_access_control.py's docstring for why this is a real,
+    if today mostly-invariant, check rather than a no-op."""
     if result.get("success"):
-        pending = {"awaiting": AWAITING_OTP_CODE, "report_number": report_number, "retries": 0}
+        resolved_patient_id = result.get("patient_id")
+        if verified_patient_id is not None and not authorize_report_access(verified_patient_id, resolved_patient_id):
+            return None, _denied("VERIFIED_IDENTITY_MISMATCH", resolved_patient_id)
+        pending = {
+            "awaiting": AWAITING_OTP_CODE, "report_number": report_number, "retries": 0,
+            "verified_patient_id": verified_patient_id if verified_patient_id is not None else resolved_patient_id,
+        }
         return otp_requested_reply(result, language), pending
 
     reason = result.get("reason")
@@ -177,7 +235,8 @@ def interpret_delivery_request_result(result: dict, report_number: str, language
     return delivery_blocked_reply(reason, language), None
 
 
-def interpret_otp_verify_result(result: dict, report_number: str, language: str = "bengali") -> tuple[str, dict | None]:
+def interpret_otp_verify_result(result: dict, report_number: str, language: str = "bengali",
+                                 verified_patient_id: int | None = None) -> tuple[str, dict | None]:
     """Called after tools_client.verify_report_otp() returns. On
     OTP_INVALID, stays in the SAME otp_code pending state so the caller
     can try again -- bounded by the transport file's own
@@ -188,10 +247,22 @@ def interpret_otp_verify_result(result: dict, report_number: str, language: str 
     is authoritative and always ends the flow here regardless of the
     local retry counter, so a caller can never out-wait a local retry
     cap to get more real attempts than the server allows.
+
+    `verified_patient_id` -- ADDED BY SOURAV, Story 5 -- same meaning
+    and default as interpret_delivery_request_result()'s own parameter
+    above: carried forward from this same flow's earlier turns, and
+    re-asserted against clinic-api's own patient_id on a successful
+    verification, one last time, immediately before the flow ends by
+    reporting delivery as sent. See agent/report_access_control.py.
     """
     reply = otp_verify_reply(result, language)
     if result.get("reason") == "OTP_INVALID":
-        return reply, {"awaiting": AWAITING_OTP_CODE, "report_number": report_number, "retries": 0}
+        return reply, {"awaiting": AWAITING_OTP_CODE, "report_number": report_number, "retries": 0,
+                        "verified_patient_id": verified_patient_id}
+    if result.get("success") and verified_patient_id is not None:
+        resolved_patient_id = result.get("patient_id")
+        if not authorize_report_access(verified_patient_id, resolved_patient_id):
+            return None, _denied("VERIFIED_IDENTITY_MISMATCH", resolved_patient_id)
     # Every other reason (success, expired, used, maxed, not_ready,
     # disabled, delivery failed, not found, patient not found) ends the
     # flow -- none of them are something retrying the SAME OTP fixes.

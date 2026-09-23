@@ -948,6 +948,16 @@ def _report_summary(report: LabReport, test_name: str) -> dict:
         "delivery_enabled": report.delivery_enabled,
         "expected_ready_at": report.expected_ready_at.isoformat() if report.expected_ready_at else None,
         "ready_at": report.ready_at.isoformat() if report.ready_at else None,
+        # ADDED BY SOURAV -- Story 5 ("Caller asks about another
+        # person's report"). An internal identifier only -- never a
+        # value any reply_templates.py function speaks aloud -- that
+        # agent/report_access_control.py's authorize_report_access()
+        # checks before the agent discloses anything from this dict.
+        # Additive: every pre-existing consumer of this shape keeps
+        # working unchanged (tests in this repo assert on specific keys
+        # here, never on exact dict equality for a found=True/AMBIGUOUS
+        # response -- see tests/test_clinic_api_reports.py).
+        "patient_id": report.patient_id,
     }
 
 
@@ -973,7 +983,12 @@ def report_status(phone: str = Query(...), test_name: str | None = Query(None),
     reports = db.query(LabReport).filter_by(patient_id=patient.id).all()
     if not reports:
         # RULE 1: an honest NOT_FOUND, never a fabricated report.
-        return {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+        # ADDED BY SOURAV -- Story 5: patient_id included here too (not
+        # just on a found=True response) so agent/report_access_control.py's
+        # gate -- which runs before this reason is even inspected -- has
+        # something real to check for every patient_found=True shape,
+        # not just the ones with an actual report to disclose.
+        return {"patient_found": True, "found": False, "reason": "NOT_FOUND", "patient_id": patient.id}
 
     lab_test_ids = {r.lab_test_id for r in reports}
     tests_by_id = {t.id: t for t in db.query(LabTest).filter(LabTest.id.in_(lab_test_ids)).all()}
@@ -987,8 +1002,9 @@ def report_status(phone: str = Query(...), test_name: str | None = Query(None),
         # A test_name was given but nothing this patient has matches it --
         # honest NOT_FOUND rather than silently falling back to "all
         # reports" (which would let a misheard test name return an
-        # unrelated report).
-        return {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+        # unrelated report). patient_id included -- see the comment on
+        # the zero-reports NOT_FOUND branch above for why.
+        return {"patient_found": True, "found": False, "reason": "NOT_FOUND", "patient_id": patient.id}
 
     if len(matches) > 1:
         # RULE 13: multiple candidates -> ask, never guess.
@@ -1127,6 +1143,11 @@ def request_report_delivery(req: DeliveryRequest, db: Session = Depends(get_db))
     return {
         "success": True, "reason": "OTP_REQUIRED",
         "masked_phone": _mask_phone_last4(patient.phone),
+        # ADDED BY SOURAV -- Story 5: see _report_summary()'s own
+        # comment above for why this key is safe to add (additive,
+        # never spoken, no exact-dict-equality test covers a
+        # success=True response here).
+        "patient_id": patient.id,
     }
 
 
@@ -1282,6 +1303,14 @@ def verify_report_otp(req: OtpVerifyRequest, db: Session = Depends(get_db)):
         "success": True, "reason": "DELIVERY_SENT",
         "masked_phone": _mask_phone_last4(patient.phone),
         "signed_link_expires_minutes": SIGNED_LINK_VALIDITY_MINUTES,
+        # ADDED BY SOURAV -- Story 5: see _report_summary()'s own
+        # comment above. Deliberately NOT added to the DELIVERY_FAILED
+        # response a few lines above this one -- that shape IS covered
+        # by an exact-dict-equality test
+        # (test_simulated_delivery_failure_after_correct_otp), and
+        # there is nothing left to authorize once delivery has already
+        # failed for an unrelated (provider) reason.
+        "patient_id": patient.id,
     }
 
 

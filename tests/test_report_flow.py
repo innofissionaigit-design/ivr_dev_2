@@ -45,7 +45,13 @@ class TestPatientNotFound:
 
 class TestReportNotFound:
     def test_ends_the_flow(self):
-        result = {"patient_found": True, "found": False, "reason": "NOT_FOUND"}
+        # ADDED BY SOURAV -- Story 5: "patient_id" is now part of every
+        # patient_found=True clinic-api response (see
+        # clinic-api/main.py's report_status()) -- required here so
+        # agent/report_access_control.py's authorize_report_access()
+        # gate, which runs before this reason is even inspected, has a
+        # real, self-consistent identity to check.
+        result = {"patient_found": True, "found": False, "reason": "NOT_FOUND", "patient_id": 1}
         text, pending = interpret_report_status_result(result, "report_status")
         assert pending is None
         assert text
@@ -61,12 +67,16 @@ class TestAmbiguousMultipleReports:
             {"report_number": "RPT-10004", "test_name": "CBC", "status": "READY"},
             {"report_number": "RPT-10010", "test_name": "TSH", "status": "READY"},
         ]
-        result = {"patient_found": True, "found": False, "reason": "AMBIGUOUS", "candidates": candidates}
+        # ADDED BY SOURAV -- Story 5: top-level "patient_id" (see
+        # TestReportNotFound.test_ends_the_flow's comment above).
+        result = {"patient_found": True, "found": False, "reason": "AMBIGUOUS",
+                  "candidates": candidates, "patient_id": 1}
         text, pending = interpret_report_status_result(result, "report_status")
         assert pending["awaiting"] == AWAITING_WHICH_REPORT
         assert pending["flow"] == "report_status"
         assert pending["candidates"] == candidates
         assert pending["retries"] == 0
+        assert pending["verified_patient_id"] == 1
         assert text
 
     def test_report_send_flow_also_asks_which_before_sending_anything(self):
@@ -74,7 +84,8 @@ class TestAmbiguousMultipleReports:
         # -- a caller who opens with "send my report" but has two reports
         # must still be asked which, not have one guessed for delivery.
         candidates = [{"report_number": "RPT-A", "test_name": "CBC", "status": "READY"}]
-        result = {"patient_found": True, "found": False, "reason": "AMBIGUOUS", "candidates": candidates}
+        result = {"patient_found": True, "found": False, "reason": "AMBIGUOUS",
+                  "candidates": candidates, "patient_id": 1}
         _, pending = interpret_report_status_result(result, "report_send")
         assert pending["awaiting"] == AWAITING_WHICH_REPORT
         assert pending["flow"] == "report_send"
@@ -88,6 +99,7 @@ class TestNotReadyStatuses:
         return {
             "patient_found": True, "found": True, "status": status,
             "delivery_enabled": True, "report_number": "RPT-1",
+            "patient_id": 1,  # ADDED BY SOURAV -- Story 5, see above.
         }
 
     def test_not_ready_report_status_just_answers(self):
@@ -120,6 +132,7 @@ class TestDeliveryDisabled:
         return {
             "patient_found": True, "found": True, "status": "READY",
             "delivery_enabled": False, "report_number": "RPT-I",
+            "patient_id": 1,  # ADDED BY SOURAV -- Story 5, see above.
         }
 
     def test_report_status_reports_status_with_no_offer(self):
@@ -143,6 +156,7 @@ class TestReadyAndDeliveryEnabled:
         return {
             "patient_found": True, "found": True, "status": "READY",
             "delivery_enabled": True, "report_number": "RPT-A",
+            "patient_id": 1,  # ADDED BY SOURAV -- Story 5, see above.
         }
 
     def test_report_status_offers_and_waits_for_yes(self):
@@ -150,12 +164,14 @@ class TestReadyAndDeliveryEnabled:
         assert pending["awaiting"] == AWAITING_CONFIRM_DELIVERY
         assert pending["report_number"] == "RPT-A"
         assert pending["retries"] == 0
+        assert pending["verified_patient_id"] == 1
         assert text
 
     def test_report_send_returns_request_delivery_now_sentinel(self):
         text, pending = interpret_report_status_result(self._result(), "report_send")
         assert text is None
-        assert pending == {"awaiting": "__request_delivery_now__", "report_number": "RPT-A"}
+        assert pending == {"awaiting": "__request_delivery_now__", "report_number": "RPT-A",
+                            "verified_patient_id": 1}
 
 
 # --------------------------------------------------------------------- #
@@ -164,11 +180,20 @@ class TestReadyAndDeliveryEnabled:
 
 class TestDeliveryRequestResult:
     def test_success_moves_to_otp_code_pending_with_report_number_carried(self):
+        # ADDED BY SOURAV -- Story 5: "patient_id" is now part of
+        # clinic-api's real request_report_delivery() success response
+        # (see clinic-api/main.py) -- with no `verified_patient_id`
+        # passed in (this test's whole point predates that parameter),
+        # interpret_delivery_request_result() falls back to trusting
+        # this dict's own patient_id and carries THAT forward as the
+        # next pending state's "verified_patient_id" -- see that
+        # function's own docstring.
         text, pending = interpret_delivery_request_result(
-            {"success": True, "reason": "OTP_REQUIRED", "masked_phone": "xxxxx01"},
+            {"success": True, "reason": "OTP_REQUIRED", "masked_phone": "xxxxx01", "patient_id": 1},
             report_number="RPT-A",
         )
-        assert pending == {"awaiting": AWAITING_OTP_CODE, "report_number": "RPT-A", "retries": 0}
+        assert pending == {"awaiting": AWAITING_OTP_CODE, "report_number": "RPT-A", "retries": 0,
+                            "verified_patient_id": 1}
         assert text
 
     def test_masked_phone_is_spoken_not_the_full_number(self):
@@ -232,7 +257,11 @@ class TestOtpVerifyResult:
         text, pending = interpret_otp_verify_result(
             {"success": False, "reason": "OTP_INVALID"}, report_number="RPT-A",
         )
-        assert pending == {"awaiting": AWAITING_OTP_CODE, "report_number": "RPT-A", "retries": 0}
+        # ADDED BY SOURAV -- Story 5: this call site does not pass
+        # verified_patient_id (predates that parameter), so it stays
+        # None, carried forward unchanged onto the re-prompt state.
+        assert pending == {"awaiting": AWAITING_OTP_CODE, "report_number": "RPT-A", "retries": 0,
+                            "verified_patient_id": None}
         assert text
 
     def test_every_other_reason_ends_the_flow(self):
