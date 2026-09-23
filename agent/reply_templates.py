@@ -3334,3 +3334,154 @@ def callback_scheduled_reply(slots: dict, result: dict, language: str = "bengali
         return "Dukkhito, apnar callback request note korte parlam na. Ektu pore abar try korun, ba counter-e jogajog korun."
     else:  # bengali
         return "দুঃখিত, আপনার কল ব্যাকের অনুরোধ নথিভুক্ত করা গেল না। একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।"
+
+
+# =============================================================================
+# ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+# Difficult, Sensitive and Edge Cases).
+#
+# story title: Caller goes silent
+# user story: As a caller who was distracted, I want a gentle prompt rather
+#   than a disconnection, so that I do not lose the call.
+# acceptance criteria: Two graduated prompts precede a graceful close, each
+#   different from the last. The close states what was and was not
+#   completed. Abandonment is logged with the turn index and the preceding
+#   prompt.
+#
+# Three functions: the two graduated re-engagement prompts (spoken in that
+# order, never the same wording twice -- see main.py's _turn_poll_loop and
+# agent/silence_flow.next_silence_action() for the stage machine that picks
+# which one), and the completion-aware graceful close spoken only after
+# both have gone unanswered. Kept as plain, fixed, four-language templates
+# -- same discipline as human_fallback_reply()/out_of_scope_reply() above --
+# because nothing about a silence episode is caller-supplied data; there is
+# nothing here that needs to be composed rather than stored verbatim.
+# =============================================================================
+
+def silence_prompt_one(language: str = "bengali") -> str:
+    """First graduated prompt: a gentle check that the caller is still on
+    the line, spoken once the existing IDLE_TIMEOUT_S silence window has
+    passed for the first time in an episode. Deliberately soft -- this is
+    not yet a warning that the call will end, only a check-in, so a caller
+    who was briefly distracted is not made to feel rushed."""
+    if language == "english":
+        return "Hello, are you still there? I didn't hear anything -- please go ahead whenever you're ready."
+    elif language == "hinglish":
+        return "Hello, aap line par hain? Kuch sunai nahi diya -- jab ready ho tab bataiye."
+    elif language == "banglish":
+        return "Hello, apni ki line-e achen? Kichu shunte pelam na -- ready hole bolun."
+    else:  # bengali
+        return "হ্যালো, আপনি কি লাইনে আছেন? কিছু শুনতে পাচ্ছি না -- আপনি প্রস্তুত হলে বলুন।"
+
+
+def silence_prompt_two(language: str = "bengali") -> str:
+    """Second and LAST graduated prompt, spoken only if the caller stayed
+    silent through the full IDLE_TIMEOUT_S window that followed
+    silence_prompt_one() above. Deliberately worded differently from
+    silence_prompt_one() (the acceptance criterion's own "each different
+    from the last") and, unlike the first prompt, says plainly that the
+    call will end next if there is still no response -- the caller's last
+    warning before silence_close_reply() below actually closes the line."""
+    if language == "english":
+        return ("I'm still not hearing anything. If you're there, please say "
+                 "something now -- otherwise I'll have to end this call.")
+    elif language == "hinglish":
+        return ("Abhi bhi kuch sunai nahi de raha. Agar aap wahan hain, please "
+                 "kuch boliye -- nahi toh mujhe yeh call end karni hogi.")
+    elif language == "banglish":
+        return ("Ekhono kichu shunte pacchi na. Apni jodi thaken, ekhon kichu "
+                 "bolun -- na hole amake ei call ta shesh korte hobe.")
+    else:  # bengali
+        return ("এখনও কিছু শুনতে পাচ্ছি না। আপনি যদি লাইনে থাকেন, এখনই কিছু বলুন -- "
+                 "না হলে আমাকে এই কলটি শেষ করতে হবে।")
+
+
+# ADDED BY SOURAV -- bugfix for the "Caller goes silent" story (validation
+# report Bug #2). why: silence_close_reply() used to take a plain bool
+# (has_unfinished_business()'s own return value), so a caller who never
+# said a word before going silent looked IDENTICAL to a caller who talked
+# and finished cleanly -- both are "pending is None and deferred is
+# None" -- and got the same "everything you asked has been taken care of"
+# text. Importing agent.silence_flow.next_close_state()'s three string
+# constants here (same cross-module import style this file already uses
+# for agent.bn_normalize above) so this function's branches and that
+# function's return values can never silently drift apart into two
+# different sets of "state name" strings.
+from agent.silence_flow import CLOSE_NO_ENGAGEMENT, CLOSE_COMPLETED, CLOSE_UNFINISHED
+
+
+def silence_close_reply(close_state: str, language: str = "bengali") -> str:
+    """The graceful close spoken when both graduated prompts above have
+    gone unanswered (main.py's _turn_poll_loop, ACTION_ABANDON branch).
+
+    `close_state` is agent/silence_flow.next_close_state()'s return value
+    -- one of CLOSE_UNFINISHED / CLOSE_NO_ENGAGEMENT / CLOSE_COMPLETED,
+    never a value invented here. This template is not allowed to invent
+    what was in progress or what happened, only to say honestly whether
+    something was left unfinished, nothing ever happened, or something
+    real was resolved:
+
+      CLOSE_UNFINISHED    -- states plainly that something was left
+                             incomplete, without ever implying it
+                             succeeded ("never claim that an operation
+                             was completed merely because the caller
+                             started it").
+      CLOSE_NO_ENGAGEMENT -- the caller never said anything at all this
+                             call (session.utt_seq == 0). Must NOT claim
+                             anything was completed, taken care of, or
+                             answered -- there was nothing to resolve.
+                             Simply says no response was received and the
+                             call is ending.
+      CLOSE_COMPLETED     -- the caller engaged (at least one dispatched
+                             turn) and nothing is currently pending or
+                             deferred -- the one case where "everything
+                             you asked has been taken care of" is
+                             actually true.
+    """
+    if close_state == CLOSE_UNFINISHED:
+        if language == "english":
+            return ("Since I'm not getting a response, I'll end the call here. "
+                     "What you were in the middle of hasn't been completed yet -- "
+                     "please call back to continue it. Thank you.")
+        elif language == "hinglish":
+            return ("Response na milne ki wajah se main yeh call yahin end kar "
+                     "raha hoon. Aap jo kar rahe the woh abhi complete nahi hua "
+                     "hai -- continue karne ke liye phir se call kariye. Dhanyabad.")
+        elif language == "banglish":
+            return ("Response na paoyay ami ei call ta ekhane shesh korchi. Apni "
+                     "ja shuru korechilen ta ekhono complete hoyni -- continue "
+                     "korte abar call korun. Dhonnobad.")
+        else:  # bengali
+            return ("কোনো সাড়া না পাওয়ায় আমি কলটি এখানে শেষ করছি। আপনি যেটি শুরু "
+                     "করেছিলেন সেটি এখনও সম্পূর্ণ হয়নি -- চালিয়ে যেতে আবার কল করুন। "
+                     "ধন্যবাদ।")
+
+    if close_state == CLOSE_NO_ENGAGEMENT:
+        if language == "english":
+            return ("Since I'm not getting any response, I'll end the call here. "
+                     "Thank you.")
+        elif language == "hinglish":
+            return ("Koi response na milne ki wajah se main yeh call yahin end "
+                     "kar raha hoon. Dhanyabad.")
+        elif language == "banglish":
+            return ("Kono response na paoyay ami ei call ta ekhane shesh korchi. "
+                     "Dhonnobad.")
+        else:  # bengali
+            return ("কোনো সাড়া না পাওয়ায় আমি কলটি এখানে শেষ করছি। ধন্যবাদ।")
+
+    # CLOSE_COMPLETED
+    if language == "english":
+        return ("Since I'm not getting a response, I'll end the call here. "
+                 "Everything you'd asked has been taken care of. Thank you, "
+                 "have a good day.")
+    elif language == "hinglish":
+        return ("Response na milne ki wajah se main yeh call yahin end kar raha "
+                 "hoon. Aapne jo bhi poocha tha uska jawab de diya gaya hai. "
+                 "Dhanyabad, aapka din shubh ho.")
+    elif language == "banglish":
+        return ("Response na paoyay ami ei call ta ekhane shesh korchi. Apni ja "
+                 "jiggesh korechilen tar uttor deya hoye geche. Dhonnobad, "
+                 "apnar din bhalo katuk.")
+    else:  # bengali
+        return ("কোনো সাড়া না পাওয়ায় আমি কলটি এখানে শেষ করছি। আপনি যা জিজ্ঞাসা "
+                 "করেছিলেন তার উত্তর দেওয়া হয়ে গেছে। ধন্যবাদ, ভালো থাকবেন।")

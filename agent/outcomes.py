@@ -340,13 +340,80 @@ def immediate_human_escalation_rate() -> dict:
     }
 
 
+# =============================================================================
+# ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+# Difficult, Sensitive and Edge Cases). AC: "Abandonment is logged with the
+# turn index and the preceding prompt."
+#
+# A FIFTH event in the same ESCALATION_LOG_PATH ledger, distinguished from
+# "human_handoff" (and from the un-tagged insufficient-verified-information
+# records above, which predate the "event" field entirely) by its own
+# "event": "call_abandoned" value -- same discipline record_human_handoff()
+# already established: one shared, durable, greppable JSONL file, one
+# process-wide lock, one dict of counts kept SEPARATE per event type so no
+# two different things are ever added together.
+#
+# Called from main.py's/main_pcm.py's _turn_poll_loop, and from there only
+# once per abandoned call: the ACTION_ABANDON branch this call sits in ends
+# with `return`, so _turn_poll_loop never ticks again for that call
+# afterward, which is what keeps this a one-shot log rather than something
+# that needs its own re-entrancy guard.
+# =============================================================================
+
+_abandonment_count = 0
+
+
+def record_call_abandoned(turn_index: int, preceding_prompt: str | None,
+                           call_id: str | None = None) -> None:
+    """Records one "caller went silent through both graduated prompts and
+    the call was closed" event: bumps the process-wide abandonment count
+    and appends a JSON line to ESCALATION_LOG_PATH.
+
+    `turn_index` is session.utt_seq at the moment of abandonment -- the
+    count of utterances this call had already dispatched, the same
+    counter _turn_poll_loop itself increments for every confirmed
+    utterance (see that function's own `session.utt_seq += 1`), not a
+    value invented for this story.
+
+    `preceding_prompt` is the exact text of whichever graduated prompt
+    (agent/reply_templates.silence_prompt_one()/silence_prompt_two())
+    was spoken immediately before the close -- per the acceptance
+    criterion, this is always the SECOND prompt, since abandonment is
+    only ever reached after both have gone unanswered.
+    """
+    global _abandonment_count
+    with _lock:
+        _abandonment_count += 1
+        record = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "event": "call_abandoned",
+            "call_id": call_id,
+            "turn_index": turn_index,
+            "preceding_prompt": preceding_prompt,
+        }
+        log_dir = os.path.dirname(ESCALATION_LOG_PATH)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(ESCALATION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def call_abandoned_count() -> int:
+    """The current count of logged call_abandoned events -- mirrors
+    total_turns() above exactly, but reads _abandonment_count, never
+    _total_turns or either of the other two counters in this file."""
+    with _lock:
+        return _abandonment_count
+
+
 def _reset_for_testing() -> None:
     """Test-only: clear the in-process counters between test cases. Never
     called from production code -- tests import and call this explicitly
     in a fixture, the same pattern as clearing any other module-level
     cache in a test suite."""
-    global _total_turns
+    global _total_turns, _abandonment_count
     with _lock:
         _counts.clear()
         _handoff_counts.clear()
         _total_turns = 0
+        _abandonment_count = 0

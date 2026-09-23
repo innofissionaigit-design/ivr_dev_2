@@ -155,6 +155,13 @@ from agent.reply_templates import (
     # function for both booking and callback corrections -- see its own
     # docstring in agent/reply_templates.py.
     correction_acknowledged_reply,
+    # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+    # Difficult, Sensitive and Edge Cases). Two graduated re-engagement
+    # prompts plus the completion-aware graceful close -- see each
+    # function's own docstring in agent/reply_templates.py, and
+    # agent/silence_flow.py's module docstring for the stage machine in
+    # _turn_poll_loop below that picks between them.
+    silence_prompt_one, silence_prompt_two, silence_close_reply,
 )
 from agent.compare_flow import build_comparison
 # ADDED BY SOURAV -- "The agent accepts a correction and restates" story.
@@ -162,6 +169,13 @@ from agent.compare_flow import build_comparison
 # see this module's own docstring for why it lives here rather than
 # duplicated inline in both main.py and main_pcm.py.
 from agent.correction_flow import detect_booking_correction, detect_callback_correction
+# ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+# Difficult, Sensitive and Edge Cases). Pure, transport-agnostic "what is
+# the next silence action / has anything been left unfinished" logic --
+# same drift reason as detect_booking_correction() above: kept here once
+# so _turn_poll_loop's independently-maintained copy in main.py and
+# main_pcm.py cannot disagree about it. See this module's own docstring.
+from agent import silence_flow
 # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
 # answer" story. Cross-turn entity memory (pronoun/elliptical follow-up
 # resolution) -- see agent/state.py's own module docstring for the full
@@ -237,6 +251,11 @@ from agent.outcomes import (
     record_turn_attempt,
     record_immediate_human_handoff,
     immediate_human_escalation_rate,
+    # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+    # Difficult, Sensitive and Edge Cases). Same ESCALATION_LOG_PATH ledger
+    # and _lock as record_human_handoff() above, own "call_abandoned" event
+    # name -- see its own docstring in agent/outcomes.py.
+    record_call_abandoned,
 )
 # ADDED BY SOURAV -- "Caller asks to be called back" story. Pure
 # availability-check/context-building logic -- see that module's own
@@ -691,6 +710,20 @@ class CallSession:
         # without making the caller repeat the name. See agent/state.py's
         # own module docstring for the full design.
         self.state = DialogueState()
+
+        # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation
+        # -- Difficult, Sensitive and Edge Cases). Per-call, never global or
+        # shared between sessions (a process-wide counter would leak one
+        # caller's silence into another caller's call): how many graduated
+        # silence prompts the CURRENT silence episode has already used
+        # (agent/silence_flow.STAGE_NORMAL/STAGE_PROMPT_1_SENT/
+        # STAGE_PROMPT_2_SENT), and the exact text of whichever one was
+        # spoken most recently, so a later abandonment log entry can record
+        # the preceding prompt without re-rendering or re-guessing it. Both
+        # are read and written only by _turn_poll_loop -- see that
+        # function's own comment on the IDLE_TIMEOUT_S branch below.
+        self.silence_stage = silence_flow.STAGE_NORMAL
+        self.last_silence_prompt: str | None = None
 
     def hold_gate_for(self, audio_duration_s: float):
         """Called before each reply goes out. Extends rather than replaces
@@ -4860,13 +4893,72 @@ async def _turn_poll_loop(session: CallSession):
     On yes: slice that utterance out for ASR, hand it to _dispatch_turn as
     a background task (so ingestion of the NEXT turn's audio is never
     blocked by this turn's ASR/LLM/TTS work), and advance the marker.
+
+    ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+    Difficult, Sensitive and Edge Cases). The IDLE_TIMEOUT_S branch just
+    below used to close the call outright on the first silence, with no
+    warning (this story's own Repo Evidence: "closes after 90 s with a
+    single message and no counting"). It now runs two graduated
+    re-engagement prompts first -- see agent/silence_flow.py's module
+    docstring for the exact stage machine and why it lives in its own
+    pure module rather than inline here a second time (once for main.py,
+    once again for main_pcm.py).
     """
     while True:
         await asyncio.sleep(POLL_INTERVAL_S)
 
         if time.time() - session.last_activity > IDLE_TIMEOUT_S:
-            logger.info("[%s] idle timeout, closing", session.call_id)
-            await _speak(session, "লাইনে কোনো সাড়া পাচ্ছি না, কল শেষ করছি। ধন্যবাদ।")
+            # Two graduated prompts, then a completion-aware close -- see
+            # this function's own docstring above and
+            # agent/silence_flow.next_silence_action()'s docstring for the
+            # stage machine. session.last_activity is reset to time.time()
+            # after each prompt is spoken (never after the abandon branch,
+            # which ends the call) so every stage gets its own FULL
+            # IDLE_TIMEOUT_S window -- the timeout's value and how it is
+            # measured are otherwise unchanged.
+            action = silence_flow.next_silence_action(session.silence_stage)
+
+            if action == silence_flow.ACTION_PROMPT_1:
+                logger.info("[%s] silence: sending prompt 1", session.call_id)
+                session.last_silence_prompt = silence_prompt_one()
+                await _speak(session, session.last_silence_prompt)
+                session.silence_stage = silence_flow.STAGE_PROMPT_1_SENT
+                session.last_activity = time.time()
+                continue
+
+            if action == silence_flow.ACTION_PROMPT_2:
+                logger.info("[%s] silence: sending prompt 2", session.call_id)
+                session.last_silence_prompt = silence_prompt_two()
+                await _speak(session, session.last_silence_prompt)
+                session.silence_stage = silence_flow.STAGE_PROMPT_2_SENT
+                session.last_activity = time.time()
+                continue
+
+            # ACTION_ABANDON: silent through both prompts. Say plainly what
+            # was and was not completed (never inventing a completed
+            # action the caller only started -- see
+            # silence_flow.has_unfinished_business()'s own docstring for
+            # exactly which session state this is allowed to read), log
+            # the abandonment exactly once, then close. This `return` is
+            # the only exit from this branch, so _turn_poll_loop never
+            # ticks again for this call afterward -- there is no path that
+            # could log a second call_abandoned event for the same call.
+            #
+            # ADDED BY SOURAV -- bugfix (validation report Bug #2):
+            # next_close_state() replaces a bare has_unfinished_business()
+            # call here so a caller who never said a word (utt_seq == 0)
+            # is not told "everything you asked has been taken care of" --
+            # see that function's own docstring for the three-way split.
+            logger.info("[%s] silence: abandoning after both prompts", session.call_id)
+            close_state = silence_flow.next_close_state(
+                session.utt_seq, session.pending, session.deferred,
+            )
+            await _speak(session, silence_close_reply(close_state))
+            record_call_abandoned(
+                turn_index=session.utt_seq,
+                preceding_prompt=session.last_silence_prompt,
+                call_id=session.call_id,
+            )
             with contextlib.suppress(Exception):
                 await session.ws.close()
             return
@@ -4900,6 +4992,18 @@ async def _turn_poll_loop(session: CallSession):
         result = await asyncio.to_thread(_turn_detector.poll, tail, sr)
         if result.utterance_end_s is None:
             continue
+
+        # ADDED BY SOURAV -- "Caller goes silent" story. A confirmed
+        # utterance end here is the turn detector (VAD) reporting actual
+        # caller speech, not merely audio bytes arriving (CallSession.
+        # append() already bumps last_activity on every raw chunk
+        # regardless of content) and not the background noise/silence the
+        # turn detector already filters out before ever returning an
+        # utterance_end_s at all. This is therefore the correct point --
+        # and the only point in this loop -- to end a silence episode:
+        # whichever graduated prompt was most recently sent, the caller
+        # has now actually answered it.
+        session.silence_stage = silence_flow.STAGE_NORMAL
 
         absolute_end_s = session.processed_until_s + result.utterance_end_s
         session.utt_seq += 1

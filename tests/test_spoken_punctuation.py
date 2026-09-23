@@ -70,7 +70,17 @@ from agent.reply_templates import (  # noqa: E402
     test_duration_reply as duration_reply,
     test_preparation_reply as preparation_reply,
     walkin_eligibility_reply,
+    # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+    # Difficult, Sensitive and Edge Cases). Found by this file's own
+    # test_the_gate_covers_every_public_reply_function() -- three new
+    # public functions with no case here yet. See each yield below.
+    silence_prompt_one, silence_prompt_two, silence_close_reply,
 )
+# ADDED BY SOURAV -- bugfix for the "Caller goes silent" story's close
+# message (validation report Bug #2): silence_close_reply() now branches
+# on one of these three state strings instead of a bare bool, so its
+# gate cases below need to pass one of these, not True/False.
+from agent.silence_flow import CLOSE_NO_ENGAGEMENT, CLOSE_COMPLETED, CLOSE_UNFINISHED
 
 # Characters that mean something on a page and nothing in a sentence. A caller
 # hears them as a stumble, a mispronunciation, or -- with the Bengali
@@ -461,6 +471,21 @@ def _replies():
                       "time_slot", "patient_name", "phone"):
             yield f"prompt/{intent}/{field}", missing_slot_prompt(intent, field)
 
+    # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+    # Difficult, Sensitive and Edge Cases). silence_prompt_one/two take no
+    # caller-supplied values (fixed templates, like callback_correction_
+    # prompt() above), so one case each is enough; silence_close_reply()
+    # now branches on one of three close-state strings (bugfix, validation
+    # report Bug #2 -- see agent/silence_flow.next_close_state()'s own
+    # docstring), so all three get a case -- same reason
+    # correction_acknowledged_reply above gets one case per field, not
+    # just one call.
+    yield "silence/prompt-1", silence_prompt_one()
+    yield "silence/prompt-2", silence_prompt_two()
+    yield "silence/close-unfinished", silence_close_reply(CLOSE_UNFINISHED)
+    yield "silence/close-no-engagement", silence_close_reply(CLOSE_NO_ENGAGEMENT)
+    yield "silence/close-completed", silence_close_reply(CLOSE_COMPLETED)
+
 
 CASES = list(_replies())
 
@@ -512,6 +537,10 @@ def test_the_gate_covers_every_public_reply_function():
         "prescription_requirements_reply", "report_ambiguous_reply",
         "report_not_found_reply", "report_status_reply", "sample_type_reply",
         "test_duration_reply", "test_preparation_reply", "walkin_eligibility_reply",
+        # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation
+        # -- Difficult, Sensitive and Edge Cases). See the three yields
+        # above in _replies() for their cases.
+        "silence_prompt_one", "silence_prompt_two", "silence_close_reply",
     }
     assert public <= exercised, (
         f"reply function(s) {sorted(public - exercised)} have no case in this gate"
