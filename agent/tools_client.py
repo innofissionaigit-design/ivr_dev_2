@@ -698,3 +698,26 @@ class ClinicToolsClient:
             return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"request_callback({body!r}): {e}") from e
+
+    # =========================================================================
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+    # =========================================================================
+
+    # ---- Tool 18: POST /api/v1/complaints ----
+    # Expected response shape:
+    #   {"success": true, "complaint_id": "CMP-20260918-A1B2", "phone": "..." or
+    #    null, "status": "pending"}
+    async def submit_complaint(self, complaint_text: str, phone: str | None = None) -> dict:
+        # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED,
+        # same reasoning as request_callback() above -- a write, never a
+        # cache candidate. `complaint_text` is passed through exactly as
+        # received -- this method never trims, translates, or rewrites it;
+        # see agent/complaint_flow.py's own module docstring for why the
+        # verbatim text has to survive unmodified all the way to this call.
+        body = {"complaint_text": complaint_text, "phone": phone}
+        try:
+            r = await self._client.post("/api/v1/complaints", json=body)
+            r.raise_for_status()
+            return _parse_exact(r)
+        except httpx.HTTPError as e:
+            raise ToolCallError(f"submit_complaint({body!r}): {e}") from e

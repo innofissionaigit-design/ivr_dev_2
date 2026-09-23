@@ -1265,3 +1265,97 @@ class CallbackRequest(Base):
         DateTime,
         nullable=False,
     )
+
+
+# ============================================================================
+# COMPLAINT RECORDS
+# ============================================================================
+#
+# ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+#
+# User story: "As a dissatisfied patient, I want my complaint recorded and
+# routed to a person, so that it is not absorbed by a machine."
+#
+# Same "Evidence: 'No outbound capability'" honesty as CallbackRequest just
+# above, and deliberately modelled on it: this stack cannot itself connect a
+# caller to a live human, so "routed to a person" cannot mean a real call
+# transfer here -- it means a durable, queryable RECORD a human staff member
+# picks up and acts on. `status` starts at "pending" and, exactly like
+# CallbackRequest.status, nothing in this prototype ever moves it past
+# "pending" -- there is no admin UI anywhere in this codebase to do that
+# from. This table is the entire scope of AC 4 ("routed to the complaints
+# path/person-handling path"): a real, persisted, greppable row, never a
+# fabricated transfer.
+#
+# Deliberately its OWN table, not a repurposed CallbackRequest row: a
+# complaint has no time_window (nobody is asking to be called back at a
+# particular time) and its free-text column means something different
+# (what went wrong, not why a callback is wanted) -- conflating the two
+# would make one shared `reason` column carry two unrelated meanings, and a
+# future query for "unresolved complaints" would have to somehow tell them
+# apart from ordinary callback requests again by some other means.
+#
+# WHY THIS COLUMN CAN HOLD THE VERBATIM CALLER TEXT WHEN agent/outcomes.py's
+# ESCALATION_LOG_PATH LEDGER DELIBERATELY NEVER DOES: that ledger is a
+# shared, append-only log file every outcome in this codebase writes to,
+# and its own module docstring is explicit that avoiding caller free text
+# there is "one of the few PHI controls the prototype actually has today"
+# -- a property of THAT shared file, not a blanket rule that no table
+# anywhere may ever store caller-supplied text. This table follows the
+# EXISTING, narrower precedent instead: CallbackRequest.reason already
+# stores a caller's verbatim callback reason in exactly this same
+# database, behind exactly this same access boundary, for exactly the
+# same reason (AC 3's "captured verbatim" needs a durable place to live
+# that a human can actually read back, and a log ledger nobody re-reads in
+# order is not that place).
+class ComplaintRecord(Base):
+    __tablename__ = "complaint_records"
+
+    id = Column(Integer, primary_key=True)
+
+    # Human-readable reference, same style as CallbackRequest.callback_id
+    # (see clinic-api/main.py's request_callback()) -- a caller or staff
+    # member can read this back over the phone or on a printout.
+    complaint_id = Column(
+        String,
+        nullable=False,
+        unique=True,
+    )
+
+    # The caller's own words, stored EXACTLY as ASR transcribed them --
+    # never summarised, translated, or trimmed. AC 3 ("captured verbatim")
+    # is this column, full stop; agent/complaint_flow.py's own docstring
+    # covers why the agent itself never rewrites or interprets this text
+    # before it reaches here. NOT nullable: unlike CallbackRequest.reason
+    # (an optional elaboration on a callback that stands fine without one),
+    # a complaint IS its text -- there is no such thing as a complaint
+    # record with nothing said.
+    complaint_text = Column(
+        Text,
+        nullable=False,
+    )
+
+    # Not a foreign key into Patient -- a caller filing a complaint is
+    # never required to be an already-registered patient, same reasoning
+    # as CallbackRequest.phone above. Nullable: this codebase's complaint
+    # guard fires on the words alone and does not itself collect a phone
+    # number (see agent/complaint_flow.py) -- a null here is an honest "no
+    # callback number was captured for this complaint", not a bug.
+    phone = Column(
+        String,
+        nullable=True,
+    )
+
+    # "pending" | "resolved" | "cancelled" -- see this class's own
+    # docstring above for why nothing in this prototype ever moves it past
+    # "pending" yet.
+    status = Column(
+        String,
+        nullable=False,
+        default="pending",
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+    )

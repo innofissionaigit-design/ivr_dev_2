@@ -75,6 +75,8 @@ from agent.reply_templates import (  # noqa: E402
     # test_the_gate_covers_every_public_reply_function() -- three new
     # public functions with no case here yet. See each yield below.
     silence_prompt_one, silence_prompt_two, silence_close_reply,
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+    complaint_acknowledged_reply,
 )
 # ADDED BY SOURAV -- bugfix for the "Caller goes silent" story's close
 # message (validation report Bug #2): silence_close_reply() now branches
@@ -486,6 +488,13 @@ def _replies():
     yield "silence/close-no-engagement", silence_close_reply(CLOSE_NO_ENGAGEMENT)
     yield "silence/close-completed", silence_close_reply(CLOSE_COMPLETED)
 
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+    # complaint_acknowledged_reply() takes no caller-supplied values (a
+    # fixed template per language, like human_fallback_reply() above), so
+    # one case per language is enough.
+    for language in ("bengali", "english", "hinglish", "banglish"):
+        yield f"complaint/acknowledged-{language}", complaint_acknowledged_reply(language)
+
 
 CASES = list(_replies())
 
@@ -541,6 +550,8 @@ def test_the_gate_covers_every_public_reply_function():
         # -- Difficult, Sensitive and Edge Cases). See the three yields
         # above in _replies() for their cases.
         "silence_prompt_one", "silence_prompt_two", "silence_close_reply",
+        # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+        "complaint_acknowledged_reply",
     }
     assert public <= exercised, (
         f"reply function(s) {sorted(public - exercised)} have no case in this gate"

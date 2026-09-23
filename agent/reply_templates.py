@@ -2397,6 +2397,51 @@ def human_fallback_reply(language: str = "bengali") -> str:
 
 
 # =============================================================================
+# ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+#
+# AC 2 ("acknowledged exactly once") and AC 5 ("does NOT attempt to
+# resolve, explain, defend, justify, or argue") together rule out anything
+# but a single, fixed, code-level sentence here -- exactly the same
+# discipline human_fallback_reply() just above already follows for its own
+# zero-negotiation story, and for the same reason: never the model's own
+# free-composed text (see agent/llm.py's _validate() strip-for-non-
+# smalltalk rule), always one of these four fixed sentences. "Exactly
+# once" is enforced by WHERE this is called from, not by anything in this
+# function itself -- main.py's/main_pcm.py's complaint dispatch branches
+# call this and then never re-enter any complaint-specific state (no
+# `session.pending` is set afterward, same as human_direct_request's own
+# branch), so there is no path back to this function for the same
+# complaint.
+# =============================================================================
+def complaint_acknowledged_reply(language: str = "bengali") -> str:
+    """The fixed acknowledgment spoken the moment a complaint is detected.
+    Deliberately says nothing about resolving, explaining, or defending
+    anything -- it only confirms the complaint was heard, recorded exactly
+    as said, and passed on to a person, matching AC 3/4's own "captured
+    verbatim" / "routed to a person" language without promising a live
+    transfer this codebase cannot make (see agent/tools_client.py's
+    submit_complaint() and clinic-api/models.py's ComplaintRecord for what
+    "routed" actually means here)."""
+    if language == "english":
+        return ("I understand, and I'm sorry to hear that. I've recorded your "
+                 "complaint exactly as you described it, and it will be passed "
+                 "directly to our team.")
+    elif language == "hinglish":
+        return ("Samajh gaya, aur mujhe afsos hai ki aapko yeh dikkat hui. Maine "
+                 "aapki complaint bilkul waise hi note kar li hai jaise aapne "
+                 "bataya, aur ise seedha hamari team tak pahuncha diya jayega.")
+    elif language == "banglish":
+        return ("Bujhte perechi, ebong apnar ei osubidhar jonno ami dukkhito. Ami "
+                 "apnar complaint thik jevabe bolechen shevabei note kore "
+                 "niyechi, ebong eta shorashori amader team-er kache pathiye "
+                 "deoa hobe.")
+    else:  # bengali
+        return ("বুঝতে পেরেছি, এবং আপনার এই অসুবিধার জন্য আমি দুঃখিত। আপনি যেভাবে "
+                 "বলেছেন ঠিক সেভাবেই আমি আপনার অভিযোগটি নথিভুক্ত করেছি, এবং এটি "
+                 "সরাসরি আমাদের টিমের কাছে পাঠিয়ে দেওয়া হবে।")
+
+
+# =============================================================================
 # ADDED BY SOURAV -- "Caller asks something the agent does not cover" story.
 #
 # Distinct from human_fallback_reply() just above: that one fires for

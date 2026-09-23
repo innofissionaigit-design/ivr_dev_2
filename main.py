@@ -162,6 +162,10 @@ from agent.reply_templates import (
     # agent/silence_flow.py's module docstring for the stage machine in
     # _turn_poll_loop below that picks between them.
     silence_prompt_one, silence_prompt_two, silence_close_reply,
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Fixed,
+    # non-generative acknowledgment -- see this function's own docstring
+    # in agent/reply_templates.py for why AC 2/AC 5 rule out anything else.
+    complaint_acknowledged_reply,
 )
 from agent.compare_flow import build_comparison
 # ADDED BY SOURAV -- "The agent accepts a correction and restates" story.
@@ -256,6 +260,11 @@ from agent.outcomes import (
     # and _lock as record_human_handoff() above, own "call_abandoned" event
     # name -- see its own docstring in agent/outcomes.py.
     record_call_abandoned,
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Own
+    # "complaint" intent/reason pair in the same shared ledger -- see its
+    # own docstring in agent/outcomes.py for why it never logs the
+    # complaint text itself.
+    record_complaint_filed,
 )
 # ADDED BY SOURAV -- "Caller asks to be called back" story. Pure
 # availability-check/context-building logic -- see that module's own
@@ -290,6 +299,13 @@ from agent.clinical_safety import is_clinical_interpretation
 # _resolve_intent(), AND again at the very top of _continue_pending(),
 # ahead of every in-progress flow's own field parsing.
 from agent.human_fast_path import is_immediate_human_request
+# ADDED BY SOURAV -- "Caller wants to make a complaint" story. Deterministic,
+# pre-LLM, pre-fast-path phrase matcher, structured directly on
+# agent/human_fast_path.py's own guard just above -- see this module's own
+# docstring for why it must run BEFORE _fast_path and BEFORE extract_intent
+# inside _resolve_intent(), AND again at the very top of _continue_pending(),
+# ahead of every in-progress flow's own field parsing.
+from agent.complaint_flow import is_complaint
 # STORY [Answer Quality and Grounding]
 # As a patient, I want to hear the whole sentence, so that I am
 # not left guessing what the agent tried to say.
@@ -1075,6 +1091,27 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
             "direct_reply_bn": None,
         }
 
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Checked
+    # here, after the two guards above, before fast_path/the semantic
+    # cache/Ollama -- same "structurally impossible to misclassify" reasoning
+    # agent/complaint_flow.py's module docstring gives in full: AC 5's "does
+    # NOT attempt to resolve, explain, defend, justify, or argue" is a
+    # zero-tolerance policy the model must never get a turn to violate, so a
+    # complaint can never be misclassified as smalltalk, out_of_scope, or
+    # anything an LLM retry under phrasing pressure might produce. See that
+    # module's own docstring for why this also has to run again inside
+    # _continue_pending() for a caller who complains mid-flow.
+    if is_complaint(text):
+        logger.info("[%s] complaint guard fired -- no LLM call", session.call_id)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None}
+        return {
+            "intent": "complaint",
+            "slots": slots,
+            "parts": [{"intent": "complaint", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
     # Tier 1: decide it locally if we can. For a fixed catalogue the
     # entity is a string-matching problem with a 0.32 confidence margin,
     # where the embedding route had 0.03 -- see agent/fast_path.py. This
@@ -1470,6 +1507,50 @@ async def _finish_callback(session: CallSession, slots: dict, language: str = "b
             return
 
     await _speak(session, callback_scheduled_reply(slots, result, language=language))
+
+
+# ADDED BY SOURAV -- "Caller wants to make a complaint" story. Same shape as
+# _finish_callback() just above (place the write, catch ToolCallError for
+# the infra-apology path) but with no "confirm_*" pending state leading
+# into it: BOTH call sites (the complaint guard inside _continue_pending
+# below, and the "complaint" branch of _dispatch_turn_inner's dispatch
+# chain) call this directly, on the SAME turn the complaint was said --
+# AC 2/AC 5's zero-negotiation contract leaves nothing to confirm first,
+# the same reasoning human_direct_request's own branch already follows.
+#
+# `session.pending` is cleared unconditionally on entry, same as the
+# immediate-human-request guard just above in _continue_pending -- a
+# complaint said mid-flow abandons that flow outright, with no attempt to
+# finish, resume, or ask about it.
+#
+# `text` is passed through to agent/tools_client.py's submit_complaint()
+# EXACTLY as received -- never trimmed, translated, or summarised -- so
+# clinic-api's ComplaintRecord.complaint_text ends up holding precisely
+# what AC 3 asks for ("captured verbatim"). No confirmation field is ever
+# read back to the caller (complaint_acknowledged_reply() names no
+# complaint_id or status), so there is no missing_*_write_fields() check
+# here the way _finish_callback()/_finish_booking() need one -- the only
+# thing that can go wrong is the write itself failing, which the
+# ToolCallError branch below already covers honestly.
+async def _finish_complaint(session: CallSession, text: str, language: str = "bengali"):
+    session.pending = None
+    try:
+        result = await _tools.submit_complaint(text)
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+
+    if not result.get("success"):
+        logger.error("[%s] complaint submission reported failure -- withholding acknowledgment",
+                     session.call_id)
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+
+    record_complaint_filed(call_id=session.call_id)
+    await _speak(session, complaint_acknowledged_reply(language=language))
 
 
 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
@@ -1971,6 +2052,25 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         session.pending = None
         record_immediate_human_handoff(call_id=session.call_id)
         await _speak(session, human_fallback_reply(language=language))
+        return True
+
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Checked
+    # here, immediately after the immediate-human-request guard above and
+    # still before `awaiting` is even read -- ahead of every flow-specific
+    # branch below. Without this, a caller mid-booking (or mid-OTP-
+    # verification, or being asked to confirm what was heard) who suddenly
+    # says "actually I want to file a complaint about..." would have that
+    # sentence parsed as an attempted answer to whatever field was pending,
+    # silently swallowing the complaint into the wrong flow -- see
+    # agent/complaint_flow.py's own module docstring for the full
+    # reasoning. Whatever flow was in progress is abandoned outright, with
+    # no attempt to finish, resume, or ask about it -- AC 5 leaves nothing
+    # to do but record this complaint on this turn.
+    if is_complaint(text):
+        logger.info("[%s] complaint interrupted an in-progress flow "
+                    "(awaiting=%s) -- abandoning it, recording complaint now",
+                    session.call_id, pending.get("awaiting"))
+        await _finish_complaint(session, text, language=language)
         return True
 
     awaiting = pending["awaiting"]
@@ -4025,6 +4125,22 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
             await _speak(session, human_fallback_reply(language=language))
             return
 
+        if intent == "complaint":
+            # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+            # Reached when the guard fires inside _resolve_intent() above
+            # for a FRESH turn (no in-progress flow) -- the mid-flow case
+            # is handled by _continue_pending()'s own guard instead, which
+            # never falls through to here. Same zero-negotiation shape as
+            # "human_direct_request" just above: no offer, no choice, no
+            # `session.pending` left set afterward. `text` here is this
+            # turn's own ASR transcript (set at the top of this function,
+            # still in scope) -- passed straight through to
+            # _finish_complaint() so the stored complaint is exactly what
+            # the caller said, never a field extracted or rewritten by the
+            # classifier.
+            await _finish_complaint(session, text, language=language)
+            return
+
         try:
             if intent == "test_rate":
                 if not slots.get("test_name"):
@@ -4596,6 +4712,18 @@ _MULTI_INTENT_NEEDS_SEPARATE_FLOW = {
     # in _resolve_intent() means a solo "give me a human" turn never
     # actually reaches the multi-intent LLM path at all.
     "human_direct_request",
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Same
+    # reasoning as human_direct_request just above -- listed explicitly
+    # even though agent/complaint_flow.py's own whole-utterance guard in
+    # _resolve_intent() means a complaint phrased in this module's own
+    # phrase set never actually reaches the multi-intent LLM path at all.
+    # Defense-in-depth for the case the guard's literal phrase list misses
+    # but the classifier itself still tags one PART of a combined
+    # utterance as "complaint" (e.g. "book me an appointment and also I
+    # want to raise a complaint about..."): AC 5 rules out ever composing
+    # an inline "answer" to a complaint, so it must always be routed here
+    # rather than fragment-resolved like an ordinary lookup.
+    "complaint",
 }
 _MULTI_INTENT_NO_FRAGMENT = {"smalltalk", "unclear"}
 

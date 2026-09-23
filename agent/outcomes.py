@@ -319,6 +319,29 @@ def record_immediate_human_handoff(call_id: str | None = None) -> None:
                           reason=_HUMAN_DIRECT_REQUEST_REASON)
 
 
+HUMAN_COMPLAINT_INTENT = "complaint"
+_HUMAN_COMPLAINT_REASON = "caller_filed_complaint"
+
+
+def record_complaint_filed(call_id: str | None = None) -> None:
+    """ADDED BY SOURAV -- "Caller wants to make a complaint" story. Records
+    one "-> complaint filed, routed to a person" event under the same
+    shared ESCALATION_LOG_PATH ledger record_human_handoff() writes to,
+    with its own honest reason string (the caller was understood
+    perfectly and is reporting a problem -- not confusion, not a direct
+    request for a human) -- same pattern
+    record_immediate_human_handoff() just above already established for
+    its own story. Deliberately logs ONLY intent/reason/call_id, never the
+    complaint text itself: the instruction for this story is explicit that
+    logs/escalations.jsonl must keep avoiding caller free text (see this
+    module's own docstring on why that ledger has that discipline at all)
+    -- the verbatim text goes to clinic-api's ComplaintRecord table
+    instead (see agent/tools_client.py's submit_complaint()), which is a
+    different, narrower-access durable store built for exactly that."""
+    record_human_handoff(HUMAN_COMPLAINT_INTENT, call_id=call_id,
+                          reason=_HUMAN_COMPLAINT_REASON)
+
+
 def immediate_human_escalation_rate() -> dict:
     """The quality signal itself: how often a caller turn ended in an
     immediate, zero-negotiation human handoff, out of every turn attempted.

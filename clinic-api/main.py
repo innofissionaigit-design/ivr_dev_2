@@ -71,6 +71,8 @@ from models import (
     InsuranceProvider, InsurancePolicy, PatientBilling,
     # ADDED BY SOURAV -- "Caller asks to be called back" story, below.
     CallbackRequest,
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story, below.
+    ComplaintRecord,
 )
 # ADDED BY SOURAV -- "otp will not be hardcoded": how the freshly
 # generated code actually reaches the patient is a separate, pluggable
@@ -1551,5 +1553,53 @@ def request_callback(req: CallbackRequestIn, db: Session = Depends(get_db)):
         "phone": req.phone,
         "time_window": req.time_window,
         "reason": req.reason,
+        "status": "pending",
+    }
+
+
+# =============================================================================
+# Tool 17: POST /api/v1/complaints
+#
+# ADDED BY SOURAV -- "Caller wants to make a complaint" story. See
+# models.py's own ComplaintRecord docstring for why this is its own table
+# rather than a repurposed CallbackRequest row, and agent/complaint_flow.py's
+# module docstring for why detection happens entirely on the VOICE AGENT
+# side (main.py/main_pcm.py), before this endpoint is ever called -- same
+# division of labour Tool 12 above already has: the agent decides WHETHER
+# and WHEN to call this, this endpoint decides only HOW to store what it's
+# given, with no re-classification, no dedup, and no attempt to judge
+# whether the complaint is valid.
+# =============================================================================
+class ComplaintRecordIn(BaseModel):
+    complaint_text: str
+    phone: str | None = None
+
+
+@app.post("/api/v1/complaints")
+def submit_complaint(req: ComplaintRecordIn, db: Session = Depends(get_db)):
+    """Always succeeds for a syntactically valid body (FastAPI/Pydantic
+    already reject a request missing `complaint_text` with a 422 before
+    this function body ever runs) -- same "no domain check to fail" shape
+    as request_callback() above: a complaint has no capacity limit and
+    needs nothing else to already exist in the database. `success` is
+    still returned, matching every other write in this file's response
+    shape, so main.py's existing "check success, then check the fields
+    that must be non-empty before speaking them" pattern needs no
+    special-casing for this endpoint either."""
+    complaint_id = f"CMP-{datetime.date.today().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+    row = ComplaintRecord(
+        complaint_id=complaint_id,
+        complaint_text=req.complaint_text,
+        phone=req.phone,
+        status="pending",
+        created_at=datetime.datetime.now(),
+    )
+    db.add(row)
+    db.commit()
+
+    return {
+        "success": True,
+        "complaint_id": complaint_id,
+        "phone": req.phone,
         "status": "pending",
     }
