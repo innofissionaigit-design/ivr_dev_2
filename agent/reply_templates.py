@@ -2442,6 +2442,119 @@ def complaint_acknowledged_reply(language: str = "bengali") -> str:
 
 
 # =============================================================================
+# ADDED BY SOURAV -- "Caller wants to speak to a doctor personally" story.
+#
+# AC 1/2/3/4 together rule out anything model-composed here, for the same
+# reason complaint_acknowledged_reply() just above is fixed: a caller
+# asking for a doctor personally must get a TRUTHFUL answer about what is
+# actually possible, and "truthful" is not something a 7B model can be
+# trusted to stay inside under phrasing pressure (see agent/
+# doctor_personal_request.py's own module docstring for the full
+# reasoning). This function is deliberately parameterised ONLY by
+# `callback_available` -- a plain bool, already resolved by main.py's
+# dispatch via the EXISTING agent/callback_flow.check_callback_
+# availability() (never duplicated here) -- and never by a doctor's name,
+# because there is nothing this function could truthfully say about a
+# SPECIFIC doctor's ability to call back. That omission is what makes AC 3
+# ("never promises a call from a named doctor it cannot schedule") true by
+# construction: no code path in this function can ever produce a sentence
+# naming a doctor, so there is no "Dr Sen will call you" for any caller
+# phrasing to provoke.
+#
+# Every sentence states the real process (AC 1): it cannot connect the
+# caller to a doctor directly on this call, and it cannot promise a
+# specific doctor will call back. It then offers only routes this
+# codebase can actually deliver (AC 2/4): booking an appointment (a real
+# visit with a real doctor -- agent/tools_client.py's book_appointment
+# tool) always, and the existing generic callback (agent/callback_flow.py/
+# agent/tools_client.py's request_callback tool) ONLY when
+# `callback_available` is True -- when it is False, the callback route is
+# simply not mentioned at all, rather than mentioned and then hedged,
+# because AC 4's own "where a clinical callback exists in POLICY" already
+# means "do not offer what policy says is not available right now" (see
+# main.py's _finish_doctor_personal_request() for exactly how this bool is
+# resolved from the real clinic hours / CALLBACKS_ENABLED switch, the same
+# check the "request_callback" intent's own branch already runs).
+#
+# Never reuses clinical_interpretation_reply()'s "connect you with our
+# clinician right now" wording (see that function's own docstring) -- the
+# investigation for this story found that phrasing does not correspond to
+# any real live connection either, and the story is explicit that this
+# path must not repeat it. Changing that PRE-EXISTING wording is out of
+# this story's scope; see this story's own final report for that flagged,
+# not silently fixed, as an adjacent issue.
+# =============================================================================
+def doctor_personal_request_reply(callback_available: bool, language: str = "bengali") -> str:
+    """The fixed, truthful answer spoken the moment a caller asks to speak
+    with a doctor/clinician personally (agent/doctor_personal_request.py's
+    guard). Never names a doctor, never claims an immediate or direct
+    connection, and only offers the generic callback route when
+    `callback_available` is exactly what agent/callback_flow.
+    check_callback_availability() says right now."""
+    if language == "english":
+        if callback_available:
+            return ("I understand you'd like to speak with a doctor personally. "
+                     "I'm not able to connect you to a doctor directly on this "
+                     "call, and I can't promise that any specific doctor will "
+                     "call you back. What I can do is book you an appointment to "
+                     "see a doctor in person, or take down your number so "
+                     "someone from the clinic can call you back generally. "
+                     "Which would you prefer?")
+        return ("I understand you'd like to speak with a doctor personally. "
+                 "I'm not able to connect you to a doctor directly on this "
+                 "call, and I can't promise that any specific doctor will call "
+                 "you back. What I can do is book you an appointment to see a "
+                 "doctor in person. Would you like to do that?")
+    elif language == "hinglish":
+        if callback_available:
+            return ("Main samajh sakta hoon ki aap khud kisi doctor se baat "
+                     "karna chahte hain. Main aapko is call par seedhe kisi "
+                     "doctor se connect nahi kar sakta, aur na hi yeh promise "
+                     "kar sakta hoon ki koi khaas doctor aapko wapas call "
+                     "karenge. Main yeh kar sakta hoon -- aapke liye ek doctor "
+                     "ke saath appointment book kar doon, ya aapka number note "
+                     "kar loon taaki clinic se koi aapko baad mein call kare. "
+                     "Aap kya chahenge?")
+        return ("Main samajh sakta hoon ki aap khud kisi doctor se baat karna "
+                 "chahte hain. Main aapko is call par seedhe kisi doctor se "
+                 "connect nahi kar sakta, aur na hi yeh promise kar sakta hoon "
+                 "ki koi khaas doctor aapko wapas call karenge. Main yeh kar "
+                 "sakta hoon -- aapke liye ek doctor ke saath appointment book "
+                 "kar doon. Kya aap yeh chahenge?")
+    elif language == "banglish":
+        if callback_available:
+            return ("Ami bujhte parchi je apni nijei ekjon daktarer sathe kotha "
+                     "bolte chan. Ami ei call-e apnake sorasori kono daktarer "
+                     "sathe connect korte parbo na, ebong ami eo promise korte "
+                     "parbo na je kono nirdishto daktar apnake ferot call "
+                     "korben. Ami ja korte pari seta holo -- apnar jonno ekjon "
+                     "daktarer sathe appointment book kore dite pari, othoba "
+                     "apnar number ta note kore rakhte pari jate clinic theke "
+                     "keu apnake pore call kore. Apni ki chan?")
+        return ("Ami bujhte parchi je apni nijei ekjon daktarer sathe kotha "
+                 "bolte chan. Ami ei call-e apnake sorasori kono daktarer sathe "
+                 "connect korte parbo na, ebong ami eo promise korte parbo na "
+                 "je kono nirdishto daktar apnake ferot call korben. Ami ja "
+                 "korte pari seta holo -- apnar jonno ekjon daktarer sathe "
+                 "appointment book kore dite pari. Apni ki eta chan?")
+    else:  # bengali
+        if callback_available:
+            return ("আমি বুঝতে পারছি আপনি নিজে একজন ডাক্তারের সাথে কথা বলতে চান। "
+                     "আমি এই কলে সরাসরি আপনাকে কোনো ডাক্তারের সাথে সংযুক্ত করতে "
+                     "পারব না, এবং আমি এটাও প্রতিশ্রুতি দিতে পারব না যে নির্দিষ্ট "
+                     "কোনো ডাক্তার আপনাকে ফিরে কল করবেন। আমি যা করতে পারি তা হলো "
+                     "-- আপনার জন্য একজন ডাক্তারের সাথে অ্যাপয়েন্টমেন্ট বুক করে "
+                     "দিতে পারি, অথবা আপনার নম্বরটি নোট করে রাখতে পারি যাতে "
+                     "ক্লিনিক থেকে পরে কেউ আপনাকে কল করেন। আপনি কোনটা চান?")
+        return ("আমি বুঝতে পারছি আপনি নিজে একজন ডাক্তারের সাথে কথা বলতে চান। আমি "
+                 "এই কলে সরাসরি আপনাকে কোনো ডাক্তারের সাথে সংযুক্ত করতে পারব না, "
+                 "এবং আমি এটাও প্রতিশ্রুতি দিতে পারব না যে নির্দিষ্ট কোনো ডাক্তার "
+                 "আপনাকে ফিরে কল করবেন। আমি যা করতে পারি তা হলো -- আপনার জন্য "
+                 "একজন ডাক্তারের সাথে অ্যাপয়েন্টমেন্ট বুক করে দিতে পারি। আপনি কি "
+                 "এটা চান?")
+
+
+# =============================================================================
 # ADDED BY SOURAV -- "Caller asks something the agent does not cover" story.
 #
 # Distinct from human_fallback_reply() just above: that one fires for

@@ -166,6 +166,11 @@ from agent.reply_templates import (
     # non-generative acknowledgment -- see this function's own docstring
     # in agent/reply_templates.py for why AC 2/AC 5 rule out anything else.
     complaint_acknowledged_reply,
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. Fixed, non-generative, never names a doctor -- see this
+    # function's own docstring in agent/reply_templates.py for why AC 1/2/
+    # 3/4 rule out anything model-composed here.
+    doctor_personal_request_reply,
 )
 from agent.compare_flow import build_comparison
 # ADDED BY SOURAV -- "The agent accepts a correction and restates" story.
@@ -306,6 +311,12 @@ from agent.human_fast_path import is_immediate_human_request
 # inside _resolve_intent(), AND again at the very top of _continue_pending(),
 # ahead of every in-progress flow's own field parsing.
 from agent.complaint_flow import is_complaint
+# ADDED BY SOURAV -- "Caller wants to speak to a doctor personally" story.
+# Pure, transport-agnostic "is this a personal-contact-with-a-doctor
+# request" detection -- see that module's own docstring for why this is a
+# separate, pre-classifier guard, structured the same way agent/
+# complaint_flow.py and agent/human_fast_path.py already are.
+from agent.doctor_personal_request import is_doctor_personal_request
 # STORY [Answer Quality and Grounding]
 # As a patient, I want to hear the whole sentence, so that I am
 # not left guessing what the agent tried to say.
@@ -1112,6 +1123,34 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
             "direct_reply_bn": None,
         }
 
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. Checked here, after the three guards above, before fast_path/
+    # the semantic cache/Ollama -- same "structurally impossible to
+    # misclassify" reasoning agent/doctor_personal_request.py's module
+    # docstring gives in full: AC 3's "never promises a call from a named
+    # doctor it cannot schedule" is a zero-tolerance policy the model must
+    # never get a turn to violate (including via the "smalltalk" intent's
+    # own unguarded direct_reply_bn -- see agent/clinical_safety.py's
+    # docstring on that exact loophole), so this can never be
+    # misclassified as book_appointment (the wrong route for someone
+    # wanting reassurance now, not a future visit), "unclear", smalltalk,
+    # or human_direct_request. See that module's own docstring for why
+    # this also has to run again inside _continue_pending() for a caller
+    # who asks mid-flow, and for why it deliberately never matches a bare
+    # "doctor" mention (doctor_availability/doctor_schedule/book_appointment
+    # must keep working exactly as before).
+    if is_doctor_personal_request(text):
+        logger.info("[%s] doctor-personal-request guard fired -- no LLM call",
+                    session.call_id)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None}
+        return {
+            "intent": "doctor_personal_request",
+            "slots": slots,
+            "parts": [{"intent": "doctor_personal_request", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
     # Tier 1: decide it locally if we can. For a fixed catalogue the
     # entity is a string-matching problem with a 0.32 confidence margin,
     # where the embedding route had 0.03 -- see agent/fast_path.py. This
@@ -1551,6 +1590,64 @@ async def _finish_complaint(session: CallSession, text: str, language: str = "be
 
     record_complaint_filed(call_id=session.call_id)
     await _speak(session, complaint_acknowledged_reply(language=language))
+
+
+# ADDED BY SOURAV -- "Caller wants to speak to a doctor personally" story.
+# Same shape as _finish_complaint() just above (BOTH call sites -- the
+# guard inside _continue_pending above, and the "doctor_personal_request"
+# branch of _dispatch_turn_inner's dispatch chain below -- call this
+# directly, on the SAME turn the request was made, with no "confirm_*"
+# pending state leading into it and none set afterward).
+#
+# Reuses check_callback_availability()/CALLBACKS_ENABLED/get_clinic_info()
+# EXACTLY as the "request_callback" intent's own fresh-dispatch branch
+# does further below (same already-cached call, same config switch, same
+# pure decision function) -- there is no second callback-availability
+# implementation here, per this story's own "reuse the existing callback
+# availability logic" instruction. The result is passed straight into
+# doctor_personal_request_reply() as a plain bool: that function decides
+# the wording, this function only decides the FACT of whether a callback
+# is offerable right now.
+#
+# Deliberately does NOT call request_callback() or write any
+# CallbackRequest row itself -- this turn only ANSWERS the caller's
+# question about what is possible; the caller's own next ordinary
+# utterance ("please call me back" / "book me an appointment with Dr
+# Sen") is what actually starts the request_callback/book_appointment
+# flow, through those intents' own existing, already-tested dispatch
+# branches. See agent/doctor_personal_request.py's own module docstring
+# for why reusing those whole flows, rather than building a second
+# pending-choice state machine here, is the "reuse it where appropriate"
+# this story asks for.
+async def _finish_doctor_personal_request(session: CallSession, language: str = "bengali"):
+    session.pending = None
+
+    # Same short-circuit as the "request_callback" intent's own
+    # fresh-dispatch branch further below: CALLBACKS_ENABLED is checked
+    # BEFORE ever calling get_clinic_info() -- a deployment with the
+    # feature off entirely has no reason to pay for that round-trip just
+    # to learn something a config constant already answers.
+    # check_callback_availability(None, ..., callbacks_enabled=False)
+    # would reach REASON_DISABLED anyway; skipping straight there avoids
+    # the unnecessary call without duplicating its own decision logic.
+    if not CALLBACKS_ENABLED:
+        await _speak(session, doctor_personal_request_reply(False, language=language))
+        return
+
+    try:
+        hours_result = await _tools.get_clinic_info()
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+
+    hours = hours_result.get("hours") if hours_result.get("found") else None
+    availability = check_callback_availability(
+        hours, datetime.date.today().weekday(),
+        datetime.datetime.now().strftime("%H:%M"), CALLBACKS_ENABLED,
+    )
+    await _speak(session, doctor_personal_request_reply(availability["available"], language=language))
 
 
 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
@@ -2071,6 +2168,27 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                     "(awaiting=%s) -- abandoning it, recording complaint now",
                     session.call_id, pending.get("awaiting"))
         await _finish_complaint(session, text, language=language)
+        return True
+
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. Checked here, immediately after the complaint guard above and
+    # still before `awaiting` is even read -- ahead of every flow-specific
+    # branch below. Without this, a caller mid-booking (or mid-OTP-
+    # verification) who suddenly says "actually I want to speak to a
+    # doctor personally" would have that sentence parsed as an attempted
+    # answer to whatever field was pending, and the booking/report/
+    # callback flow already in progress would keep going as though nothing
+    # had been said -- exactly the "left waiting for something that will
+    # not happen" this story's own user narrative names, just from the
+    # other direction (a flow silently continuing instead of a promise
+    # silently going unfulfilled). Whatever flow was in progress is
+    # abandoned outright, with no attempt to finish, resume, or ask about
+    # it -- same zero-negotiation shape as the complaint guard just above.
+    if is_doctor_personal_request(text):
+        logger.info("[%s] doctor-personal-request interrupted an in-progress "
+                    "flow (awaiting=%s) -- abandoning it, answering now",
+                    session.call_id, pending.get("awaiting"))
+        await _finish_doctor_personal_request(session, language=language)
         return True
 
     awaiting = pending["awaiting"]
@@ -4141,6 +4259,20 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
             await _finish_complaint(session, text, language=language)
             return
 
+        if intent == "doctor_personal_request":
+            # ADDED BY SOURAV -- "Caller wants to speak to a doctor
+            # personally" story. Reached when the guard fires inside
+            # _resolve_intent() above for a FRESH turn (no in-progress
+            # flow) -- the mid-flow case is handled by _continue_pending()'s
+            # own guard instead, which never falls through to here. Same
+            # zero-negotiation shape as "complaint" just above: no
+            # `session.pending` left set afterward -- the caller's own next
+            # ordinary utterance (an appointment request or a callback
+            # request) is handled entirely by those intents' own existing
+            # branches, not by anything special retained here.
+            await _finish_doctor_personal_request(session, language=language)
+            return
+
         try:
             if intent == "test_rate":
                 if not slots.get("test_name"):
@@ -4724,6 +4856,18 @@ _MULTI_INTENT_NEEDS_SEPARATE_FLOW = {
     # an inline "answer" to a complaint, so it must always be routed here
     # rather than fragment-resolved like an ordinary lookup.
     "complaint",
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. Same reasoning as complaint just above -- listed explicitly
+    # even though agent/doctor_personal_request.py's own whole-utterance
+    # guard in _resolve_intent() means this phrasing never actually
+    # reaches the multi-intent LLM path at all. Defense-in-depth for the
+    # case the guard's phrase/regex coverage misses but the classifier
+    # itself still tags one PART of a combined utterance this way: AC 3
+    # rules out ever composing an inline "answer" that might name a
+    # doctor or promise a callback, so it must always be routed to the
+    # fixed template rather than fragment-resolved like an ordinary
+    # lookup.
+    "doctor_personal_request",
 }
 _MULTI_INTENT_NO_FRAGMENT = {"smalltalk", "unclear"}
 

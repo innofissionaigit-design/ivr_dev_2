@@ -171,6 +171,22 @@ from agent.reply_templates import (
     # function for both booking and callback corrections -- see its own
     # docstring in agent/reply_templates.py.
     correction_acknowledged_reply,
+    # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+    # Difficult, Sensitive and Edge Cases). Two graduated re-engagement
+    # prompts plus the completion-aware graceful close -- see each
+    # function's own docstring in agent/reply_templates.py, and
+    # agent/silence_flow.py's module docstring for the stage machine in
+    # _turn_poll_loop below that picks between them.
+    silence_prompt_one, silence_prompt_two, silence_close_reply,
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Fixed,
+    # non-generative acknowledgment -- see this function's own docstring
+    # in agent/reply_templates.py for why AC 2/AC 5 rule out anything else.
+    complaint_acknowledged_reply,
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. Fixed, non-generative, never names a doctor -- see this
+    # function's own docstring in agent/reply_templates.py for why AC 1/2/
+    # 3/4 rule out anything model-composed here.
+    doctor_personal_request_reply,
 )
 from agent.compare_flow import build_comparison
 # ADDED BY SOURAV -- "The agent accepts a correction and restates" story.
@@ -178,6 +194,13 @@ from agent.compare_flow import build_comparison
 # see this module's own docstring for why it lives here rather than
 # duplicated inline in both main.py and main_pcm.py.
 from agent.correction_flow import detect_booking_correction, detect_callback_correction
+# ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+# Difficult, Sensitive and Edge Cases). Pure, transport-agnostic "what is
+# the next silence action / has anything been left unfinished" logic --
+# same drift reason as detect_booking_correction() above: kept here once
+# so _turn_poll_loop's independently-maintained copy in main.py and
+# main_pcm.py cannot disagree about it. See this module's own docstring.
+from agent import silence_flow
 # ADDED BY SOURAV -- "Caller asks a follow-up that depends on the previous
 # answer" story. Cross-turn entity memory (pronoun/elliptical follow-up
 # resolution) -- see agent/state.py's own module docstring for the full
@@ -253,6 +276,16 @@ from agent.outcomes import (
     record_turn_attempt,
     record_immediate_human_handoff,
     immediate_human_escalation_rate,
+    # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+    # Difficult, Sensitive and Edge Cases). Same ESCALATION_LOG_PATH ledger
+    # and _lock as record_human_handoff() above, own "call_abandoned" event
+    # name -- see its own docstring in agent/outcomes.py.
+    record_call_abandoned,
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Own
+    # "complaint" intent/reason pair in the same shared ledger -- see its
+    # own docstring in agent/outcomes.py for why it never logs the
+    # complaint text itself.
+    record_complaint_filed,
 )
 # ADDED BY SOURAV -- "Caller asks to be called back" story. Pure
 # availability-check/context-building logic -- see that module's own
@@ -287,6 +320,19 @@ from agent.clinical_safety import is_clinical_interpretation
 # _resolve_intent(), AND again at the very top of _continue_pending(),
 # ahead of every in-progress flow's own field parsing.
 from agent.human_fast_path import is_immediate_human_request
+# ADDED BY SOURAV -- "Caller wants to make a complaint" story. Deterministic,
+# pre-LLM, pre-fast-path phrase matcher, structured directly on
+# agent/human_fast_path.py's own guard just above -- see this module's own
+# docstring for why it must run BEFORE _fast_path and BEFORE extract_intent
+# inside _resolve_intent(), AND again at the very top of _continue_pending(),
+# ahead of every in-progress flow's own field parsing.
+from agent.complaint_flow import is_complaint
+# ADDED BY SOURAV -- "Caller wants to speak to a doctor personally" story.
+# Pure, transport-agnostic "is this a personal-contact-with-a-doctor
+# request" detection -- see that module's own docstring for why this is a
+# separate, pre-classifier guard, structured the same way agent/
+# complaint_flow.py and agent/human_fast_path.py already are.
+from agent.doctor_personal_request import is_doctor_personal_request
 # STORY [Answer Quality and Grounding]
 # As a patient, I want to hear the whole sentence, so that I am
 # not left guessing what the agent tried to say.
@@ -691,6 +737,20 @@ class CallSession:
         # own module docstring for the full design.
         self.state = DialogueState()
 
+        # ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation
+        # -- Difficult, Sensitive and Edge Cases). Per-call, never global or
+        # shared between sessions (a process-wide counter would leak one
+        # caller's silence into another caller's call): how many graduated
+        # silence prompts the CURRENT silence episode has already used
+        # (agent/silence_flow.STAGE_NORMAL/STAGE_PROMPT_1_SENT/
+        # STAGE_PROMPT_2_SENT), and the exact text of whichever one was
+        # spoken most recently, so a later abandonment log entry can record
+        # the preceding prompt without re-rendering or re-guessing it. Both
+        # are read and written only by _turn_poll_loop -- see that
+        # function's own comment on the IDLE_TIMEOUT_S branch below.
+        self.silence_stage = silence_flow.STAGE_NORMAL
+        self.last_silence_prompt: str | None = None
+
     def hold_gate_for(self, audio_duration_s: float):
         """Called before each reply goes out. Extends rather than replaces
         the deadline: replies queue on the client, so a second clip starts
@@ -1048,6 +1108,55 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
             "intent": "clinical_interpretation",
             "slots": slots,
             "parts": [{"intent": "clinical_interpretation", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Checked
+    # here, after the two guards above, before fast_path/the semantic
+    # cache/Ollama -- same "structurally impossible to misclassify" reasoning
+    # agent/complaint_flow.py's module docstring gives in full: AC 5's "does
+    # NOT attempt to resolve, explain, defend, justify, or argue" is a
+    # zero-tolerance policy the model must never get a turn to violate, so a
+    # complaint can never be misclassified as smalltalk, out_of_scope, or
+    # anything an LLM retry under phrasing pressure might produce. See that
+    # module's own docstring for why this also has to run again inside
+    # _continue_pending() for a caller who complains mid-flow.
+    if is_complaint(text):
+        logger.info("[%s] complaint guard fired -- no LLM call", session.call_id)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None}
+        return {
+            "intent": "complaint",
+            "slots": slots,
+            "parts": [{"intent": "complaint", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. Checked here, after the three guards above, before fast_path/
+    # the semantic cache/Ollama -- same "structurally impossible to
+    # misclassify" reasoning agent/doctor_personal_request.py's module
+    # docstring gives in full: AC 3's "never promises a call from a named
+    # doctor it cannot schedule" is a zero-tolerance policy the model must
+    # never get a turn to violate (including via the "smalltalk" intent's
+    # own unguarded direct_reply_bn -- see agent/clinical_safety.py's
+    # docstring on that exact loophole), so this can never be
+    # misclassified as book_appointment (the wrong route for someone
+    # wanting reassurance now, not a future visit), "unclear", smalltalk,
+    # or human_direct_request. See that module's own docstring for why
+    # this also has to run again inside _continue_pending() for a caller
+    # who asks mid-flow, and for why it deliberately never matches a bare
+    # "doctor" mention (doctor_availability/doctor_schedule/book_appointment
+    # must keep working exactly as before).
+    if is_doctor_personal_request(text):
+        logger.info("[%s] doctor-personal-request guard fired -- no LLM call",
+                    session.call_id)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None}
+        return {
+            "intent": "doctor_personal_request",
+            "slots": slots,
+            "parts": [{"intent": "doctor_personal_request", "slots": slots}],
             "direct_reply_bn": None,
         }
 
@@ -1446,6 +1555,108 @@ async def _finish_callback(session: CallSession, slots: dict, language: str = "b
             return
 
     await _speak(session, callback_scheduled_reply(slots, result, language=language))
+
+
+# ADDED BY SOURAV -- "Caller wants to make a complaint" story. Same shape as
+# _finish_callback() just above (place the write, catch ToolCallError for
+# the infra-apology path) but with no "confirm_*" pending state leading
+# into it: BOTH call sites (the complaint guard inside _continue_pending
+# below, and the "complaint" branch of _dispatch_turn_inner's dispatch
+# chain) call this directly, on the SAME turn the complaint was said --
+# AC 2/AC 5's zero-negotiation contract leaves nothing to confirm first,
+# the same reasoning human_direct_request's own branch already follows.
+#
+# `session.pending` is cleared unconditionally on entry, same as the
+# immediate-human-request guard just above in _continue_pending -- a
+# complaint said mid-flow abandons that flow outright, with no attempt to
+# finish, resume, or ask about it.
+#
+# `text` is passed through to agent/tools_client.py's submit_complaint()
+# EXACTLY as received -- never trimmed, translated, or summarised -- so
+# clinic-api's ComplaintRecord.complaint_text ends up holding precisely
+# what AC 3 asks for ("captured verbatim"). No confirmation field is ever
+# read back to the caller (complaint_acknowledged_reply() names no
+# complaint_id or status), so there is no missing_*_write_fields() check
+# here the way _finish_callback()/_finish_booking() need one -- the only
+# thing that can go wrong is the write itself failing, which the
+# ToolCallError branch below already covers honestly.
+async def _finish_complaint(session: CallSession, text: str, language: str = "bengali"):
+    session.pending = None
+    try:
+        result = await _tools.submit_complaint(text)
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+
+    if not result.get("success"):
+        logger.error("[%s] complaint submission reported failure -- withholding acknowledgment",
+                     session.call_id)
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+
+    record_complaint_filed(call_id=session.call_id)
+    await _speak(session, complaint_acknowledged_reply(language=language))
+
+
+# ADDED BY SOURAV -- "Caller wants to speak to a doctor personally" story.
+# Same shape as _finish_complaint() just above (BOTH call sites -- the
+# guard inside _continue_pending above, and the "doctor_personal_request"
+# branch of _dispatch_turn_inner's dispatch chain below -- call this
+# directly, on the SAME turn the request was made, with no "confirm_*"
+# pending state leading into it and none set afterward).
+#
+# Reuses check_callback_availability()/CALLBACKS_ENABLED/get_clinic_info()
+# EXACTLY as the "request_callback" intent's own fresh-dispatch branch
+# does further below (same already-cached call, same config switch, same
+# pure decision function) -- there is no second callback-availability
+# implementation here, per this story's own "reuse the existing callback
+# availability logic" instruction. The result is passed straight into
+# doctor_personal_request_reply() as a plain bool: that function decides
+# the wording, this function only decides the FACT of whether a callback
+# is offerable right now.
+#
+# Deliberately does NOT call request_callback() or write any
+# CallbackRequest row itself -- this turn only ANSWERS the caller's
+# question about what is possible; the caller's own next ordinary
+# utterance ("please call me back" / "book me an appointment with Dr
+# Sen") is what actually starts the request_callback/book_appointment
+# flow, through those intents' own existing, already-tested dispatch
+# branches. See agent/doctor_personal_request.py's own module docstring
+# for why reusing those whole flows, rather than building a second
+# pending-choice state machine here, is the "reuse it where appropriate"
+# this story asks for.
+async def _finish_doctor_personal_request(session: CallSession, language: str = "bengali"):
+    session.pending = None
+
+    # Same short-circuit as the "request_callback" intent's own
+    # fresh-dispatch branch further below: CALLBACKS_ENABLED is checked
+    # BEFORE ever calling get_clinic_info() -- a deployment with the
+    # feature off entirely has no reason to pay for that round-trip just
+    # to learn something a config constant already answers.
+    # check_callback_availability(None, ..., callbacks_enabled=False)
+    # would reach REASON_DISABLED anyway; skipping straight there avoids
+    # the unnecessary call without duplicating its own decision logic.
+    if not CALLBACKS_ENABLED:
+        await _speak(session, doctor_personal_request_reply(False, language=language))
+        return
+
+    try:
+        hours_result = await _tools.get_clinic_info()
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        await _speak(session, "এই মুহূর্তে দেখতে পারছি না। কাউন্টারে যোগাযোগ করুন, দয়া করে।",
+                     fallback_reason="tool_failure")
+        return
+
+    hours = hours_result.get("hours") if hours_result.get("found") else None
+    availability = check_callback_availability(
+        hours, datetime.date.today().weekday(),
+        datetime.datetime.now().strftime("%H:%M"), CALLBACKS_ENABLED,
+    )
+    await _speak(session, doctor_personal_request_reply(availability["available"], language=language))
 
 
 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
@@ -1947,6 +2158,46 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         session.pending = None
         record_immediate_human_handoff(call_id=session.call_id)
         await _speak(session, human_fallback_reply(language=language))
+        return True
+
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Checked
+    # here, immediately after the immediate-human-request guard above and
+    # still before `awaiting` is even read -- ahead of every flow-specific
+    # branch below. Without this, a caller mid-booking (or mid-OTP-
+    # verification, or being asked to confirm what was heard) who suddenly
+    # says "actually I want to file a complaint about..." would have that
+    # sentence parsed as an attempted answer to whatever field was pending,
+    # silently swallowing the complaint into the wrong flow -- see
+    # agent/complaint_flow.py's own module docstring for the full
+    # reasoning. Whatever flow was in progress is abandoned outright, with
+    # no attempt to finish, resume, or ask about it -- AC 5 leaves nothing
+    # to do but record this complaint on this turn.
+    if is_complaint(text):
+        logger.info("[%s] complaint interrupted an in-progress flow "
+                    "(awaiting=%s) -- abandoning it, recording complaint now",
+                    session.call_id, pending.get("awaiting"))
+        await _finish_complaint(session, text, language=language)
+        return True
+
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. Checked here, immediately after the complaint guard above and
+    # still before `awaiting` is even read -- ahead of every flow-specific
+    # branch below. Without this, a caller mid-booking (or mid-OTP-
+    # verification) who suddenly says "actually I want to speak to a
+    # doctor personally" would have that sentence parsed as an attempted
+    # answer to whatever field was pending, and the booking/report/
+    # callback flow already in progress would keep going as though nothing
+    # had been said -- exactly the "left waiting for something that will
+    # not happen" this story's own user narrative names, just from the
+    # other direction (a flow silently continuing instead of a promise
+    # silently going unfulfilled). Whatever flow was in progress is
+    # abandoned outright, with no attempt to finish, resume, or ask about
+    # it -- same zero-negotiation shape as the complaint guard just above.
+    if is_doctor_personal_request(text):
+        logger.info("[%s] doctor-personal-request interrupted an in-progress "
+                    "flow (awaiting=%s) -- abandoning it, answering now",
+                    session.call_id, pending.get("awaiting"))
+        await _finish_doctor_personal_request(session, language=language)
         return True
 
     awaiting = pending["awaiting"]
@@ -4001,6 +4252,36 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
             await _speak(session, human_fallback_reply(language=language))
             return
 
+        if intent == "complaint":
+            # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+            # Reached when the guard fires inside _resolve_intent() above
+            # for a FRESH turn (no in-progress flow) -- the mid-flow case
+            # is handled by _continue_pending()'s own guard instead, which
+            # never falls through to here. Same zero-negotiation shape as
+            # "human_direct_request" just above: no offer, no choice, no
+            # `session.pending` left set afterward. `text` here is this
+            # turn's own ASR transcript (set at the top of this function,
+            # still in scope) -- passed straight through to
+            # _finish_complaint() so the stored complaint is exactly what
+            # the caller said, never a field extracted or rewritten by the
+            # classifier.
+            await _finish_complaint(session, text, language=language)
+            return
+
+        if intent == "doctor_personal_request":
+            # ADDED BY SOURAV -- "Caller wants to speak to a doctor
+            # personally" story. Reached when the guard fires inside
+            # _resolve_intent() above for a FRESH turn (no in-progress
+            # flow) -- the mid-flow case is handled by _continue_pending()'s
+            # own guard instead, which never falls through to here. Same
+            # zero-negotiation shape as "complaint" just above: no
+            # `session.pending` left set afterward -- the caller's own next
+            # ordinary utterance (an appointment request or a callback
+            # request) is handled entirely by those intents' own existing
+            # branches, not by anything special retained here.
+            await _finish_doctor_personal_request(session, language=language)
+            return
+
         try:
             if intent == "test_rate":
                 if not slots.get("test_name"):
@@ -4572,6 +4853,30 @@ _MULTI_INTENT_NEEDS_SEPARATE_FLOW = {
     # in _resolve_intent() means a solo "give me a human" turn never
     # actually reaches the multi-intent LLM path at all.
     "human_direct_request",
+    # ADDED BY SOURAV -- "Caller wants to make a complaint" story. Same
+    # reasoning as human_direct_request just above -- listed explicitly
+    # even though agent/complaint_flow.py's own whole-utterance guard in
+    # _resolve_intent() means a complaint phrased in this module's own
+    # phrase set never actually reaches the multi-intent LLM path at all.
+    # Defense-in-depth for the case the guard's literal phrase list misses
+    # but the classifier itself still tags one PART of a combined
+    # utterance as "complaint" (e.g. "book me an appointment and also I
+    # want to raise a complaint about..."): AC 5 rules out ever composing
+    # an inline "answer" to a complaint, so it must always be routed here
+    # rather than fragment-resolved like an ordinary lookup.
+    "complaint",
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. Same reasoning as complaint just above -- listed explicitly
+    # even though agent/doctor_personal_request.py's own whole-utterance
+    # guard in _resolve_intent() means this phrasing never actually
+    # reaches the multi-intent LLM path at all. Defense-in-depth for the
+    # case the guard's phrase/regex coverage misses but the classifier
+    # itself still tags one PART of a combined utterance this way: AC 3
+    # rules out ever composing an inline "answer" that might name a
+    # doctor or promise a callback, so it must always be routed to the
+    # fixed template rather than fragment-resolved like an ordinary
+    # lookup.
+    "doctor_personal_request",
 }
 _MULTI_INTENT_NO_FRAGMENT = {"smalltalk", "unclear"}
 
@@ -4866,13 +5171,72 @@ async def _turn_poll_loop(session: CallSession):
     On yes: slice that utterance out for ASR, hand it to _dispatch_turn as
     a background task (so ingestion of the NEXT turn's audio is never
     blocked by this turn's ASR/LLM/TTS work), and advance the marker.
+
+    ADDED BY SOURAV -- "Caller goes silent" story (Epic: Conversation --
+    Difficult, Sensitive and Edge Cases). The IDLE_TIMEOUT_S branch just
+    below used to close the call outright on the first silence, with no
+    warning (this story's own Repo Evidence: "closes after 90 s with a
+    single message and no counting"). It now runs two graduated
+    re-engagement prompts first -- see agent/silence_flow.py's module
+    docstring for the exact stage machine and why it lives in its own
+    pure module rather than inline here a second time (once for main.py,
+    once again for main_pcm.py).
     """
     while True:
         await asyncio.sleep(POLL_INTERVAL_S)
 
         if time.time() - session.last_activity > IDLE_TIMEOUT_S:
-            logger.info("[%s] idle timeout, closing", session.call_id)
-            await _speak(session, "লাইনে কোনো সাড়া পাচ্ছি না, কল শেষ করছি। ধন্যবাদ।")
+            # Two graduated prompts, then a completion-aware close -- see
+            # this function's own docstring above and
+            # agent/silence_flow.next_silence_action()'s docstring for the
+            # stage machine. session.last_activity is reset to time.time()
+            # after each prompt is spoken (never after the abandon branch,
+            # which ends the call) so every stage gets its own FULL
+            # IDLE_TIMEOUT_S window -- the timeout's value and how it is
+            # measured are otherwise unchanged.
+            action = silence_flow.next_silence_action(session.silence_stage)
+
+            if action == silence_flow.ACTION_PROMPT_1:
+                logger.info("[%s] silence: sending prompt 1", session.call_id)
+                session.last_silence_prompt = silence_prompt_one()
+                await _speak(session, session.last_silence_prompt)
+                session.silence_stage = silence_flow.STAGE_PROMPT_1_SENT
+                session.last_activity = time.time()
+                continue
+
+            if action == silence_flow.ACTION_PROMPT_2:
+                logger.info("[%s] silence: sending prompt 2", session.call_id)
+                session.last_silence_prompt = silence_prompt_two()
+                await _speak(session, session.last_silence_prompt)
+                session.silence_stage = silence_flow.STAGE_PROMPT_2_SENT
+                session.last_activity = time.time()
+                continue
+
+            # ACTION_ABANDON: silent through both prompts. Say plainly what
+            # was and was not completed (never inventing a completed
+            # action the caller only started -- see
+            # silence_flow.has_unfinished_business()'s own docstring for
+            # exactly which session state this is allowed to read), log
+            # the abandonment exactly once, then close. This `return` is
+            # the only exit from this branch, so _turn_poll_loop never
+            # ticks again for this call afterward -- there is no path that
+            # could log a second call_abandoned event for the same call.
+            #
+            # ADDED BY SOURAV -- bugfix (validation report Bug #2):
+            # next_close_state() replaces a bare has_unfinished_business()
+            # call here so a caller who never said a word (utt_seq == 0)
+            # is not told "everything you asked has been taken care of" --
+            # see that function's own docstring for the three-way split.
+            logger.info("[%s] silence: abandoning after both prompts", session.call_id)
+            close_state = silence_flow.next_close_state(
+                session.utt_seq, session.pending, session.deferred,
+            )
+            await _speak(session, silence_close_reply(close_state))
+            record_call_abandoned(
+                turn_index=session.utt_seq,
+                preceding_prompt=session.last_silence_prompt,
+                call_id=session.call_id,
+            )
             with contextlib.suppress(Exception):
                 await session.ws.close()
             return
@@ -4902,6 +5266,18 @@ async def _turn_poll_loop(session: CallSession):
         result = await asyncio.to_thread(_turn_detector.poll, tail, sr)
         if result.utterance_end_s is None:
             continue
+
+        # ADDED BY SOURAV -- "Caller goes silent" story. A confirmed
+        # utterance end here is the turn detector (VAD) reporting actual
+        # caller speech, not merely audio bytes arriving (CallSession.
+        # append() already bumps last_activity on every raw chunk
+        # regardless of content) and not the background noise/silence the
+        # turn detector already filters out before ever returning an
+        # utterance_end_s at all. This is therefore the correct point --
+        # and the only point in this loop -- to end a silence episode:
+        # whichever graduated prompt was most recently sent, the caller
+        # has now actually answered it.
+        session.silence_stage = silence_flow.STAGE_NORMAL
 
         absolute_end_s = session.processed_until_s + result.utterance_end_s
         session.utt_seq += 1

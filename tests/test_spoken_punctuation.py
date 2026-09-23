@@ -77,6 +77,9 @@ from agent.reply_templates import (  # noqa: E402
     silence_prompt_one, silence_prompt_two, silence_close_reply,
     # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
     complaint_acknowledged_reply,
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story.
+    doctor_personal_request_reply,
 )
 # ADDED BY SOURAV -- bugfix for the "Caller goes silent" story's close
 # message (validation report Bug #2): silence_close_reply() now branches
@@ -495,6 +498,17 @@ def _replies():
     for language in ("bengali", "english", "hinglish", "banglish"):
         yield f"complaint/acknowledged-{language}", complaint_acknowledged_reply(language)
 
+    # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+    # story. doctor_personal_request_reply() takes no caller-supplied
+    # value either (never a doctor's name -- see that function's own
+    # docstring), but it DOES branch on `callback_available`, so both
+    # branches get a case per language, not just one.
+    for language in ("bengali", "english", "hinglish", "banglish"):
+        yield (f"doctor-personal-request/available-{language}",
+               doctor_personal_request_reply(True, language))
+        yield (f"doctor-personal-request/unavailable-{language}",
+               doctor_personal_request_reply(False, language))
+
 
 CASES = list(_replies())
 
@@ -552,6 +566,9 @@ def test_the_gate_covers_every_public_reply_function():
         "silence_prompt_one", "silence_prompt_two", "silence_close_reply",
         # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
         "complaint_acknowledged_reply",
+        # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
+        # story. See the two yields per language above.
+        "doctor_personal_request_reply",
     }
     assert public <= exercised, (
         f"reply function(s) {sorted(public - exercised)} have no case in this gate"
