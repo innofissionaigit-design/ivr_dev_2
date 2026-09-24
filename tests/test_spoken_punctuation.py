@@ -83,6 +83,9 @@ from agent.reply_templates import (  # noqa: E402
     # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
     # story.
     doctor_personal_request_reply,
+    # ADDED BY SOURAV -- "Caller describes symptoms and asks what is
+    # wrong" story.
+    symptom_routing_reply,
 )
 # ADDED BY SOURAV -- bugfix for the "Caller goes silent" story's close
 # message (validation report Bug #2): silence_close_reply() now branches
@@ -146,6 +149,15 @@ def _replies():
              "date": None, "doctors": []})
     yield "dept/not-found", doctors_by_department_reply(
         {"department": "নিউরো"}, {"found": False, "query": "নিউরো"})
+
+    # ADDED BY SOURAV -- "Caller describes symptoms and asks what is
+    # wrong" story.
+    yield "symptom-route/found", symptom_routing_reply(
+        {"department": "Cardiology"}, dict(dept, doctors=[one, two]))
+    yield "symptom-route/no-doctors", symptom_routing_reply(
+        {"department": "Cardiology"}, dict(dept, doctors=[]))
+    yield "symptom-route/not-offered", symptom_routing_reply(
+        {"department": "Neurology"}, {"found": False, "query": "Neurology"})
 
     yield "booking/success", booking_reply(
         {"doctor_name": "সেন"},
@@ -578,6 +590,9 @@ def test_the_gate_covers_every_public_reply_function():
         # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
         # story. See the two yields per language above.
         "doctor_personal_request_reply",
+        # ADDED BY SOURAV -- "Caller describes symptoms and asks what is
+        # wrong" story. See the three yields above.
+        "symptom_routing_reply",
     }
     assert public <= exercised, (
         f"reply function(s) {sorted(public - exercised)} have no case in this gate"

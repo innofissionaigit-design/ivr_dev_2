@@ -1653,6 +1653,124 @@ def doctors_by_department_reply(slots: dict, result: dict, language: str = "beng
 
 
 # =============================================================================
+# ADDED BY SOURAV -- "Caller describes symptoms and asks what is wrong"
+# story.
+#
+# story title: Caller describes symptoms and asks what is wrong
+# user story: As a caller, I want to be routed to the right department
+#     without being diagnosed, so that the agent stays inside what a
+#     phone line can safely promise.
+# acceptance criteria: The reply names a department (never a diagnosis),
+#     explicitly frames itself as administrative routing rather than
+#     medical advice, and never uses diagnostic language ("you have...",
+#     "this sounds like...", "you are suffering from...").
+#
+# Deliberately its OWN function, not doctors_by_department_reply() just
+# above reused verbatim: that reply is a plain factual doctor listing with
+# no "this is not medical advice" framing, because it has never needed one
+# before -- a caller who names a department themselves already knows they
+# chose it. Here the SYSTEM inferred the department from a symptom
+# (agent/symptom_routing.py), so the caller has to be told plainly that
+# this is routing, never a clinical judgement -- the same "different kind
+# of moment, does not share a script" reasoning clinical_interpretation_
+# reply()'s own docstring gives for not reusing out_of_scope_reply()'s
+# wording.
+#
+# The not-offered branch below is also deliberately its own wording, not
+# doctors_by_department_reply()'s "we don't have a department named X":
+# the caller never said a department name for that sentence to quote back
+# -- the system inferred one from the symptom map and it turned out not to
+# be one clinic-api's catalogue currently has (see
+# agent/symptom_routing.py's SYMPTOM_DEPARTMENT_MAP docstring for exactly
+# which three prototype entries this applies to today). An honest "please
+# contact the front desk" is spoken instead of a fabricated department
+# name or a confusing "we don't have a department named Neurology" when
+# the caller never said "Neurology" themselves.
+# =============================================================================
+def symptom_routing_reply(slots: dict, result: dict, language: str = "bengali") -> str:
+    if result.get("found") and result.get("doctors"):
+        department = _spoken_department(slots, result)
+        doctor_names = []
+        for doc in result["doctors"]:
+            name_bn = doc.get("doctor_name_bn")
+            if language == "english":
+                doctor_names.append(doc.get("name", "Doctor"))
+            elif language in ("hinglish", "banglish"):
+                doctor_names.append(f"Dr. {name_bn}" if name_bn else doc.get("name", "Doctor"))
+            else:  # bengali
+                doctor_names.append(f"ডাঃ {name_bn}" if name_bn else doc.get("name", "ডাক্তার"))
+
+        if language == "english":
+            if len(doctor_names) == 1:
+                names = doctor_names[0]
+            else:
+                names = ", ".join(doctor_names[:-1]) + " and " + doctor_names[-1]
+            return (f"Based on what you described, our {department} department handles this "
+                     f"kind of concern -- {names} are there. This is just routing information, "
+                     f"not a diagnosis -- please describe your symptoms to the doctor directly.")
+        elif language == "hinglish":
+            names = " aur ".join(doctor_names) if len(doctor_names) <= 2 else (
+                ", ".join(doctor_names[:-1]) + " aur " + doctor_names[-1])
+            return (f"Aapne jo bataya uske hisaab se, hamara {department} department isme "
+                     f"madad karta hai -- {names} wahan hain. Yeh sirf routing information hai, "
+                     f"diagnosis nahi -- apne symptoms doctor ko seedhe bataiye.")
+        elif language == "banglish":
+            names = " ar ".join(doctor_names) if len(doctor_names) <= 2 else (
+                ", ".join(doctor_names[:-1]) + " ar " + doctor_names[-1])
+            return (f"Apni ja bollen tar upor base kore, amader {department} department eta "
+                     f"dekhe -- {names} okhane achen. Eta sudhu routing information, kono "
+                     f"diagnosis na -- nijer symptoms doctor ke shorashori bolben.")
+        else:  # bengali
+            names = " ও ".join(doctor_names) if len(doctor_names) <= 2 else (
+                ", ".join(doctor_names[:-1]) + " ও " + doctor_names[-1])
+            return (f"আপনি যা বললেন তার ভিত্তিতে, আমাদের {department} বিভাগ এই বিষয়টা দেখে -- "
+                     f"{names} সেখানে আছেন। এটা শুধু রাউটিং তথ্য, কোনো ডায়াগনসিস না -- নিজের "
+                     f"সমস্যাটা ডাক্তারকে সরাসরি বলবেন।")
+
+    if result.get("found"):
+        department = _spoken_department(slots, result)
+        if language == "english":
+            return (f"Based on what you described, our {department} department usually handles "
+                     f"this, but I don't see any doctors listed there right now. Please contact "
+                     f"our front desk -- this is just routing information, not a diagnosis.")
+        elif language == "hinglish":
+            return (f"Aapne jo bataya uske hisaab se, {department} department isme madad karta "
+                     f"hai, lekin abhi wahan koi doctor listed nahi hai. Front desk se baat "
+                     f"kariye -- yeh sirf routing information hai, diagnosis nahi.")
+        elif language == "banglish":
+            return (f"Apni ja bollen tar upor base kore, {department} department ei bishoy ta "
+                     f"dekhe, kintu ekhon okhane kono doctor nei. Front desk e jogajog korun -- "
+                     f"eta sudhu routing information, diagnosis na.")
+        else:  # bengali
+            return (f"আপনি যা বললেন তার ভিত্তিতে, {department} বিভাগ সাধারণত এটা দেখে, কিন্তু "
+                     f"এখন সেখানে কোনো ডাক্তার নেই। দয়া করে কাউন্টারে যোগাযোগ করুন -- এটা শুধু "
+                     f"রাউটিং তথ্য, কোনো ডায়াগনসিস না।")
+
+    # Not found / ambiguous -- the mapped department is not one this
+    # clinic's seeded catalogue currently has (see this function's own
+    # docstring above). Deliberately does not name the inferred
+    # department at all -- the caller never said it, and speaking a
+    # department name they don't recognise, framed as a fact, would be
+    # confusing rather than helpful.
+    if language == "english":
+        return ("Based on what you described, I'm not able to route this to a specific "
+                 "department automatically. Please contact our front desk and they'll direct "
+                 "you to the right person -- this is just routing information, not a diagnosis.")
+    elif language == "hinglish":
+        return ("Aapne jo bataya uske hisaab se, main ise automatically kisi department mein "
+                 "route nahi kar pa raha. Front desk se baat kariye, wo aapko sahi jagah "
+                 "bhejenge -- yeh sirf routing information hai, diagnosis nahi.")
+    elif language == "banglish":
+        return ("Apni ja bollen tar upor base kore, ami eta automatically kono department e "
+                 "route korte parchi na. Front desk e jogajog korun, tara apnake thik jayga te "
+                 "pathiye debe -- eta sudhu routing information, diagnosis na.")
+    else:  # bengali
+        return ("আপনি যা বললেন তার ভিত্তিতে, আমি এটা স্বয়ংক্রিয়ভাবে কোনো নির্দিষ্ট বিভাগে "
+                 "পাঠাতে পারছি না। দয়া করে কাউন্টারে যোগাযোগ করুন, তারা আপনাকে সঠিক জায়গায় "
+                 "পাঠিয়ে দেবেন -- এটা শুধু রাউটিং তথ্য, কোনো ডায়াগনসিস না।")
+
+
+# =============================================================================
 # ADDED BY SOURAV -- "Lab Report Status & Secure Delivery" combined story
 # (previously two separate stories: "is my report ready" and "send my
 # report"). Every function below composes the reply exactly the same way

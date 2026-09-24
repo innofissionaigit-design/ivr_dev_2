@@ -133,6 +133,13 @@ from agent.reply_templates import (
     # functions, and agent/clinical_safety.py's module docstring, for why
     # this reply is never model-composed.
     clinical_interpretation_reply, clinical_interpretation_decline_reply,
+    # ADDED BY SOURAV -- "Caller describes symptoms and asks what is wrong"
+    # story. Deliberately its own function, never reusing
+    # doctors_by_department_reply()'s or clinical_interpretation_reply()'s
+    # wording -- see its own docstring in agent/reply_templates.py for why:
+    # this is the one reply in this codebase that both names a department
+    # AND has to say out loud that doing so is not a diagnosis.
+    symptom_routing_reply,
     # ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
     # These three back _resolve_combinable_intent_fragment()'s three
     # non-fabricating fallback fragments below -- every OTHER fragment in
@@ -333,6 +340,20 @@ from agent.complaint_flow import is_complaint
 # separate, pre-classifier guard, structured the same way agent/
 # complaint_flow.py and agent/human_fast_path.py already are.
 from agent.doctor_personal_request import is_doctor_personal_request
+# ADDED BY SOURAV -- "Caller describes symptoms and asks what is wrong"
+# story. Deterministic, pre-LLM, pre-fast-path vocabulary matcher --
+# structured the same way agent/clinical_safety.py, agent/human_fast_path.py,
+# agent/complaint_flow.py and agent/doctor_personal_request.py already are,
+# and checked in the same tier as those, AFTER all of them (see this
+# module's own docstring for why: a caller who both describes a symptom
+# and asks for a diagnosis/danger judgement must still be caught by
+# agent/clinical_safety.py's is_clinical_interpretation() above, never by
+# this). Which department a symptom maps to is a fixed, code-owned
+# vocabulary decision here -- never something extract_intent() (the LLM)
+# is asked to invent -- see agent/symptom_routing.py's own module
+# docstring for the full reasoning, including why only a SINGLE,
+# unambiguous department match is ever acted on.
+from agent.symptom_routing import resolve_symptom_department, COMMIT as _SYMPTOM_ROUTE_COMMIT
 # STORY [Answer Quality and Grounding]
 # As a patient, I want to hear the whole sentence, so that I am
 # not left guessing what the agent tried to say.
@@ -1167,6 +1188,37 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
             "direct_reply_bn": None,
         }
 
+    # ADDED BY SOURAV -- "Caller describes symptoms and asks what is wrong"
+    # story. Checked here, after every existing zero-negotiation safety/
+    # escalation guard above (immediate-human, clinical-interpretation,
+    # complaint, doctor-personal-request) and still before fast_path/the
+    # semantic cache/Ollama -- same "structurally impossible to
+    # misclassify by the model" reasoning those guards give: which
+    # department a symptom maps to must be a code/data decision, never
+    # something the model infers or composes. Deliberately placed AFTER
+    # is_clinical_interpretation() rather than before or instead of it: a
+    # caller who names a symptom AND asks for a diagnosis/danger judgement
+    # must still be caught by that guard first -- see
+    # agent/symptom_routing.py's own module docstring for the full
+    # reasoning, and for why only a SINGLE, unambiguous department match
+    # (and no accompanying diagnosis-request wording) is ever acted on
+    # here; anything else is deliberately left unintercepted -- it falls
+    # through to the ordinary classifier chain below -- rather than
+    # guessed.
+    symptom_verdict, symptom_department = resolve_symptom_department(text)
+    if symptom_verdict == _SYMPTOM_ROUTE_COMMIT:
+        logger.info("[%s] symptom-routing guard fired -> %s -- no LLM call",
+                    session.call_id, symptom_department)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None,
+                  "department": symptom_department}
+        return {
+            "intent": "symptom_department_routing",
+            "slots": slots,
+            "parts": [{"intent": "symptom_department_routing", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
     # Tier 1: decide it locally if we can. For a fixed catalogue the
     # entity is a string-matching problem with a 0.32 confidence margin,
     # where the embedding route had 0.03 -- see agent/fast_path.py. This
@@ -1664,6 +1716,37 @@ async def _finish_doctor_personal_request(session: CallSession, language: str = 
         datetime.datetime.now().strftime("%H:%M"), CALLBACKS_ENABLED,
     )
     await _speak(session, doctor_personal_request_reply(availability["available"], language=language))
+
+
+# ADDED BY SOURAV -- "Caller describes symptoms and asks what is wrong"
+# story. Same shape as _finish_complaint()/_finish_doctor_personal_request()
+# above (both call sites -- the interrupt guard inside _continue_pending,
+# and the "symptom_department_routing" branch of _dispatch_turn_inner's
+# dispatch chain below -- call this directly, on the same turn the
+# department was resolved, with no "confirm_*" pending state leading into
+# it and none set afterward, and no "doctor_choice" follow-up opened
+# either -- unlike the pre-existing "doctors_by_department" intent, this
+# is deliberately a single-turn answer; booking with a listed doctor is a
+# separate request the caller can make next).
+#
+# `department` was already resolved deterministically by
+# agent/symptom_routing.py's fixed vocabulary BEFORE this is ever called --
+# this function never decides which department fits, it only fetches that
+# department's doctors through the exact same lookup the pre-existing
+# "doctors_by_department" intent already uses (clinic-api's own
+# _resolve_department()/match_band.py fuzzy matcher, reached via
+# agent/tools_client.py's get_doctors_by_department()) and speaks a reply
+# that is explicit this is administrative routing, never a diagnosis
+# (agent/reply_templates.py's symptom_routing_reply()).
+async def _finish_symptom_routing(session: CallSession, department: str, language: str = "bengali"):
+    session.pending = None
+    try:
+        result = await _tools.get_doctors_by_department(department)
+    except ToolCallError as e:
+        logger.error("[%s] clinic API call failed: %s", session.call_id, e)
+        await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
+        return
+    await _speak(session, symptom_routing_reply({"department": department}, result, language=language))
 
 
 # ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
@@ -2247,6 +2330,29 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
                     "flow (awaiting=%s) -- abandoning it, answering now",
                     session.call_id, pending.get("awaiting"))
         await _finish_doctor_personal_request(session, language=language)
+        return True
+
+    # ADDED BY SOURAV -- "Caller describes symptoms and asks what is wrong"
+    # story. Checked here, immediately after the doctor-personal-request
+    # guard above and still before `awaiting` is even read -- ahead of
+    # every flow-specific branch below, same "structurally impossible to
+    # misclassify" placement as the three guards above. Without this, a
+    # caller mid-booking (or mid-OTP-verification) who suddenly describes
+    # a symptom ("actually, I have chest pain, which department should I
+    # see") would have that sentence parsed as an attempted answer to
+    # whatever field was pending. Deliberately checked LAST among the
+    # deterministic pre-LLM guards, after clinical-interpretation/complaint/
+    # doctor-personal-request would already have claimed the turn if any
+    # of them matched -- see agent/symptom_routing.py's own module
+    # docstring for why. Whatever flow was in progress is abandoned
+    # outright, with no attempt to finish, resume, or ask about it -- same
+    # zero-negotiation shape as the guards just above.
+    symptom_verdict, symptom_department = resolve_symptom_department(text)
+    if symptom_verdict == _SYMPTOM_ROUTE_COMMIT:
+        logger.info("[%s] symptom-routing request interrupted an in-progress "
+                    "flow (awaiting=%s) -- abandoning it, routing to %s now",
+                    session.call_id, pending.get("awaiting"), symptom_department)
+        await _finish_symptom_routing(session, symptom_department, language=language)
         return True
 
     awaiting = pending["awaiting"]
@@ -4293,6 +4399,22 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
             # accident.
             await _speak(session, clinical_interpretation_reply(language=language))
             session.pending = {"awaiting": "clinical_interpretation_choice", "retries": 0}
+            return
+
+        if intent == "symptom_department_routing":
+            # ADDED BY SOURAV -- "Caller describes symptoms and asks what
+            # is wrong" story. Reached only via agent/symptom_routing.py's
+            # guard in _resolve_intent() -- the department in `slots` was
+            # already resolved deterministically there from a fixed,
+            # code-owned vocabulary, never by the model. No missing-slot
+            # prompt is possible here (unlike "doctors_by_department"
+            # just below in this same chain): this intent is only ever
+            # produced already carrying a resolved department. See
+            # _finish_symptom_routing()'s own docstring for what happens
+            # next -- the same clinic-api lookup "doctors_by_department"
+            # already uses, then a reply that is explicit this is
+            # administrative routing, never a diagnosis.
+            await _finish_symptom_routing(session, slots.get("department"), language=language)
             return
 
         if intent == "human_direct_request":
