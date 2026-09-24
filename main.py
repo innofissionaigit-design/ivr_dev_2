@@ -187,6 +187,12 @@ from agent.reply_templates import (
     # non-generative acknowledgment -- see this function's own docstring
     # in agent/reply_templates.py for why AC 2/AC 5 rule out anything else.
     complaint_acknowledged_reply,
+    # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+    # story. Fixed, non-generative apology+offer (once) / offer-only
+    # (repeat) -- see this function's own docstring in
+    # agent/reply_templates.py for why AC 4/5/6 rule out anything
+    # model-composed here.
+    anger_reply,
     # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
     # story. Fixed, non-generative, never names a doctor -- see this
     # function's own docstring in agent/reply_templates.py for why AC 1/2/
@@ -291,6 +297,11 @@ from agent.outcomes import (
     # own docstring in agent/outcomes.py for why it never logs the
     # complaint text itself.
     record_complaint_filed,
+    # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+    # story. Own "caller_angry" intent/reason pair in the same shared
+    # ledger -- see its own docstring in agent/outcomes.py for why it
+    # never logs the angry utterance itself.
+    record_anger_detected,
     # ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
     # report" / privacy gateway enforcement). Own "report_access_denied"
     # event in the same shared ledger -- see its own docstring in
@@ -348,6 +359,15 @@ from agent.human_fast_path import is_immediate_human_request
 # inside _resolve_intent(), AND again at the very top of _continue_pending(),
 # ahead of every in-progress flow's own field parsing.
 from agent.complaint_flow import is_complaint
+# ADDED BY SOURAV -- "Caller is angry about a previous experience" story.
+# Pure, transport-agnostic anger/frustration detection -- structured the
+# same way agent/complaint_flow.py (immediately above) already is, and
+# checked in the same tier, immediately AFTER it (see that module's own
+# docstring for why: an utterance that is both angry and a clear
+# complaint must still be caught by is_complaint() first, so the two
+# stories enhance rather than compete -- Story 2's own flow is never
+# redesigned by this import or this story).
+from agent.anger_flow import is_anger
 # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally" story.
 # Pure, transport-agnostic "is this a personal-contact-with-a-doctor
 # request" detection -- see that module's own docstring for why this is a
@@ -743,6 +763,22 @@ class CallSession:
         # in short, it is the only thing that survives between turns, since
         # every _resolve_intent call otherwise starts from zero context.
         self.pending: dict | None = None
+
+        # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+        # story. AC 4's own explicit design decision is "apologises once
+        # PER CALL", not once per angry utterance (a deliberate departure
+        # from Story 2's own complaint_acknowledged_reply(), which repeats
+        # every time a complaint is filed in the same call -- see
+        # tests/test_complaint_flow.py's own
+        # test_repeated_complaint_in_the_same_call_is_acknowledged_each_time).
+        # A per-call flag is the smallest new state that can express that:
+        # it lives on CallSession (the transport bookkeeper that already
+        # owns other per-call, mutable state like `pending`), never on
+        # CallState (frozen/immutable and rebuilt wholesale by Call
+        # Intelligence, per that module's own docstring -- it is not the
+        # right place for a plain boolean flag this story owns). Read and
+        # set only by main.py's _finish_anger().
+        self.anger_apologized = False
 
         # The single structure every downstream layer reads for caller signals
         # (Blueprint 4.5). Replaced wholesale each turn by Call Intelligence,
@@ -1186,6 +1222,33 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
             "intent": "complaint",
             "slots": slots,
             "parts": [{"intent": "complaint", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
+    # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+    # story. Checked here, immediately after the complaint guard above and
+    # still before fast_path/the semantic cache/Ollama -- same
+    # "structurally impossible to misclassify" reasoning agent/anger_flow.py's
+    # module docstring gives in full: AC 5/AC 6's "does not argue"/"does not
+    # defend the hospital" are zero-tolerance policies the model must never
+    # get a turn to violate, so an angry utterance can never be
+    # misclassified as smalltalk, out_of_scope, or anything an LLM retry
+    # under phrasing pressure might produce. Checked AFTER is_complaint()
+    # on purpose: an utterance that is both angry and a clear complaint is
+    # routed through the complaint branch above unchanged (Story 2 is never
+    # redesigned by this story), which already speaks its own apology --
+    # this guard's own is_anger() check is never even reached for that
+    # utterance. See that module's own docstring for why this also has to
+    # run again inside _continue_pending() for a caller who becomes angry
+    # mid-flow.
+    if is_anger(text):
+        logger.info("[%s] anger guard fired -- no LLM call", session.call_id)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None}
+        return {
+            "intent": "caller_angry",
+            "slots": slots,
+            "parts": [{"intent": "caller_angry", "slots": slots}],
             "direct_reply_bn": None,
         }
 
@@ -1723,6 +1786,128 @@ async def _finish_complaint(session: CallSession, text: str, language: str = "be
 
     record_complaint_filed(call_id=session.call_id)
     await _speak(session, complaint_acknowledged_reply(language=language))
+
+
+# ADDED BY SOURAV -- "Caller is angry about a previous experience" story.
+#
+# Called from BOTH guard sites -- the fresh-turn "caller_angry" dispatch
+# branch below in _dispatch_turn_inner(), and _continue_pending()'s own
+# anger interrupt-guard above -- exactly the same two-call-site shape
+# _finish_complaint() just above already uses for its own guard pair.
+#
+# What this does, in order, and why each step is here:
+#
+# 1. Reads session.anger_apologized BEFORE touching anything else, so
+#    "was the apology already given THIS call" reflects the state as of
+#    the START of this turn, not something this function itself just
+#    changed a moment earlier.
+#
+# 2. Rebuilds session.call_state via the existing, already-built
+#    agent/call_state.py::build()/responses/speech_policy.py machinery
+#    with caller_state="angry" -- this is a REASSIGNMENT of the plain
+#    session.call_state attribute, not a mutation of the frozen
+#    CallState dataclass itself (CallState's own fields cannot be
+#    written to directly; session.call_state, like session.pending
+#    elsewhere in this file, is freely reassignable). The dormant
+#    "angry" row in responses/speech_policy.py's _ROWS
+#    (speech_rate="slow_normal", escalation_threshold="low") is what
+#    this reassignment activates -- no new speech-rate or escalation
+#    mechanism is created here; see agent/tts.py's SPEECH_RATE_SCALE and
+#    main.py's own _speak(), which already reads session.call_state.
+#    speech_rate on every turn, as the one existing consumer this
+#    satisfies (AC 2). AC 1 ("anger lowers the escalation threshold") is
+#    NOT implemented as "branch on session.call_state.escalation_
+#    threshold" -- the investigation confirmed that field is written by
+#    build()/derive() but has no reader anywhere in this codebase, so
+#    wiring one up here would be exactly the "generic escalation
+#    framework" instruction 3 forbids. Instead, per the investigation's
+#    own recommendation, the threshold-lowering IS is_anger()'s own
+#    eligibility rule: an angry caller reaches an explicit human offer on
+#    the VERY FIRST angry utterance, with no other justification needed --
+#    the same way agent/human_fast_path.py's mere existence already
+#    encodes "a direct human request needs zero other justification to
+#    escalate." A normal (non-angry) caller only reaches a human offer
+#    via an explicit request, a guard like out_of_scope/clinical_
+#    interpretation/unverifiable_claim, or three consecutive low-ASR-
+#    confidence turns (session.confirm_attempts > 2, further down in this
+#    file) -- anger skips straight past all of that on turn one. The
+#    escalation_threshold="low" value IS still set on session.call_state
+#    below (so it is honestly reported wherever CallState.as_dict() is
+#    logged), it is simply not what TRIGGERS the earlier offer here.
+#    senior/language/provenance are carried forward from the session's
+#    existing call_state rather than reset, so an angry senior caller
+#    does not lose their senior-citizen derivations just because anger
+#    fired.
+#
+# 3. Reuses Story 2's existing complaint-storage mechanism
+#    (agent/tools_client.py::submit_complaint(), the same call site
+#    _finish_complaint() above already uses, writing into the same
+#    clinic-api ComplaintRecord table) to satisfy AC 7 ("captured in the
+#    context packet") -- no second complaint-storage system, per this
+#    story's own explicit design decision. `text` is passed through
+#    verbatim, exactly as _finish_complaint() does, so the record holds
+#    precisely what the caller said. Wrapped in try/except so a tool
+#    failure here can NEVER block the caller from being spoken to and
+#    offered a human -- AC 3 ("a human is offered") must hold even if
+#    the context-capture write fails; this mirrors _finish_unverifiable_
+#    claim()'s own audit-write discipline just above (an audit/storage
+#    failure must never turn into a silent, unheard caller).
+#
+# 4. Reuses agent/outcomes.py's shared ESCALATION_LOG_PATH ledger via
+#    record_anger_detected() -- its own event/counter pair, deliberately
+#    NOT routed through record_human_handoff() (see that function's own
+#    module comment in agent/outcomes.py for why: this story's own
+#    "angry_choice" pending state, opened at the end of this function,
+#    calls record_human_handoff() itself on an affirmative answer, so
+#    detection and confirmed-handoff stay two distinct, non-double-
+#    counted events, the same separation record_unverifiable_claim()/
+#    record_human_handoff() already keep for their own guard+choice
+#    pair). Fires on EVERY angry utterance, never gated on
+#    anger_apologized (see record_anger_detected()'s own docstring for
+#    why: AC 4 governs what is SPOKEN, never what is audited). Also
+#    wrapped in try/except for the same "must never block the honest
+#    reply" reason as step 3.
+#
+# 5. Speaks anger_reply(already_apologized, language) -- the apology-plus-
+#    offer sentence the FIRST time this call, the offer-only sentence
+#    every time after, per AC 4's "once" and this story's explicit
+#    "must not weaken the human-offer on repeat" instruction.
+#
+# 6. Sets session.anger_apologized = True (a no-op write if it was
+#    already True) and opens "angry_choice" -- the SAME offer-then-wait-
+#    for-yes/no shape "out_of_scope_choice"/"clinical_interpretation_
+#    choice"/"unverifiable_claim_choice" already use (see
+#    _continue_pending()'s own handler for this awaiting value below),
+#    satisfying AC 3's "explicitly offered... and wait for a response"
+#    rather than the silent handoff Story 2's own complaint flow uses.
+#    This is the one deliberate behavioural difference from
+#    _finish_complaint() above, which leaves session.pending as None --
+#    required because AC 3 is specific to THIS story, not Story 2.
+async def _finish_anger(session: CallSession, text: str, language: str = "bengali") -> None:
+    already_apologized = getattr(session, "anger_apologized", False)
+
+    session.call_state = call_state_mod.build(
+        caller_state="angry",
+        senior=session.call_state.senior,
+        language=session.call_state.language,
+        provenance=session.call_state.provenance + ("anger_flow",),
+    )
+
+    try:
+        await _tools.submit_complaint(text)
+    except ToolCallError as e:
+        logger.error("[%s] anger context-capture call failed (reply/offer still proceed): %s",
+                     session.call_id, e)
+
+    try:
+        record_anger_detected(call_id=session.call_id, turn_index=getattr(session, "utt_seq", None))
+    except Exception as e:
+        logger.error("[%s] failed to record anger-detected audit event (reply still fixed/honest): %s",
+                     session.call_id, e)
+
+    await _speak(session, anger_reply(already_apologized, language=language))
+    session.anger_apologized = True
+    session.pending = {"awaiting": "angry_choice", "retries": 0}
 
 
 # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally" story.
@@ -2420,6 +2605,29 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         await _finish_complaint(session, text, language=language)
         return True
 
+    # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+    # story. Checked here, immediately after the complaint guard above and
+    # still before `awaiting` is even read -- ahead of every flow-specific
+    # branch below (booking, report, billing, doctor lookup, callback --
+    # every one of them). Without this, a caller mid-booking (or mid-OTP-
+    # verification, or being asked to confirm what was heard) who suddenly
+    # says "I am so angry, this is ridiculous" would have that sentence
+    # parsed as an attempted answer to whatever field was pending, forcing
+    # them through several more normal transaction steps -- exactly what
+    # AC 3/AC 9 rule out. Whatever flow was in progress is abandoned
+    # outright, with no attempt to finish, resume, or ask about it -- same
+    # zero-negotiation-about-WHETHER-to-stop shape as the complaint guard
+    # just above (the human offer that follows, unlike complaint's own
+    # silent handoff, DOES ask a yes/no question -- see
+    # _finish_anger()'s own docstring -- but whether to abandon the
+    # in-progress flow is not itself up for negotiation).
+    if is_anger(text):
+        logger.info("[%s] anger interrupted an in-progress flow "
+                    "(awaiting=%s) -- abandoning it, offering a human now",
+                    session.call_id, pending.get("awaiting"))
+        await _finish_anger(session, text, language=language)
+        return True
+
     # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally"
     # story. Checked here, immediately after the complaint guard above and
     # still before `awaiting` is even read -- ahead of every flow-specific
@@ -3109,6 +3317,56 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             session.pending = None
             return False  # give a fresh LLM classification a chance instead
         await _speak(session, unverifiable_claim_reply(language=language))
+        return True
+
+    if awaiting == "angry_choice":
+        # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+        # story. Mirrors "out_of_scope_choice"/"clinical_interpretation_
+        # choice"/"unverifiable_claim_choice" immediately above, byte-for-
+        # byte in shape: this is the SAME offer-then-wait-for-yes/no
+        # pending mechanism every other guard-offered choice in this chain
+        # already uses -- AC 3's own instruction to "use the existing
+        # pending yes/no human or callback mechanism" rather than build a
+        # second one. Tagged with its own intent string ("caller_angry")
+        # so it stays distinguishable in the shared escalation ledger from
+        # "unverifiable_claim", "out_of_scope", "clinical_interpretation",
+        # and "complaint" (Story 2's own, separate, silent handoff -- see
+        # this story's own module docstring in agent/anger_flow.py for why
+        # the two stay distinguishable events even though they share
+        # infrastructure). The negative branch reuses
+        # out_of_scope_counter_reply() verbatim, same as every sibling
+        # choice above -- this story does not need a second decline
+        # template, and AC 5/AC 6 (no arguing, no defending) are already
+        # satisfied by that reply's own fixed, non-defensive wording.
+        #
+        # No false live-transfer promise (AC 3's own "use truthful
+        # wording" instruction): human_fallback_reply() below is the exact
+        # same fixed sentence "out_of_scope_choice"/"clinical_
+        # interpretation_choice"/"unverifiable_claim_choice" already speak
+        # on their own affirmative branch -- whatever that sentence
+        # promises (or doesn't) for this deployment is already correct by
+        # construction, since it is the one sentence this whole codebase
+        # uses everywhere a human handoff is confirmed; this story adds no
+        # new promise on top of it.
+        if is_affirmative(text):
+            session.pending = None
+            record_human_handoff("caller_angry", call_id=session.call_id)
+            await _speak(session, human_fallback_reply(language=language))
+            return True
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, out_of_scope_counter_reply(language=language))
+            return True
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            return False  # give a fresh LLM classification a chance instead
+        # already_apologized=True: by the time this retry path is reached,
+        # the apology (if any was owed) was already spoken when this
+        # "angry_choice" pending state was first opened -- re-speaking the
+        # offer-only half of anger_reply() here re-asks the still-
+        # unanswered question without ever re-apologising, per AC 4.
+        await _speak(session, anger_reply(True, language=language))
         return True
 
     # Universal escape hatch, checked before any field-specific parsing:
@@ -4626,6 +4884,24 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
             # the caller said, never a field extracted or rewritten by the
             # classifier.
             await _finish_complaint(session, text, language=language)
+            return
+
+        if intent == "caller_angry":
+            # ADDED BY SOURAV -- "Caller is angry about a previous
+            # experience" story. Reached when the guard fires inside
+            # _resolve_intent() above for a FRESH turn (no in-progress
+            # flow) -- the mid-flow case is handled by _continue_pending()'s
+            # own anger interrupt-guard instead, which never falls through
+            # to here. `text` here is this turn's own ASR transcript (set
+            # at the top of this function, still in scope) -- passed
+            # straight through to _finish_anger() so the context-capture
+            # write is exactly what the caller said, never a field
+            # extracted or rewritten by the classifier. Unlike "complaint"
+            # just above, _finish_anger() DOES leave session.pending set
+            # (to "angry_choice") -- AC 3 requires the explicit human offer
+            # to wait for an answer, which Story 2's own silent handoff
+            # never needed.
+            await _finish_anger(session, text, language=language)
             return
 
         if intent == "doctor_personal_request":

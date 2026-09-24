@@ -89,6 +89,7 @@ from agent.reply_templates import (  # noqa: E402
     # ADDED BY SOURAV -- "Caller states something the agent cannot
     # verify" story.
     unverifiable_claim_reply,
+    anger_reply,
 )
 # ADDED BY SOURAV -- bugfix for the "Caller goes silent" story's close
 # message (validation report Bug #2): silence_close_reply() now branches
@@ -537,6 +538,16 @@ def _replies():
     for language in ("bengali", "english", "hinglish", "banglish"):
         yield f"unverifiable-claim/{language}", unverifiable_claim_reply(language=language)
 
+    # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+    # story. anger_reply() takes no caller-supplied value either, but it
+    # DOES branch on `already_apologized` (AC 4's "once" logic), so both
+    # branches get a case per language, not just one -- same discipline
+    # doctor_personal_request_reply() above already established for its
+    # own boolean branch.
+    for language in ("bengali", "english", "hinglish", "banglish"):
+        yield f"anger/first-{language}", anger_reply(False, language=language)
+        yield f"anger/repeat-{language}", anger_reply(True, language=language)
+
 
 CASES = list(_replies())
 
@@ -606,6 +617,9 @@ def test_the_gate_covers_every_public_reply_function():
         # ADDED BY SOURAV -- "Caller states something the agent cannot
         # verify" story. See the four yields above (one per language).
         "unverifiable_claim_reply",
+        # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+        # story. See the eight yields above (two branches x four languages).
+        "anger_reply",
     }
     assert public <= exercised, (
         f"reply function(s) {sorted(public - exercised)} have no case in this gate"

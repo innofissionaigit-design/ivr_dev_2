@@ -342,6 +342,94 @@ def record_complaint_filed(call_id: str | None = None) -> None:
                           reason=_HUMAN_COMPLAINT_REASON)
 
 
+HUMAN_ANGER_INTENT = "caller_angry"
+_HUMAN_ANGER_REASON = "caller_expressed_anger"
+
+# =============================================================================
+# ADDED BY SOURAV -- "Caller is angry about a previous experience" story.
+#
+# Deliberately its OWN event/counter pair (ANGER_DETECTED_EVENT /
+# _anger_detected_counts), NOT routed through record_human_handoff()/
+# _handoff_counts the way record_complaint_filed() is -- unlike Story 2's
+# complaint flow (a single, silent, immediate handoff with no subsequent
+# yes/no step), this story's own "angry_choice" pending state (see
+# main.py's _continue_pending()) asks the caller a real yes/no question
+# and, on "yes", ALSO calls record_human_handoff(HUMAN_ANGER_INTENT, ...)
+# itself -- the same established pattern "out_of_scope_choice"/
+# "clinical_interpretation_choice"/"unverifiable_claim_choice" already
+# use for THEIR own affirmative branches. If anger DETECTION also wrote
+# into that same _handoff_counts["caller_angry"] counter/ledger event,
+# every angry call that also said "yes" to the offer would be counted
+# TWICE under one intent tag, and one that said "no" would still show a
+# handoff that never happened. Keeping detection on its own counter is
+# the exact same "detected" vs "actually escalated" separation
+# record_unverifiable_claim()/unverifiable_claim_counts() above already
+# established for agent/unverifiable_claim.py's own guard+choice pair --
+# reused here rather than inventing a third shape.
+# =============================================================================
+
+ANGER_DETECTED_EVENT = "caller_angry_detected"
+
+_anger_detected_counts: dict[str, int] = {}
+
+
+def record_anger_detected(call_id: str | None = None,
+                           turn_index: int | None = None) -> None:
+    """Records one "-> anger/frustration detected" event: bumps a
+    per-call-id-independent occurrence count and appends one JSON line to
+    the SAME shared ESCALATION_LOG_PATH ledger every other record_*()
+    function in this file writes to, tagged with its own event name
+    (ANGER_DETECTED_EVENT) so it stays greppable apart from
+    "human_handoff", "unverifiable_claim", and every other event already
+    in this ledger.
+
+    Deliberately logs no reason/free-text field beyond the fixed intent
+    tag -- the same PHI discipline this ledger holds every other event
+    to. The caller's verbatim words go to clinic-api's ComplaintRecord
+    table instead, via the SAME agent/tools_client.py::submit_complaint()
+    call agent/complaint_flow.py already uses (see main.py's
+    _finish_anger()) -- this story does not add a second complaint-
+    storage system, per its own explicit instruction.
+
+    Called once per angry utterance that reaches main.py's
+    _finish_anger() (mirroring record_complaint_filed()'s own
+    per-occurrence counting, proven by tests/test_complaint_flow.py to
+    count every complaint in a call, not just the first) -- this is
+    deliberately NOT gated on session.anger_apologized: AC 4's
+    "apologises once" governs what is SPOKEN, never what is audited, and
+    an audit trail that quietly stopped counting after the first angry
+    turn would undercount exactly the callers this story exists to
+    protect. See this section's own module comment just above for why
+    this does NOT also call record_human_handoff() -- that call happens
+    separately, only on an affirmative answer, inside main.py's
+    "angry_choice" pending-state handler."""
+    with _lock:
+        _anger_detected_counts[HUMAN_ANGER_INTENT] = \
+            _anger_detected_counts.get(HUMAN_ANGER_INTENT, 0) + 1
+        record = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "event": ANGER_DETECTED_EVENT,
+            "intent": HUMAN_ANGER_INTENT,
+            "reason": _HUMAN_ANGER_REASON,
+            "call_id": call_id,
+            "turn_index": turn_index,
+        }
+        log_dir = os.path.dirname(ESCALATION_LOG_PATH)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(ESCALATION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def anger_detected_counts() -> int:
+    """Total anger-detected occurrence COUNT -- mirrors
+    unverifiable_claim_counts() above in shape, but this story has only
+    one reason code, so it returns a plain int rather than a per-reason
+    dict."""
+    with _lock:
+        return _anger_detected_counts.get(HUMAN_ANGER_INTENT, 0)
+
+
 def immediate_human_escalation_rate() -> dict:
     """The quality signal itself: how often a caller turn ended in an
     immediate, zero-negotiation human handoff, out of every turn attempted.
@@ -619,5 +707,9 @@ def _reset_for_testing() -> None:
         _handoff_counts.clear()
         _denied_counts.clear()
         _unverifiable_claim_counts.clear()
+        # ADDED BY SOURAV -- "Caller is angry about a previous experience"
+        # story. Same reset discipline as _unverifiable_claim_counts just
+        # above -- its own separate counter dict, cleared here.
+        _anger_detected_counts.clear()
         _total_turns = 0
         _abandonment_count = 0

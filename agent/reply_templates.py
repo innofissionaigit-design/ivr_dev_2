@@ -2629,6 +2629,76 @@ def complaint_acknowledged_reply(language: str = "bengali") -> str:
 
 
 # =============================================================================
+# ADDED BY SOURAV -- "Caller is angry about a previous experience" story.
+#
+# AC 4's "apologises once" (this story's own explicit design decision: once
+# PER CALL, not once per angry utterance -- unlike Story 2's own
+# complaint_acknowledged_reply() just above, which is proven by
+# tests/test_complaint_flow.py to repeat every time a complaint is filed)
+# is why this is TWO fixed sentences per language, not one, selected by
+# `already_apologized` -- main.py's _finish_anger() is the only caller, and
+# it decides which one applies by checking (and then setting)
+# session.anger_apologized. AC 5/AC 6's "does not argue"/"does not defend
+# the hospital" rule out anything but a fixed, pre-written line here, the
+# same discipline complaint_acknowledged_reply() and out_of_scope_reply()
+# already hold themselves to -- neither sentence explains, justifies, or
+# comments on what the caller is angry about, and neither claims a live
+# transfer this codebase cannot make (see agent/tools_client.py's
+# submit_complaint() and human_fallback_reply()'s own docstring for what
+# "connect you" already honestly means everywhere else in this codebase).
+#
+# The offer clause is deliberately WORDED THE SAME as out_of_scope_reply()'s
+# own tail ("connect you with one of our staff, or ... contact our counter
+# directly") rather than a new invented phrasing -- AC 3's "a human is
+# offered explicitly" is exactly the offer that template already makes, and
+# reusing its exact wording is what lets main.py reuse its exact
+# is_affirmative()/is_negative() pending-choice mechanism unchanged (see
+# main.py's own "angry_choice" pending state).
+# =============================================================================
+def anger_reply(already_apologized: bool, language: str = "bengali") -> str:
+    """The fixed spoken reply for a detected angry/frustrated utterance.
+
+    `already_apologized` is False for the FIRST angry utterance in this
+    call (apology + explicit human offer) and True for every subsequent
+    one (offer only -- AC 4 forbids saying sorry twice in the same call,
+    but the human offer must still be made every time anger recurs, never
+    weakened or dropped just because the apology already happened)."""
+    if not already_apologized:
+        if language == "english":
+            return ("I'm sorry to hear that, and I understand your frustration. "
+                     "Would you like me to connect you with one of our staff, "
+                     "or would you rather contact our counter directly?")
+        elif language == "hinglish":
+            return ("Mujhe afsos hai ki aapko yeh takleef hui, aur main aapki "
+                     "frustration samajh sakta hoon. Kya aapko hamare staff se "
+                     "connect karwa doon, ya aap seedhe counter par contact "
+                     "karna chahenge?")
+        elif language == "banglish":
+            return ("Apnar ei osubidhar jonno ami dukkhito, ebong ami apnar "
+                     "frustration bujhte parchi. Apnake ki amader staff-er "
+                     "sathe connect kore debo, naki apni nijei counter-e "
+                     "jogajog korben?")
+        else:  # bengali
+            return ("আপনার এই অসুবিধার জন্য আমি দুঃখিত, এবং আপনার এই অসন্তোষ আমি "
+                     "বুঝতে পারছি। আপনাকে কি আমাদের স্টাফের সাথে সংযুক্ত করে দেব, "
+                     "নাকি আপনি নিজে কাউন্টারে যোগাযোগ করবেন?")
+    else:
+        if language == "english":
+            return ("I understand. Would you like me to connect you with one "
+                     "of our staff, or would you rather contact our counter "
+                     "directly?")
+        elif language == "hinglish":
+            return ("Samajh gaya. Kya aapko hamare staff se connect karwa "
+                     "doon, ya aap seedhe counter par contact karna chahenge?")
+        elif language == "banglish":
+            return ("Bujhte perechi. Apnake ki amader staff-er sathe connect "
+                     "kore debo, naki apni nijei counter-e jogajog korben?")
+        else:  # bengali
+            return ("বুঝতে পেরেছি। আপনাকে কি আমাদের স্টাফের সাথে সংযুক্ত করে দেব, "
+                     "নাকি আপনি নিজে কাউন্টারে যোগাযোগ করবেন?")
+
+
+# =============================================================================
 # ADDED BY SOURAV -- "Caller wants to speak to a doctor personally" story.
 #
 # AC 1/2/3/4 together rule out anything model-composed here, for the same
