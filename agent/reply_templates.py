@@ -2538,6 +2538,52 @@ def human_fallback_reply(language: str = "bengali") -> str:
 
 
 # =============================================================================
+# ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+# story.
+#
+# Spoken ONLY when agent/unverifiable_claim.py's detect_unverifiable_claim()
+# guard fires (see that module's own docstring for the full reasoning on
+# what it does and does not intercept). Fixed and generic across every
+# category that guard recognises -- deliberately does NOT vary by claim
+# category, the same "no dynamic value of any kind" discipline
+# human_fallback_reply() just above already follows, for the identical
+# reason: this sentence must never accidentally repeat, confirm, or deny
+# anything about the caller's specific claim, only say plainly that this
+# system has no way to check it from here.
+#
+# MUST NOT, per this story's own explicit instruction:
+#   - repeat the caller's claim as fact ("your appointment tomorrow...")
+#   - confirm or deny an unverified appointment/report/payment
+#   - provide medical interpretation
+#   - invent a record result
+# None of the four sentences below do any of this -- each is a single,
+# self-contained statement ("I'm not able to confirm that from here")
+# followed by a human/callback offer, with no slot substitution of any
+# kind, so there is nothing FOR it to get wrong about the specific claim.
+# =============================================================================
+def unverifiable_claim_reply(language: str = "bengali") -> str:
+    """The fixed "I can't confirm that" + human-offer sentence. Always
+    exactly one of these four fixed sentences -- never composed from, or
+    varied by, the caller's own words or the claim category detected."""
+    if language == "english":
+        return ("I'm not able to confirm that from the information available to "
+                 "me right now. Would you like me to connect you with one of our "
+                 "staff, or would you rather contact our counter directly?")
+    elif language == "hinglish":
+        return ("Main abhi is baare mein confirm nahi kar sakta jo information "
+                 "mere paas hai usse. Kya aapko hamare staff se connect karwa "
+                 "doon, ya aap seedhe counter par contact karna chahenge?")
+    elif language == "banglish":
+        return ("Ekhon amar kache ja information ache tar upor eta ami confirm "
+                 "korte parchi na. Apnake ki amader staff-er sathe connect kore "
+                 "debo, naki apni nijei counter-e jogajog korben?")
+    else:  # bengali
+        return ("এখন আমার কাছে যে তথ্য আছে তার ভিত্তিতে আমি এটা নিশ্চিত করতে "
+                 "পারছি না। আপনাকে কি আমাদের স্টাফের সাথে সংযুক্ত করে দেব, নাকি "
+                 "আপনি নিজে কাউন্টারে যোগাযোগ করবেন?")
+
+
+# =============================================================================
 # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
 #
 # AC 2 ("acknowledged exactly once") and AC 5 ("does NOT attempt to

@@ -519,6 +519,95 @@ def report_access_denied_counts(intent: str | None = None) -> dict[str, int] | i
         return dict(_denied_counts)
 
 
+# =============================================================================
+# ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+# story. AC: "A caller assertion never becomes a system fact... where the
+# system cannot verify the claim, the agent clearly says it cannot
+# confirm it."
+#
+# A SEVENTH event in the same ESCALATION_LOG_PATH ledger, distinguished
+# from every other event here by its own "event": "unverifiable_claim"
+# value -- same discipline record_report_access_denied() above already
+# established: one shared, durable, greppable JSONL file, one process-
+# wide lock, its own counter dict (_unverifiable_claim_counts) kept
+# SEPARATE from every other counter here so no two different things are
+# ever added together.
+#
+# Called from main.py's/main_pcm.py's _finish_unverifiable_claim() --
+# the ONE place agent/unverifiable_claim.py's detect_unverifiable_claim()
+# guard hands off to once it fires, whether that happened on a fresh turn
+# (_resolve_intent()) or mid-flow (_continue_pending()). Deliberately
+# logs ONLY a fixed category reason code (one of
+# agent/unverifiable_claim.py's CATEGORY_* constants), never the caller's
+# claim text itself -- per this story's own explicit instruction ("do not
+# store unnecessary caller free text"), matching record_complaint_filed()'s
+# and record_report_access_denied()'s own already-established discipline
+# in this exact file.
+# =============================================================================
+
+UNVERIFIABLE_CLAIM_EVENT = "unverifiable_claim"
+
+_unverifiable_claim_counts: dict[str, int] = {}
+
+
+def record_unverifiable_claim(intent: str, reason: str, call_id: str | None = None,
+                               turn_index: int | None = None) -> None:
+    """Records one "-> caller asserted something this system cannot
+    verify" event. Bumps a per-`reason` count
+    (unverifiable_claim_counts() below) and appends one JSON line to the
+    shared ESCALATION_LOG_PATH ledger.
+
+    `intent` is always "unverifiable_claim" today (the one guard-fired
+    intent this event is ever recorded for) -- accepted as a parameter
+    rather than hardcoded so this function's shape matches every other
+    record_*() function in this file (`intent` keyed) and stays open to a
+    second caller without a signature change, exactly as
+    record_human_handoff()'s own `intent` parameter already is. `reason`
+    is a fixed, non-sensitive category code from
+    agent/unverifiable_claim.py's CLAIM_PATTERNS (e.g.
+    "APPOINTMENT_EXISTING_CLAIM") -- never a sentence built from caller
+    speech.
+
+    CALLER RESPONSIBILITY, not enforced here by design: main.py/
+    main_pcm.py must call this from inside their own try/except (see
+    main.py's _finish_unverifiable_claim()) -- same discipline
+    record_report_access_denied()'s own docstring already establishes,
+    and for the identical reason: the fixed "I can't confirm that" reply
+    must be spoken, and the guard's decision must stand, regardless of
+    whether this audit write succeeds. A failure HERE can at worst mean
+    an unverifiable-claim event goes unrecorded, never that the claim
+    becomes confirmed or the reply changes.
+    """
+    with _lock:
+        _unverifiable_claim_counts[reason] = _unverifiable_claim_counts.get(reason, 0) + 1
+        record = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "event": UNVERIFIABLE_CLAIM_EVENT,
+            "intent": intent,
+            "reason": reason,
+            "call_id": call_id,
+            "turn_index": turn_index,
+        }
+        log_dir = os.path.dirname(ESCALATION_LOG_PATH)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(ESCALATION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def unverifiable_claim_counts(reason: str | None = None) -> dict[str, int] | int:
+    """Per-category unverifiable-claim occurrence COUNTS -- mirrors
+    report_access_denied_counts() above exactly, but reads the separate
+    _unverifiable_claim_counts dict, keyed by reason code rather than
+    intent (every occurrence today shares the same "unverifiable_claim"
+    intent, so counting by intent alone would collapse all four claim
+    categories into one indistinguishable number)."""
+    with _lock:
+        if reason is not None:
+            return _unverifiable_claim_counts.get(reason, 0)
+        return dict(_unverifiable_claim_counts)
+
+
 def _reset_for_testing() -> None:
     """Test-only: clear the in-process counters between test cases. Never
     called from production code -- tests import and call this explicitly
@@ -529,5 +618,6 @@ def _reset_for_testing() -> None:
         _counts.clear()
         _handoff_counts.clear()
         _denied_counts.clear()
+        _unverifiable_claim_counts.clear()
         _total_turns = 0
         _abandonment_count = 0

@@ -156,6 +156,14 @@ from agent.reply_templates import (
     # this is the one reply in this codebase that both names a department
     # AND has to say out loud that doing so is not a diagnosis.
     symptom_routing_reply,
+    # ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+    # story. Fixed, non-generative "I can't confirm that" + human-offer
+    # sentence -- out_of_scope_counter_reply above is reused verbatim for
+    # this story's own "no thanks, I'll contact the counter" branch (see
+    # main.py's "unverifiable_claim_choice" pending handler), the same
+    # deliberate reuse out_of_scope_reply/clinical_interpretation_reply
+    # already established for that exact declined-offer sentence.
+    unverifiable_claim_reply,
     # ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
     # These three back _resolve_combinable_intent_fragment()'s three
     # non-fabricating fallback fragments below -- every OTHER fragment in
@@ -305,6 +313,12 @@ from agent.outcomes import (
     # agent/outcomes.py for exactly what it logs and (just as
     # importantly) what it never logs.
     record_report_access_denied,
+    # ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+    # story. Own "unverifiable_claim" event in the same shared ledger --
+    # see its own docstring in agent/outcomes.py for exactly what it logs
+    # and (just as importantly) what it never logs (the caller's claim
+    # text itself).
+    record_unverifiable_claim,
 )
 # ADDED BY SOURAV -- "Caller asks to be called back" story. Pure
 # availability-check/context-building logic -- see that module's own
@@ -370,6 +384,21 @@ from agent.doctor_personal_request import is_doctor_personal_request
 # docstring for the full reasoning, including why only a SINGLE,
 # unambiguous department match is ever acted on.
 from agent.symptom_routing import resolve_symptom_department, COMMIT as _SYMPTOM_ROUTE_COMMIT
+# ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+# story. Deterministic, pre-LLM, pre-fast-path phrase matcher -- structured
+# the same way agent/symptom_routing.py (immediately above) and this
+# codebase's other guard modules already are, and checked in the same
+# tier, AFTER all of them (see this module's own docstring for why: a
+# caller who both asserts an unverifiable claim and also files a
+# complaint, describes a symptom, or asks for a person/doctor directly
+# must still be caught by one of those guards first). Which claims have
+# no system-of-record check today is a fixed, code-owned list here --
+# never something extract_intent() (the LLM) is asked to decide -- see
+# agent/unverifiable_claim.py's own module docstring for the full
+# reasoning, including why a caller's ordinary QUESTION about the same
+# topics (report status, billing, booking) is deliberately never
+# intercepted here at all.
+from agent.unverifiable_claim import detect_unverifiable_claim, UNVERIFIABLE as _UNVERIFIABLE_CLAIM
 # STORY [Answer Quality and Grounding]
 # As a patient, I want to hear the whole sentence, so that I am
 # not left guessing what the agent tried to say.
@@ -1228,6 +1257,42 @@ async def _resolve_intent(session: CallSession, text: str) -> dict:
             "direct_reply_bn": None,
         }
 
+    # ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+    # story. Checked here, after every existing zero-negotiation safety/
+    # escalation guard above (immediate-human, clinical-interpretation,
+    # complaint, doctor-personal-request, symptom-routing) and still
+    # before fast_path/the semantic cache/Ollama -- same "structurally
+    # impossible to misclassify by the model" reasoning those guards give:
+    # a caller asserting a fact this system has no way to verify must
+    # never reach "smalltalk", the one intent whose reply the model is
+    # allowed to compose freely (see agent/llm.py's _validate() and this
+    # guard's own module docstring, "smalltalk is the one unsafe lane",
+    # for exactly why). Deliberately placed AFTER every guard above rather
+    # than before or instead of them: a caller who both makes this kind of
+    # claim AND asks a danger/diagnosis question, files a complaint, asks
+    # for a doctor personally, or describes a symptom must still be caught
+    # by whichever of those guards actually applies, first -- see
+    # agent/unverifiable_claim.py's own module docstring for the full
+    # reasoning, and for why only a narrow, fixed set of claim shapes with
+    # NO existing lookup is ever acted on here; an ordinary QUESTION about
+    # the same topics (report status, billing, booking) is deliberately
+    # left unintercepted -- it falls through to the ordinary classifier
+    # chain and reaches the real, already-verified tool-backed intent,
+    # exactly as it already does today.
+    claim_verdict, claim_category = detect_unverifiable_claim(text)
+    if claim_verdict == _UNVERIFIABLE_CLAIM:
+        logger.info("[%s] unverifiable-claim guard fired -> %s -- no LLM call",
+                    session.call_id, claim_category)
+        slots = {"test_name": None, "doctor_name": None, "date": None,
+                  "time_slot": None, "patient_name": None, "phone": None,
+                  "claim_category": claim_category}
+        return {
+            "intent": "unverifiable_claim",
+            "slots": slots,
+            "parts": [{"intent": "unverifiable_claim", "slots": slots}],
+            "direct_reply_bn": None,
+        }
+
     # Tier 1: decide it locally if we can. For a fixed catalogue the
     # entity is a string-matching problem with a 0.32 confidence margin,
     # where the embedding route had 0.03 -- see agent/fast_path.py. This
@@ -1756,6 +1821,50 @@ async def _finish_symptom_routing(session: CallSession, department: str, languag
         await _speak(session, SYSTEM_UNREACHABLE_BN, fallback_reason="tool_failure")
         return
     await _speak(session, symptom_routing_reply({"department": department}, result, language=language))
+
+
+# ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+# story. Shared by both call sites that can reach agent/unverifiable_
+# claim.py's guard -- the "unverifiable_claim" branch of
+# _dispatch_turn_inner's dispatch chain below, for a FRESH turn, and the
+# interrupt guard inside _continue_pending, for a caller mid-flow -- so
+# the audit write and the fixed reply are never hand-duplicated twice and
+# allowed to drift, same "one place, not duplicated" discipline
+# agent/report_flow.py's own module docstring argues for at length.
+#
+# UNLIKE _finish_symptom_routing()/_finish_doctor_personal_request() just
+# above, there is deliberately no clinic-api call here at all: this
+# guard's whole point is that NOTHING exists to look this claim up
+# against (see agent/unverifiable_claim.py's own module docstring,
+# "WHY THIS DOES NOT BUILD A NEW APPOINTMENT-LOOKUP API"), so there is
+# nothing to fetch and nothing a ToolCallError could ever fail on here.
+#
+# The audit write IS local I/O (agent/outcomes.py's JSONL ledger) and can
+# still fail (a full disk, a permissions problem) -- wrapped in its own
+# try/except, same discipline as _apply_report_outcome()'s own
+# report_access_denied audit write below: an audit failure must never
+# block, delay, or change the fixed reply the caller hears, and must
+# certainly never turn an unverifiable claim into a confirmed one.
+#
+# Ends by opening "unverifiable_claim_choice" -- the SAME offer-then-wait-
+# for-yes/no shape "out_of_scope_choice"/"clinical_interpretation_choice"
+# already use (see _continue_pending's own handler for this awaiting
+# value), reusing human_fallback_reply()/record_human_handoff() verbatim
+# on an affirmative answer rather than inventing a second escalation path
+# for what is, once the caller says yes, the exact same "connect me to a
+# person" outcome those two stories already built and tested.
+async def _finish_unverifiable_claim(session: CallSession, claim_category: str | None,
+                                      language: str = "bengali") -> None:
+    try:
+        record_unverifiable_claim(
+            intent="unverifiable_claim", reason=claim_category or "UNSPECIFIED_CLAIM",
+            call_id=session.call_id, turn_index=getattr(session, "utt_seq", None),
+        )
+    except Exception as e:
+        logger.error("[%s] failed to record unverifiable_claim audit event (reply still fixed/honest): %s",
+                     session.call_id, e)
+    await _speak(session, unverifiable_claim_reply(language=language))
+    session.pending = {"awaiting": "unverifiable_claim_choice", "retries": 0}
 
 
 # ADDED BY SOURAV -- Story 5 ("Caller asks about another person's
@@ -2364,6 +2473,27 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
         await _finish_symptom_routing(session, symptom_department, language=language)
         return True
 
+    # ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+    # story. Checked here, immediately after the symptom-routing guard
+    # above and still before `awaiting` is even read -- ahead of every
+    # flow-specific branch below, same "structurally impossible to
+    # misclassify" placement as every guard above it. Without this, a
+    # caller mid-booking (or mid-OTP-verification, or being asked to
+    # confirm what was heard) who suddenly asserts "actually, my
+    # appointment's already tomorrow" or "I already paid this" would have
+    # that sentence parsed as an attempted answer to whatever field was
+    # pending, instead of being recognised as the kind of claim this
+    # system cannot verify. Whatever flow was in progress is abandoned
+    # outright, with no attempt to finish, resume, or ask about it -- same
+    # zero-negotiation shape as the guards just above.
+    claim_verdict, claim_category = detect_unverifiable_claim(text)
+    if claim_verdict == _UNVERIFIABLE_CLAIM:
+        logger.info("[%s] unverifiable claim interrupted an in-progress flow "
+                    "(awaiting=%s) -- abandoning it, answering now (%s)",
+                    session.call_id, pending.get("awaiting"), claim_category)
+        await _finish_unverifiable_claim(session, claim_category, language=language)
+        return True
+
     awaiting = pending["awaiting"]
 
     # NOTE: confirm_booking/confirm_correction are handled below, together
@@ -2957,6 +3087,37 @@ async def _continue_pending(session: CallSession, text: str) -> bool:
             session.pending = None
             return False  # give a fresh LLM classification a chance instead
         await _speak(session, clinical_interpretation_reply(language=language))
+        return True
+
+    if awaiting == "unverifiable_claim_choice":
+        # ADDED BY SOURAV -- "Caller states something the agent cannot
+        # verify" story. Mirrors "out_of_scope_choice" and
+        # "clinical_interpretation_choice" immediately above, byte-for-byte
+        # in shape: the AC's "offers a human" is this affirmative branch
+        # reusing human_fallback_reply()/record_human_handoff() verbatim --
+        # the exact same escalation path every other guard-offered choice in
+        # this chain already uses -- just tagged with its own intent string
+        # ("unverifiable_claim") so it stays distinguishable in the shared
+        # escalation ledger from "out_of_scope", "clinical_interpretation",
+        # and "unclear". The negative branch deliberately reuses
+        # out_of_scope_counter_reply() verbatim rather than writing a new
+        # decline template -- its wording ("please contact our counter
+        # directly, anything else?") is already generic enough and this
+        # story does not need a second one.
+        if is_affirmative(text):
+            session.pending = None
+            record_human_handoff("unverifiable_claim", call_id=session.call_id)
+            await _speak(session, human_fallback_reply(language=language))
+            return True
+        if is_negative(text):
+            session.pending = None
+            await _speak(session, out_of_scope_counter_reply(language=language))
+            return True
+        pending["retries"] += 1
+        if pending["retries"] > 2:
+            session.pending = None
+            return False  # give a fresh LLM classification a chance instead
+        await _speak(session, unverifiable_claim_reply(language=language))
         return True
 
     # Universal escape hatch, checked before any field-specific parsing:
@@ -4424,6 +4585,20 @@ async def _dispatch_turn_inner(session: CallSession, utterance_wav: str):
             # already uses, then a reply that is explicit this is
             # administrative routing, never a diagnosis.
             await _finish_symptom_routing(session, slots.get("department"), language=language)
+            return
+
+        if intent == "unverifiable_claim":
+            # ADDED BY SOURAV -- "Caller states something the agent cannot
+            # verify" story. Reached only via agent/unverifiable_claim.py's
+            # guard in _resolve_intent() -- the claim_category in `slots`
+            # was already resolved deterministically there from a fixed,
+            # code-owned phrase list, never by the model. Same
+            # "guard-fired, no missing-slot prompt possible" shape as
+            # "symptom_department_routing" immediately above. See
+            # _finish_unverifiable_claim()'s own docstring for what happens
+            # next -- a fixed "can't confirm that" reply plus a human/
+            # callback offer, never a guess and never an echo of the claim.
+            await _finish_unverifiable_claim(session, slots.get("claim_category"), language=language)
             return
 
         if intent == "human_direct_request":

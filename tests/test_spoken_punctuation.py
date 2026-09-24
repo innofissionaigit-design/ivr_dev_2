@@ -86,6 +86,9 @@ from agent.reply_templates import (  # noqa: E402
     # ADDED BY SOURAV -- "Caller describes symptoms and asks what is
     # wrong" story.
     symptom_routing_reply,
+    # ADDED BY SOURAV -- "Caller states something the agent cannot
+    # verify" story.
+    unverifiable_claim_reply,
 )
 # ADDED BY SOURAV -- bugfix for the "Caller goes silent" story's close
 # message (validation report Bug #2): silence_close_reply() now branches
@@ -527,6 +530,13 @@ def _replies():
         yield (f"doctor-personal-request/unavailable-{language}",
                doctor_personal_request_reply(False, language))
 
+    # ADDED BY SOURAV -- "Caller states something the agent cannot verify"
+    # story. unverifiable_claim_reply() takes no caller-supplied value (a
+    # fixed template per language, like human_fallback_reply() above), so
+    # one case per language is enough.
+    for language in ("bengali", "english", "hinglish", "banglish"):
+        yield f"unverifiable-claim/{language}", unverifiable_claim_reply(language=language)
+
 
 CASES = list(_replies())
 
@@ -593,6 +603,9 @@ def test_the_gate_covers_every_public_reply_function():
         # ADDED BY SOURAV -- "Caller describes symptoms and asks what is
         # wrong" story. See the three yields above.
         "symptom_routing_reply",
+        # ADDED BY SOURAV -- "Caller states something the agent cannot
+        # verify" story. See the four yields above (one per language).
+        "unverifiable_claim_reply",
     }
     assert public <= exercised, (
         f"reply function(s) {sorted(public - exercised)} have no case in this gate"
