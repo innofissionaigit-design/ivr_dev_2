@@ -82,6 +82,16 @@ def _word_agreement(a: str, b: str) -> float:
         return 1.0
     if not wa or not wb:
         return 0.0
+    # Same characters, different word breaks: the two decoders HEARD the same
+    # thing and only split it differently -- on a live call CTC wrote
+    # "দ্বিতীয়টা" and RNNT "দ্বিতীয় টা". Compared as word sets that shares no
+    # word, scored 0.00, and the confidence gate threw away a turn both had
+    # heard identically -- exactly the one-word answers ("প্রথমটা",
+    # "দ্বিতীয়টা") that pick a slot or a date. This only ever raises a score
+    # to 1.0 when the texts are identical once spaces are removed; any real
+    # difference in what was heard is scored exactly as before.
+    if "".join(a.split()) == "".join(b.split()):
+        return 1.0
     return len(wa & wb) / len(wa | wb)
 
 

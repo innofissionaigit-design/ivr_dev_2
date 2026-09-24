@@ -134,5 +134,31 @@ class TestParseOtpIsUnaffectedByTheSharedWordList:
         assert parse_otp("4829") is None
 
 
+class TestAsrSpellingsOfEnglishDigitWords:
+    """Live reschedule call: the booked number was said as "... সেভেন এইট
+    নাইন" and accepted; to find the booking the same caller said it again and
+    the ASR wrote "... সেবেন নাইট নাইন ফোন নম্বার". "সেবেন" (seven) and
+    "নাইট" (eight, carrying the n of "seven") were not digits, the number came
+    up short, and the caller was asked for it three times."""
+
+    def test_the_live_reschedule_answer_is_the_booked_number(self):
+        said = "জিরো ওয়ান টু থ্রি ফোর ফাইভ সিক্স সেবেন নাইট নাইন ফোন নম্বার"
+        booked = "জিরো ওয়ান টু থ্রি ফোর ফাইভ সিক্স সেভেন এইট নাইন"
+        assert parse_phone(said) == parse_phone(booked) == "0123456789"
+
+    @pytest.mark.parametrize("seven", ["সেবেন", "সেভেন", "seven"])
+    def test_naait_after_seven_is_eight(self, seven):
+        assert parse_phone(f"ওয়ান টু থ্রি ফোর ফাইভ সিক্স {seven} নাইট নাইন জিরো") == "1234567890"
+
+    def test_naait_anywhere_else_is_not_a_digit(self):
+        # Opening a number, "নাইট" is as close to "nine" as to "eight":
+        # never guessed, so this nine-digit reading is refused.
+        assert parse_phone("নাইট সেবেন সেভেন সেবেন সেবেন ফোর সেভেন জিরো ফাইভ টু") is None
+
+    def test_a_number_that_is_really_short_is_still_refused(self):
+        # The caller's second try dropped the leading zero: nine digits.
+        assert parse_phone("ওয়ান টু থ্রি ফোর ফাইভ সিক্স সেভেন এইট নাইন") is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -220,6 +220,8 @@ from agent.slot_parse import (
     parse_cancel_choice, is_explicit_consent,
     # E13-S7: the one phone number in a whole booking sentence.
     find_phone_in_sentence,
+    # The phone part of a "name and phone" answer, numerals or words.
+    split_phone_span,
     # E13-S7 follow-up: what the caller's day word ("কাল") meant.
     spoken_day_word,
 )
@@ -1110,7 +1112,14 @@ def _clean_patient_name(text: str) -> str | None:
 
 
 _NUMERAL_RUN = re.compile(r"[0-9০-৯](?:[ \-]?[0-9০-৯])*")
-_PHONE_WORDS = re.compile(r"(?i)\b(?:phone|number|mobile|no)\b|ফোন|নম্বর|নাম্বার|মোবাইল")
+_PHONE_WORDS = re.compile(r"(?i)\b(?:phone|number|mobile|no)\b|ফোন|নম্বর|নম্বার|নাম্বার|নাম্বর|মোবাইল")
+# How a caller labels the name inside that answer: "রাজস্বী চক্রবর্তী রোগীর নাম",
+# "রোগীর নাম হল রাজস্বী". Only the QUALIFIED label is removed wherever it
+# sits; a bare leading "নাম" is left to _clean_patient_name, which strips at
+# most one filler on purpose (see its docstring).
+_NAME_LABEL = re.compile(r"(?:রোগীর|রুগীর|পেশেন্টের|patient'?s?)\s+নাম(?:\s+(?:হল|হলো|হচ্ছে))?")
+# Left dangling at the END once the phone part is cut away: "... নাম আর".
+_NAME_TAIL = re.compile(r"(?:\s+(?:আমার\s+নাম|নাম|আর|এবং|ও|হল|হলো|হচ্ছে))+$")
 
 
 def _starts_affirmative(text: str) -> bool:
@@ -1120,16 +1129,24 @@ def _starts_affirmative(text: str) -> bool:
 
 
 def _split_name_and_phone(text: str) -> tuple[str | None, str | None]:
-    """The answer to "name and phone?" -> (name, phone). Only a phone said
-    in numerals is split off; without one the whole answer is the name,
-    exactly as before."""
-    if not _NUMERAL_RUN.search(text):
-        return _clean_patient_name(text), None
-    phone = find_phone_in_sentence(text)
-    if not phone:
-        return _clean_patient_name(text), None
-    rest =_PHONE_WORDS.sub(" ", _NUMERAL_RUN.sub(" ", text))
+    """The answer to "name and phone?" -> (name, phone).
+
+    The phone part -- said in numerals OR as digit words, together with the
+    words that introduce it -- is cut out by split_phone_span() and never
+    becomes part of the name. That holds even when the number does not
+    parse: phone is then None and the caller is asked for it again, but
+    the name they gave is kept clean.
+
+    Bug fixed here: this used to split off only a phone said in NUMERALS
+    and otherwise returned the whole answer as the name. On a real call,
+    "রাজস্বী চক্রবর্তী রোগীর নাম আর ফোন নম্বার হল নাইট সেবেন সেভেন ..." was
+    read back as the patient's name -- label, phone phrase, digits and all --
+    and one "হ্যাঁ" would have written it into the appointment."""
+    before, after, phone = split_phone_span(text)
+    rest = _PHONE_WORDS.sub(" ", f"{before} {after}")
+    rest = _NAME_LABEL.sub(" ", rest)
     rest = re.sub(r"\s+", " ", rest).strip(" ,।!?.-")
+    rest = _NAME_TAIL.sub("", rest)
     return _clean_patient_name(rest), phone
 
 

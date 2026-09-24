@@ -323,7 +323,53 @@ def parse_date(text: str, today: datetime.date | None = None,
                     return None
             return candidate.isoformat()
 
+    # The same day of the month said as a WORD: "চব্বিশ তারিখে". The ASR writes a
+    # spoken day number as a word, not a numeral, so on a live call a caller's
+    # "চব্বিশ তারিখে" never became a date -- the day was then guessed from the
+    # model's reading instead ("next month"). Reached ONLY when everything above
+    # found nothing, and only for a day word directly before তারিখ/তারিখে (the
+    # numeral rule's exact shape), so no input that parsed before parses
+    # differently now. The word becomes the numeral and goes through the rule
+    # above, so the month roll-over is the same code.
+    nt = unicodedata.normalize("NFC", t)
+    m = _DAY_WORD_DATE.search(nt)
+    if m:
+        resolved = parse_date(f"{_DAY_WORDS[m.group(1)]} তারিখ", today=today)
+        # The rule above ignores month names. The agent's own readback names
+        # the month ("অক্টোবর মাসের পাঁচ তারিখ"), so a caller repeating it could
+        # otherwise get a day in the wrong month. A month that was said and is
+        # not this date's month -> None: asked again, never guessed.
+        named = [i + 1 for i, name in enumerate(_MONTH_NAMES) if _bn_bounded(name, nt)]
+        if resolved and named and int(resolved[5:7]) not in named:
+            return None
+        return resolved
+
     return None
+
+
+# Day-of-month words 1-31. The first spelling of each is the one the agent
+# itself speaks (bn_normalize.number_to_bn_words -- "সেপ্টেম্বর মাসের চব্বিশ
+# তারিখ"), so a caller repeating a readback is understood; a test pins the two
+# together. The rest are common spellings of the same numbers. Kept local so
+# this module stays a leaf (no bn_normalize import), like _LETTER_WORDS.
+_DAY_WORDS = {unicodedata.normalize("NFC", w): str(n) for n, words in {
+    1: ("এক",), 2: ("দুই",), 3: ("তিন",), 4: ("চার",), 5: ("পাঁচ",), 6: ("ছয়",),
+    7: ("সাত",), 8: ("আট",), 9: ("নয়",), 10: ("দশ",), 11: ("এগারো", "এগার"),
+    12: ("বারো", "বার"), 13: ("তেরো", "তের"), 14: ("চোদ্দো", "চোদ্দ", "চৌদ্দ"),
+    15: ("পনেরো", "পনের"), 16: ("ষোলো", "ষোল"), 17: ("সতেরো", "সতের"),
+    18: ("আঠারো", "আঠার"), 19: ("উনিশ",), 20: ("কুড়ি", "বিশ"), 21: ("একুশ",),
+    22: ("বাইশ",), 23: ("তেইশ",), 24: ("চব্বিশ",), 25: ("পঁচিশ",), 26: ("ছাব্বিশ",),
+    27: ("সাতাশ",), 28: ("আটাশ",), 29: ("ঊনত্রিশ", "উনত্রিশ"), 30: ("ত্রিশ", "তিরিশ"),
+    31: ("একত্রিশ",),
+}.items() for w in words}
+# Month names as the agent speaks them (bn_normalize._MONTHS_BN), January first.
+_MONTH_NAMES = tuple(unicodedata.normalize("NFC", w) for w in (
+    "জানুয়ারি", "ফেব্রুয়ারি", "মার্চ", "এপ্রিল", "মে", "জুন", "জুলাই", "আগস্ট",
+    "সেপ্টেম্বর", "অক্টোবর", "নভেম্বর", "ডিসেম্বর"))
+_DAY_WORD_DATE = re.compile(
+    rf"(?<!{_BN_CHAR})("
+    + "|".join(re.escape(w) for w in sorted(_DAY_WORDS, key=len, reverse=True))
+    + rf")\s*(?:তারিখ|তারিখে)(?!{_BN_CHAR})")
 
 
 _HOUR_WORD_TO_NUM = {
@@ -470,10 +516,32 @@ _BN_DIGIT_WORDS = {_nfc(k): v for k, v in {
     "চার": "4", "ফোর": "4",
     "পাঁচ": "5", "ফাইভ": "5",
     "ছয়": "6", "ছ": "6", "সিক্স": "6",
-    "সাত": "7", "সেভেন": "7",
+    # "সেবেন" is how the live ASR spelled "seven" on a real call (several
+    # times in one phone number). Unambiguous -- no Bengali word or other
+    # digit sounds like it. "নাইট" is NOT in this table: it is only a digit
+    # right after "seven" -- see _is_liaison_eight() below.
+    "সাত": "7", "সেভেন": "7", "সেবেন": "7",
     "আট": "8", "এইট": "8",
     "নয়": "9", "নাইন": "9",
 }.items()}
+
+# "Seven eight" said in one breath carries the n of "seven" onto "eight", and
+# the ASR writes that "eight" as "নাইট". Seen on two live calls, both times as
+# "... সেবেন নাইট নাইন ..." -- 7 8 9, in a number the same caller elsewhere
+# read as "সেভেন এইট নাইন" -- while "nine" in those same sentences came out
+# as "নাইন". So "নাইট" is read as 8 ONLY right after "seven". Anywhere else
+# (e.g. opening a number) it is as close to "nine" as to "eight"; it stays
+# unrecognised there, the number comes up short, and the caller is asked
+# again, because a guessed digit sends a confirmation -- or a report -- to
+# someone else. The "7" covers parse_phone, which has already turned an
+# English "seven" into a numeral by the time it reads tokens.
+_SEVEN_TOKENS = frozenset(_nfc(w) for w in ("সেভেন", "সেবেন", "seven", "7"))
+_LIAISON_EIGHT = _nfc("নাইট")
+
+
+def _is_liaison_eight(tok: str, prev: str | None) -> bool:
+    return tok == _LIAISON_EIGHT and prev is not None and prev.lower() in _SEVEN_TOKENS
+
 
 # How a Latin letter in a confirmation reference is spoken. The reverse of
 # bn_normalize._LETTER_BN, kept local so this module stays a leaf; a
@@ -559,8 +627,11 @@ def parse_phone(text: str) -> str | None:
     words_resolved = _DIGIT_WORD_RE.sub(
         lambda m: _DIGIT_WORDS[m.group(1).lower()], translated,
     )
-    digits = "".join(_BN_DIGIT_WORDS.get(tok) or re.sub(r"\D", "", tok)
-                     for tok in _tokens(words_resolved))
+    toks = _tokens(words_resolved)
+    digits = "".join(
+        "8" if _is_liaison_eight(tok, toks[i - 1] if i else None)
+        else (_BN_DIGIT_WORDS.get(tok) or re.sub(r"\D", "", tok))
+        for i, tok in enumerate(toks))
     if len(digits) == 10:
         return digits
     # A number read as WORDS has no boundary a stray "one"/"এক" cannot cross.
@@ -838,6 +909,111 @@ def find_phone_in_sentence(text: str) -> str | None:
     # read by parse_phone, with every numeral run (a time, a date) removed
     # first so their digits cannot be counted into it.
     return parse_phone(_RE_DIGIT_RUN.sub(" ", t))
+
+
+# Words that introduce a phone number inside a longer answer. Bengali as
+# substrings (no \b on vowel signs); "নম্বার" is the spelling the live ASR
+# produced for "নম্বর" on a real call. Bare English "no" is left out on
+# purpose: it is also the word for a refusal.
+_PHONE_CUE = re.compile(
+    r"(?i)\b(?:phone|number|mobile|contact)\b|ফোন|মোবাইল|নম্বর|নম্বার|নাম্বার|নাম্বর")
+# Connectors that belong to the phone phrase when they sit right before its
+# cue ("... আর ফোন নম্বর হল ..."), so they leave with it instead of being
+# left dangling on the end of the name.
+_PHONE_LEAD_IN = frozenset(_nfc(w) for w in ("আর", "এবং", "ও", "আমার", "and", "my"))
+_NAME_WORDS = frozenset(_nfc(w) for w in ("নাম", "নামটা", "নামটি", "name"))
+_RE_SPAN_TOKEN = re.compile(r"[^\s,।\-–—.:/]+")
+# A run of digit tokens this long is a phone number being read out, not a
+# time ("10:30" -> 4) or a count. Kept below 10 so a number with one word
+# the ASR garbled still counts as a phone the caller was saying.
+_MIN_PHONE_RUN_DIGITS = 6
+
+
+def _token_digits(tok: str, prev: str | None = None) -> str:
+    """Digits a single token stands for: numerals as-is, a digit word as
+    its digit, anything else as "". prev is the token before it, for the
+    one digit word that depends on its neighbour (_is_liaison_eight)."""
+    if tok.isdigit():
+        return tok
+    if _is_liaison_eight(tok, prev):
+        return "8"
+    return _BN_DIGIT_WORDS.get(tok) or _DIGIT_WORDS.get(tok.lower(), "")
+
+
+def split_phone_span(text: str) -> tuple[str, str, str | None]:
+    """Split a spoken answer to "name and phone number?" around the phone
+    part -> (before, after, phone).
+
+    before/after are the text on either side of the phone part (NFC), for
+    the caller to read a name out of; phone is the ten digits, or None when
+    the phone part is there but does not parse. With no phone part at all
+    the answer is returned whole: (text, "", None).
+
+    Why this exists: main.py used to split off a phone only when it was said
+    in NUMERALS, and otherwise took the whole answer as the patient's name.
+    A real caller said
+
+        "রাজস্বী চক্রবর্তী রোগীর নাম আর ফোন নম্বার হল নাইট সেবেন সেভেন ..."
+
+    -- digits as English words, in Bengali script -- and the entire sentence,
+    number included, was read back as the patient's name, one "yes" away
+    from being written into the appointment.
+
+    The phone part is found from a cue word ("ফোন", "নম্বর", ...) or, with
+    no cue, from a run of digit tokens. It is removed EVEN WHEN IT DOES NOT
+    PARSE: a number the caller will be asked for again must still not end up
+    inside their name.
+    """
+    t = _nfc(text or "")
+    # translate() maps one character to one character, so spans found in
+    # the digit-normalised copy are valid indices into t.
+    probe = t.translate(_BN_DIGITS)
+    toks = [(m.start(), m.end(), m.group()) for m in _RE_SPAN_TOKEN.finditer(probe)]
+
+    def first_run(from_idx: int) -> tuple[int, int] | None:
+        """(first, last) token index of the first run of digit tokens at or
+        after from_idx that is long enough to be a phone number."""
+        def dig(k: int) -> str:
+            return _token_digits(toks[k][2], toks[k - 1][2] if k else None)
+
+        i = from_idx
+        while i < len(toks):
+            if not dig(i):
+                i += 1
+                continue
+            j, digits = i, ""
+            while j < len(toks) and dig(j):
+                digits += dig(j)
+                j += 1
+            if len(digits) >= _MIN_PHONE_RUN_DIGITS:
+                return i, j - 1
+            i = j
+        return None
+
+    cue = next((k for k, (_, _, tok) in enumerate(toks) if _PHONE_CUE.search(tok)), None)
+    if cue is not None:
+        start = cue
+        while start > 0 and toks[start - 1][2] in _PHONE_LEAD_IN:
+            start -= 1
+        run = first_run(cue)
+        if run:
+            end_char = toks[run[1]][1]
+        else:
+            # The cue is there but the digits are not readable. The phone
+            # part then runs to the next mention of a name ("নাম ...") or to
+            # the end of the answer.
+            # Whole tokens only: "নাম্বার" (number) contains "নাম" (name).
+            nxt = next((k for k in range(cue + 1, len(toks))
+                        if toks[k][2].lower() in _NAME_WORDS), None)
+            end_char = toks[nxt][0] if nxt is not None else len(t)
+        seg_start = toks[start][0]
+    else:
+        run = first_run(0)
+        if not run:
+            return t, "", None
+        seg_start, end_char = toks[run[0]][0], toks[run[1]][1]
+
+    return t[:seg_start], t[end_char:], find_phone_in_sentence(t[seg_start:end_char])
 
 
 # "Caller asks for the earliest available appointment". Code, not the model,

@@ -1,8 +1,0 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
-*.db
-static/fallback_audio/*.wav
-official_doc
-Claude outputs
