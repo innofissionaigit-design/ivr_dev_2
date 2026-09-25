@@ -1,16 +1,25 @@
+# MERGE NOTE (sourav) -- this test file differed between dev_sourav and
+# dev_rajarshee. Merged 3-way against their common ancestor (6cbeb0b ==
+# test): every change from each branch touches a different part of the
+# file, so it merged with NO conflicts -- rule 1, both sides kept whole.
+# Changed regions vs the ancestor: 0 from dev_sourav, 40 from
+# dev_rajarshee. Checked after merging: parses, and no test function or
+# class name is defined twice (which would silently drop a test).
 """ADDED BY SOURAV -- "Caller asks two questions in one breath" story.
 
 Covers all three layers this story touches, mirroring
 tests/test_phase1_intents_and_dispatch.py's own established 3-place
 pattern (see that file's module docstring):
 
-  1. agent/llm.py: _validate() now accepts the new "intents" array shape
-     (TestMultiIntentSchema), with the exact same fatal-vs-tolerated
-     semantics the legacy single-intent shape always had, plus
-     _apply_backward_compat_mirror()'s own contract (TestBackwardCompatMirror).
-  2. agent/semantic_cache.py: a multi-intent value is never L2 (fuzzy)
-     eligible, while an ordinary single-intent value's eligibility is
-     completely unaffected by this story (TestSemanticCacheMultiIntentGuard).
+  1. agent/llm.py: _validate() accepts the optional "parts" list
+     (TestMultiPartSchema), with the same fatal-vs-tolerated semantics the
+     single-intent shape always had. NOTE: this story originally shipped
+     an "intents" array with a backward-compatibility mirror; both were
+     later replaced by "parts" (see that section's own comment), and the
+     mirror's tests went with them.
+  2. agent/semantic_cache.py: a multi-part value is never L2 (fuzzy)
+     eligible, while an ordinary single-part value's eligibility is
+     completely unaffected by this story (TestSemanticCacheMultiPartGuard).
   3. main.py AND main_pcm.py dispatch -- parametrized over BOTH modules
      wherever the assertion is transport-independent, so a gap between the
      two (the exact "test_sample" bug this codebase has already hit once
@@ -33,7 +42,7 @@ import types
 
 import pytest
 
-from agent.llm import _validate, _apply_backward_compat_mirror
+from agent.llm import _validate, _SLOT_KEYS as _ALL_SLOT_KEYS
 from agent.semantic_cache import SemanticCache
 from agent.tools_client import ToolCallError
 from agent.reply_templates import (
@@ -53,11 +62,6 @@ def run(coro):
     return asyncio.run(coro)
 
 
-_ALL_SLOT_KEYS = ("test_name", "doctor_name", "department", "date", "time_slot",
-                  "patient_name", "phone", "package_name", "info_topic",
-                  "insurance_provider_name")
-
-
 def _empty_slots(**overrides):
     slots = {k: None for k in _ALL_SLOT_KEYS}
     slots.update(overrides)
@@ -65,146 +69,153 @@ def _empty_slots(**overrides):
 
 
 # --------------------------------------------------------------------- #
-# agent/llm.py -- new "intents" array schema
+# agent/llm.py -- the optional "parts" list
+#
+# The "intents" array this story originally shipped was REPLACED by
+# "parts" (agent/llm.py's _validate(), agent/turn_parts.py). Two things
+# changed with it, and the assertions below are written against them:
+#
+#   1. The top-level {intent, slots} pair is authoritative and never went
+#      away, so nothing is mirrored back onto it any more -- normalise()
+#      builds the parts list FROM the top level instead, forcing parts[0]
+#      to be the head. (The old _apply_backward_compat_mirror() and its
+#      TestBackwardCompatMirror went with the "intents" key.)
+#   2. "parts" is ADDITIVE: its absence is not an error, and a malformed
+#      one is dropped rather than repaired, so a degraded extraction
+#      becomes a known-good single-part turn instead of a failed one.
+#      Only an invalid intent, a non-dict `slots`, or a non-dict entry
+#      inside `parts` is fatal.
 # --------------------------------------------------------------------- #
 
-class TestMultiIntentSchema:
-    def test_validate_accepts_a_two_item_intents_array(self):
-        data = {
-            "intents": [
-                {"intent": "test_rate", "slots": _empty_slots(test_name="CBC")},
-                {"intent": "walkin_eligibility", "slots": _empty_slots(test_name="CBC")},
-            ],
-            "direct_reply_bn": None,
-        }
+def _part(intent, **slot_overrides):
+    return {"intent": intent, "slots": _empty_slots(**slot_overrides)}
+
+
+def _turn(*parts, direct_reply_bn=None, include_parts=True):
+    """A whole extraction: the top-level pair is parts[0] -- the invariant
+    turn_parts.normalise() establishes -- plus the optional list."""
+    head = parts[0]
+    data = {"intent": head["intent"], "slots": head["slots"],
+            "direct_reply_bn": direct_reply_bn}
+    if include_parts:
+        data["parts"] = list(parts)
+    return data
+
+
+class TestMultiPartSchema:
+    def test_validate_accepts_a_two_part_turn(self):
+        data = _turn(_part("test_rate", test_name="CBC"),
+                     _part("walkin_eligibility", test_name="CBC"))
         ok, errors = _validate(data)
         assert ok is True, errors
 
-    def test_validate_accepts_a_one_item_intents_array(self):
+    def test_validate_accepts_a_one_part_turn(self):
         # The common case wrapped in the new shape -- length-1 is valid too.
-        data = {"intents": [{"intent": "test_rate", "slots": _empty_slots(test_name="CBC")}],
-                "direct_reply_bn": None}
+        data = _turn(_part("test_rate", test_name="CBC"))
         ok, errors = _validate(data)
         assert ok is True, errors
 
-    def test_validate_still_accepts_the_legacy_single_intent_shape(self):
-        # No "intents" key at all -- every pre-this-story caller/test.
-        data = {"intent": "test_rate", "slots": _empty_slots(test_name="CBC"), "direct_reply_bn": None}
+    def test_validate_still_accepts_a_turn_with_no_parts_key(self):
+        # No "parts" key at all -- every pre-this-story caller/test, and
+        # every model that ignores the field entirely.
+        data = _turn(_part("test_rate", test_name="CBC"), include_parts=False)
         ok, errors = _validate(data)
         assert ok is True, errors
 
-    def test_validate_rejects_empty_intents_array(self):
-        data = {"intents": [], "direct_reply_bn": None}
+    def test_empty_parts_list_is_tolerated_not_fatal(self):
+        # DIFFERS from the retired "intents" shape, which rejected an empty
+        # array. `parts` is additive: an empty one just means the top-level
+        # pair describes the whole turn.
+        data = _turn(_part("test_rate", test_name="CBC"))
+        data["parts"] = []
         ok, errors = _validate(data)
-        assert ok is False
+        assert ok is True, errors
 
-    def test_validate_rejects_non_list_intents(self):
-        data = {"intents": "test_rate", "direct_reply_bn": None}
+    def test_non_list_parts_is_dropped_not_fatal(self):
+        # DIFFERS from the retired "intents" shape, which rejected this.
+        # Dropped rather than repaired, so the log says what the model
+        # produced and the fallback is a known-good single-part turn.
+        data = _turn(_part("test_rate", test_name="CBC"))
+        data["parts"] = "test_rate"
         ok, errors = _validate(data)
-        assert ok is False
+        assert ok is True, errors
+        assert "parts" not in data
 
-    def test_validate_rejects_invalid_intent_inside_the_array(self):
-        data = {"intents": [{"intent": "made_up_intent", "slots": _empty_slots()}],
-                "direct_reply_bn": None}
+    def test_validate_rejects_invalid_intent_inside_a_part(self):
+        data = _turn(_part("test_rate", test_name="CBC"),
+                     _part("made_up_intent"))
         ok, errors = _validate(data)
         assert ok is False
         assert any("invalid intent" in e for e in errors)
 
-    def test_validate_tolerates_a_missing_slot_key_inside_one_array_item(self):
+    def test_validate_tolerates_a_missing_slot_key_inside_one_part(self):
         # RULE (unchanged from the legacy shape): an individual missing
         # slot dict key is never fatal by itself.
-        slots = _empty_slots(test_name="CBC")
-        del slots["insurance_provider_name"]
-        data = {"intents": [{"intent": "test_rate", "slots": slots}], "direct_reply_bn": None}
+        second = _part("walkin_eligibility", test_name="CBC")
+        del second["slots"]["insurance_provider_name"]
+        data = _turn(_part("test_rate", test_name="CBC"), second)
         ok, errors = _validate(data)
         assert ok is True, errors
         assert any("insurance_provider_name" in e and "missing" in e for e in errors)
 
-    def test_validate_one_bad_item_fails_the_whole_batch(self):
+    def test_one_bad_part_fails_the_whole_turn(self):
         # Not a partial-success shape -- either the whole extraction is
         # schema-valid or extract_intent() retries the whole turn.
-        data = {
-            "intents": [
-                {"intent": "test_rate", "slots": _empty_slots(test_name="CBC")},
-                {"intent": "not_a_real_intent", "slots": _empty_slots()},
-            ],
-            "direct_reply_bn": None,
-        }
+        data = _turn(_part("test_rate", test_name="CBC"),
+                     _part("not_a_real_intent"))
         ok, errors = _validate(data)
         assert ok is False
 
-    def test_validate_rejects_non_dict_array_item(self):
-        data = {"intents": ["test_rate"], "direct_reply_bn": None}
+    def test_validate_rejects_non_dict_part(self):
+        data = _turn(_part("test_rate", test_name="CBC"))
+        data["parts"].append("walkin_eligibility")
         ok, errors = _validate(data)
         assert ok is False
+        assert any("expected object" in e for e in errors)
 
-    def test_direct_reply_bn_stripped_when_intents_has_more_than_one_entry(self):
-        # Even if the intent WERE smalltalk, direct_reply_bn only survives
-        # for an intents array of length exactly 1.
-        data = {
-            "intents": [
-                {"intent": "smalltalk", "slots": _empty_slots()},
-                {"intent": "test_rate", "slots": _empty_slots(test_name="CBC")},
-            ],
-            "direct_reply_bn": "hi there",
-        }
+    def test_direct_reply_bn_stripped_when_the_turn_has_more_than_one_part(self):
+        # Even when the top-level intent IS smalltalk, direct_reply_bn only
+        # survives a turn of exactly one part.
+        data = _turn(_part("smalltalk"), _part("test_rate", test_name="CBC"),
+                     direct_reply_bn="hi there")
         _validate(data)
         assert data["direct_reply_bn"] is None
 
-    def test_direct_reply_bn_kept_for_a_single_smalltalk_entry(self):
-        data = {"intents": [{"intent": "smalltalk", "slots": _empty_slots()}],
-                "direct_reply_bn": "hi there"}
+    def test_direct_reply_bn_kept_for_a_single_smalltalk_part(self):
+        data = _turn(_part("smalltalk"), direct_reply_bn="hi there")
         ok, errors = _validate(data)
         assert ok is True, errors
         assert data["direct_reply_bn"] == "hi there"
-
-
-class TestBackwardCompatMirror:
-    def test_mirrors_first_intent_onto_top_level_keys(self):
-        data = {
-            "intents": [
-                {"intent": "test_rate", "slots": _empty_slots(test_name="CBC")},
-                {"intent": "walkin_eligibility", "slots": _empty_slots(test_name="CBC")},
-            ],
-            "direct_reply_bn": None,
-        }
-        _apply_backward_compat_mirror(data)
-        assert data["intent"] == "test_rate"
-        assert data["slots"] == _empty_slots(test_name="CBC")
-
-    def test_noop_when_intents_key_absent(self):
-        data = {"intent": "test_rate", "slots": _empty_slots(test_name="CBC"), "direct_reply_bn": None}
-        _apply_backward_compat_mirror(data)
-        assert data["intent"] == "test_rate"
 
 
 # --------------------------------------------------------------------- #
 # agent/semantic_cache.py
 # --------------------------------------------------------------------- #
 
-class TestSemanticCacheMultiIntentGuard:
-    def test_multi_intent_value_never_l2_eligible(self):
+class TestSemanticCacheMultiPartGuard:
+    def test_multi_part_value_never_l2_eligible(self):
         value = {
             "intent": "test_rate", "slots": {"test_name": "CBC"},
-            "intents": [
+            "parts": [
                 {"intent": "test_rate", "slots": {"test_name": "CBC"}},
                 {"intent": "walkin_eligibility", "slots": {"test_name": "CBC"}},
             ],
         }
         assert SemanticCache._is_l2_eligible(value) is False
 
-    def test_single_item_intents_array_unaffected(self):
+    def test_single_part_value_unaffected(self):
         value = {
             "intent": "test_rate", "slots": {"test_name": "CBC"},
-            "intents": [{"intent": "test_rate", "slots": {"test_name": "CBC"}}],
+            "parts": [{"intent": "test_rate", "slots": {"test_name": "CBC"}}],
         }
         assert SemanticCache._is_l2_eligible(value) is True
 
-    def test_ordinary_value_with_no_intents_key_unaffected(self):
+    def test_ordinary_value_with_no_parts_key_unaffected(self):
         # Every value before this story, and every ordinary one-question
         # turn after it.
         value = {"intent": "test_rate", "slots": {"test_name": "CBC"}}
         assert SemanticCache._is_l2_eligible(value) is True
+
 
 
 # --------------------------------------------------------------------- #
@@ -257,6 +268,15 @@ class _AsyncNoOp:
 
 class FakeASRResult:
     text = "কিছু একটা বললাম"
+    # The confidence gate (agent/confidence.py) reads these off every ASR
+    # result: no agreement signal at all is treated as DOUBT, so a fake
+    # without them gets echoed back ("did I hear you right?") and never
+    # reaches the dispatch these tests are about. Full agreement from two
+    # decoders = PROCEED, which is the turn being exercised here.
+    decoder_agreement = 1.0
+    decoder_used = "rnnt"
+    ctc_words = 3
+    rnnt_words = 3
 
 
 class FakeASR:
@@ -264,10 +284,20 @@ class FakeASR:
         return FakeASRResult()
 
 
-def make_session(pending=None):
+def make_session(transport, pending=None):
+    """The attributes a dispatch touches on a real CallSession. It cannot be
+    built directly here -- its __init__ wants a live WebSocket and a temp
+    recording file -- so the fields _dispatch_turn_inner reads are mirrored
+    instead, from the SAME modules the transport builds them from."""
     return types.SimpleNamespace(
-        call_id="test-call-1", pending=pending,
+        call_id="test-call-1", pending=pending, utt_seq=0,
         dispatch_lock=asyncio.Lock(), send_json=_AsyncNoOp(),
+        call_state=transport.call_state_mod.build(),
+        answer_ledger=transport.answer_ledger.AnswerLedger(),
+        state=transport.DialogueState(),
+        confirm_attempts=0, deferred=None,
+        last_activity=0.0, last_heartbeat=0.0, processed_until_s=0.0,
+        agent_speaking=False, speak_deadline=0.0, resync_pending=False,
     )
 
 
@@ -293,15 +323,17 @@ def stub(transport, monkeypatch):
     return types.SimpleNamespace(spoken=spoken, tools=tools, transport=transport)
 
 
-def _dispatch(stub, monkeypatch, intents, tmp_path, pending=None):
+def _dispatch(stub, monkeypatch, parts, tmp_path, pending=None):
     async def fake_resolve_intent(session, text):
+        # turn_parts.normalise() forces parts[0] to be the top-level pair,
+        # so an extraction always agrees with itself here.
         return {
-            "intents": intents,
-            "intent": intents[0]["intent"], "slots": intents[0]["slots"],
+            "parts": parts,
+            "intent": parts[0]["intent"], "slots": parts[0]["slots"],
         }
 
     monkeypatch.setattr(stub.transport, "_resolve_intent", fake_resolve_intent)
-    session = make_session(pending=pending)
+    session = make_session(stub.transport, pending=pending)
     wav_path = tmp_path / "utt.wav"
     wav_path.write_bytes(b"")
     run(stub.transport._dispatch_turn(session, str(wav_path)))
@@ -455,7 +487,7 @@ class TestMultiIntentDispatch:
 
     def test_single_intent_turn_is_completely_unaffected(self, stub, monkeypatch, tmp_path):
         # The fast_path/solo-extraction backward-compatibility guarantee:
-        # a length-1 "intents" array takes the ORIGINAL if/elif chain, not
+        # a length-1 "parts" list takes the ORIGINAL if/elif chain, not
         # _dispatch_multi_intent_turn at all.
         session = _dispatch(stub, monkeypatch, [_CBC_RATE], tmp_path)
 
@@ -478,7 +510,7 @@ class TestTransportParity:
     @pytest.mark.parametrize("marker", [
         "async def _dispatch_multi_intent_turn(",
         "async def _resolve_combinable_intent_fragment(",
-        'intents_list = data.get("intents")',
+        "parts = turn_parts.normalise(data)",
         "_MULTI_INTENT_NEEDS_SEPARATE_FLOW = ",
         "_MULTI_INTENT_NO_FRAGMENT = ",
     ])
@@ -506,12 +538,12 @@ class TestTransportParity:
 
             async def fake_resolve_intent(session, text):
                 return {
-                    "intents": [_CBC_RATE, _CBC_WALKIN],
+                    "parts": [_CBC_RATE, _CBC_WALKIN],
                     "intent": _CBC_RATE["intent"], "slots": _CBC_RATE["slots"],
                 }
 
             monkeypatch.setattr(transport, "_resolve_intent", fake_resolve_intent)
-            session = make_session()
+            session = make_session(transport)
             wav_path = tmp_path / f"utt-{transport.__name__}.wav"
             wav_path.write_bytes(b"")
             run(transport._dispatch_turn(session, str(wav_path)))

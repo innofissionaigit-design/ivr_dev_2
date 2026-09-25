@@ -360,7 +360,14 @@ class SemanticCache:
         # purpose: _entity_guard() only ever runs on an L2 hit -- see its
         # own call site in get() -- so an intent excluded from L2 entirely
         # never needs entries added there; they would be dead code.)
-        if intent in ("book_appointment", "insurance_coverage", "compare_options"):
+        if intent in ("book_appointment", "insurance_coverage", "compare_options",
+                      # E4-S3: identity-bound and a WRITE flow. A fuzzy hit
+                      # that turned "move it" into "book it" (or back) is
+                      # the original two-appointments bug.
+                      "reschedule_appointment",
+                      # E4-S4: identity-bound, a WRITE flow, and one word
+                      # ("বাতিল" vs "বদল") away from reschedule.
+                      "cancel_appointment"):
             return False
 
         required = _REQUIRED_ENTITY_FOR_INTENT.get(intent)

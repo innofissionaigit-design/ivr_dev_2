@@ -246,3 +246,61 @@ def resolve(transcript: str, date_expr: str | None = None,
         return DateSpan(span[0], span[1], date_expr, SOURCE_INTERPRETED)
 
     return DateSpan(None, None, "none", SOURCE_ABSENT)
+
+
+# ---------------------------------------------------------------------------
+# "Caller says tomorrow, day after, or next Monday"
+# (docs/stories/relative-dates-plan.md). THE rule for every flow -- booking,
+# availability, department -- wherever a spoken day becomes a calendar date:
+#
+#     the code parser (the caller's own words) and the model's reading
+#     (its expression or its copied date words -- turned into a date HERE)
+#     agree            -> CONFIRM that date with the caller
+#     differ, or only
+#     one has a date   -> ASK, offering the date(s) found
+#     a range          -> read the range back and ask which day
+#     nothing          -> no day was said
+#
+# Both dates compared are computed by code; the model only ever named a
+# meaning. When the model was not consulted (the fast path), its slot holds a
+# date the fast path computed from the same words, so the two agree and the
+# date is confirmed.
+
+@dataclasses.dataclass(frozen=True)
+class DateDecision:
+    kind: str                       # "absent" | "confirm" | "ask" | "range"
+    date: str | None = None         # confirm: the date
+    candidates: tuple = ()          # ask: 0-2 dates to offer
+    start: str | None = None        # range
+    end: str | None = None
+    said: str | None = None         # what the caller's day word meant ("tomorrow", "monday")
+
+
+def decide(transcript: str, date_expr: str | None = None, date_words: str | None = None,
+           today: datetime.date | None = None) -> DateDecision:
+    from agent.slot_parse import parse_date, spoken_day_word
+
+    parser = parse_date(transcript, today=today)
+    said = spoken_day_word(transcript)
+
+    model, span = None, None
+    if date_expr and date_expr != EXPRESSION_UNMAPPED:
+        span = resolve_expression(date_expr, today=today)
+        if span and span[0] == span[1]:
+            model = span[0]
+            if said is None:
+                said = date_expr[5:] if date_expr.startswith("next_") else date_expr
+                if said not in _WEEKDAY_INDEX and said not in ("today", "tomorrow", "day_after_tomorrow"):
+                    said = None
+    if model is None and date_words:
+        model = parse_date(date_words, today=today)
+
+    if span and span[0] != span[1]:
+        if parser is None:
+            return DateDecision("range", start=span[0], end=span[1])
+        return DateDecision("ask", candidates=(parser,), said=said)
+    if parser is None and model is None:
+        return DateDecision("ask") if date_expr == EXPRESSION_UNMAPPED else DateDecision("absent")
+    if parser == model:
+        return DateDecision("confirm", date=parser, said=said)
+    return DateDecision("ask", candidates=tuple(d for d in (parser, model) if d), said=said)

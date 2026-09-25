@@ -40,6 +40,8 @@ survives.
 """
 from __future__ import annotations
 
+import datetime
+
 import re
 
 # STORY [Answer Quality and Grounding]
@@ -1367,6 +1369,10 @@ def booking_reply(slots: dict, result: dict, language: str = "bengali") -> str:
 
     reason = result.get("reason")
     if reason == "slot_taken":
+        # "Requested slot is already taken": the nearest free times that
+        # day and the same time on the nearest other day, in one sentence.
+        if result.get("alternative_slots") or result.get("other_day_slot"):
+            return booking_slot_taken_prompt(slots, result, language=language)
         alts = result.get("alternative_slots") or []
         if alts:
             # story title: Answers sound like a person, not a database row
@@ -1445,6 +1451,14 @@ def booking_confirmation_prompt(slots: dict, language: str = "bengali") -> str:
     """
     doctor = _spoken_doctor_name(slots, {}, language=language)
     date = slots.get("date") or ""
+    # E13-S7 follow-up: a date the agent CALCULATED from the caller's day
+    # word ("কাল") is read back with that word and its weekday -- "আগামীকাল
+    # রবিবার, সেপ্টেম্বর মাসের কুড়ি তারিখ" -- so the caller confirms what the
+    # agent worked out, not just a date. Unchanged when the caller said the
+    # date itself (no date_said on the slots).
+    day = _spoken_day(slots, language)
+    if day:
+        date = f"{day}, {date}"
     time_slot = slots.get("time_slot") or ""
     patient_name = slots.get("patient_name") or ""
     phone = slots.get("phone") or ""
@@ -3900,3 +3914,707 @@ def silence_close_reply(close_state: str, language: str = "bengali") -> str:
     else:  # bengali
         return ("কোনো সাড়া না পাওয়ায় আমি কলটি এখানে শেষ করছি। আপনি যা জিজ্ঞাসা "
                  "করেছিলেন তার উত্তর দেওয়া হয়ে গেছে। ধন্যবাদ, ভালো থাকবেন।")
+
+
+# ============================================================== reschedule
+# story title: Caller moves an existing appointment (E4-S3)
+# user story: As a patient whose plans changed, I want to move my appointment
+#   without cancelling it, so that I do not lose my place entirely.
+# acceptance criteria: The booking is found by contact number, name or
+#   reference. The new slot is swapped atomically, holding the old one until
+#   the new commits, and a failed swap leaves the original intact.
+#   Confirmation is sent on both channels.
+#
+# Every date, time, doctor and reference below is substituted from the
+# clinic-api lookup / availability / PATCH response or from a local parser --
+# never from the model. Bengali only, like the booking readback.
+#
+# Three rules the sentences keep:
+#   * Doctors are spoken by their Bengali alias ("ডাঃ সেন"), never the English
+#     label, which is Latin script and would be dropped by the tokenizer.
+#   * No field-label colon (E12-S3, tests/test_spoken_punctuation.py). Times
+#     and dates keep their digits here; verbalize() turns them into words.
+#   * _UNCHANGED -- "your earlier appointment is as it was" -- is said ONLY
+#     where it is provably true: the move was refused before any write, or
+#     the write provably never happened. NEVER on a conflict (somebody else
+#     changed it), NEVER when the outcome is unknown, never on success.
+#     Nor is an SMS ever claimed: nothing sends one yet (E1-S10).
+
+_UNCHANGED = "আপনার আগের অ্যাপয়েন্টমেন্ট যেমন ছিল তেমনই আছে।"
+_ORDINAL_WORDS = ("প্রথমটা", "দ্বিতীয়টা", "তৃতীয়টা")
+_MATCH_COUNT_WORDS = {2: "দুটো", 3: "তিনটে"}
+
+
+def _resched_doctor(appointment: dict) -> str:
+    alias = appointment.get("doctor_name_bn")
+    return f"ডাঃ {alias}" if alias else "ডাক্তার"
+
+
+def _resched_slot(date_iso: str, time_slot: str) -> str:
+    return f"{date_iso} তারিখে, সময় {time_slot}"
+
+
+def reschedule_prompt(field: str) -> str:
+    """The question for one step of the reschedule flow. Also the re-ask
+    after a reply that could not be parsed."""
+    prompts = {
+        "phone": ("অ্যাপয়েন্টমেন্টটা খুঁজে বের করতে, যে ফোন নম্বরে বুক করেছিলেন সেটা বলবেন? "
+                  "কনফার্মেশন নম্বর থাকলে সেটাও বলতে পারেন।"),
+        "name": "রোগীর নামটা বলবেন?",
+        "pick": "কোনটা সরাতে চান, প্রথম, দ্বিতীয় না তৃতীয়?",
+        "date": "কোন দিনে সরাতে চান?",
+        "time_slot": "কোন সময়ে চান, একটু বলবেন?",
+        "confirm": "অ্যাপয়েন্টমেন্টটা সরাব কিনা, হ্যাঁ বা না বলবেন?",
+    }
+    return prompts.get(field, "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
+
+
+def reschedule_found_prompt(appointment: dict) -> str:
+    """Exactly one appointment matched. Say which, then ask for the day."""
+    return (f"আপনার অ্যাপয়েন্টমেন্ট পেয়েছি, {_resched_doctor(appointment)}, "
+            f"{_resched_slot(appointment['date'], appointment['time_slot'])}। কোন দিনে সরাতে চান?")
+
+
+def reschedule_pick_prompt(matches: list[dict]) -> str:
+    """Two or three matched (E14-S4). Read them out; never pick the likeliest."""
+    shown = matches[:len(_ORDINAL_WORDS)]
+    parts = [f"{_ORDINAL_WORDS[i]} {_resched_doctor(m)}, {_resched_slot(m['date'], m['time_slot'])}"
+             for i, m in enumerate(shown)]
+    choices = "প্রথম না দ্বিতীয়" if len(shown) == 2 else "প্রথম, দ্বিতীয় না তৃতীয়"
+    count = _MATCH_COUNT_WORDS.get(len(shown), "কয়েকটা")
+    return (f"এই তথ্যে {count} অ্যাপয়েন্টমেন্ট পেয়েছি। " + "; ".join(parts)
+            + f"। কোনটা সরাতে চান, {choices}?")
+
+
+def reschedule_not_found_reply() -> str:
+    """Nothing matched -- identical whether nothing exists or the details
+    disagree, so the line cannot be used to probe. Offers a next step."""
+    return ("দুঃখিত, এই তথ্যে কোনো আগামী অ্যাপয়েন্টমেন্ট খুঁজে পেলাম না। "
+            "কাউন্টারে যোগাযোগ করতে পারেন, অথবা নতুন অ্যাপয়েন্টমেন্ট করতে চাইলে বলুন।")
+
+
+def reschedule_day_unavailable_reply(appointment: dict, result: dict) -> str:
+    """The doctor does not sit on the day asked. Offer their next day."""
+    doctor = _resched_doctor(appointment)
+    next_date = result.get("next_available_date")
+    if next_date:
+        return (f"{doctor} ওই দিন বসেন না। পরের দিন {next_date} তারিখে বসবেন। "
+                f"ওই দিনে সরাতে চান, নাকি অন্য কোনো দিন?")
+    return f"{doctor} ওই দিন বসেন না। অন্য কোনো দিন বলবেন?"
+
+
+def reschedule_time_prompt(appointment: dict, new_date: str, result: dict) -> str:
+    """The doctor sits that day. Say their hours and ask for a time."""
+    hours = result.get("chamber_hours")
+    if hours:
+        return (f"{_resched_doctor(appointment)} {new_date} তারিখে {hours} চেম্বারে থাকবেন। "
+                f"কোন সময়ে চান?")
+    return reschedule_prompt("time_slot")
+
+
+def reschedule_confirm_prompt(appointment: dict, new_date: str, new_time_slot: str) -> str:
+    """The whole change, read back before anything is written (E13-S4)."""
+    return (f"একটু মিলিয়ে নিই। {_resched_doctor(appointment)}, "
+            f"{_resched_slot(appointment['date'], appointment['time_slot'])}, "
+            f"এই অ্যাপয়েন্টমেন্টটা সরিয়ে {_resched_slot(new_date, new_time_slot)} করা হবে। ঠিক আছে?")
+
+
+def reschedule_reply(result: dict, appointment: dict) -> str:
+    """What clinic-api answered to the PATCH. Success is spoken from the
+    COMMITTED response, not from what the caller asked for."""
+    if result.get("success"):
+        return (f"আপনার অ্যাপয়েন্টমেন্ট সরানো হয়েছে। {_resched_doctor(result)}, "
+                f"{_resched_slot(result['new_date'], result['new_time_slot'])}। "
+                f"কনফার্মেশন নম্বর আগের মতোই থাকছে, নম্বরটা হলো {result['reference']}।")
+
+    reason = result.get("reason")
+    if reason == "slot_taken":
+        alts = result.get("alternative_slots") or []
+        if alts:
+            return (f"ওই সময়টা ফাঁকা নেই। {_UNCHANGED} "
+                    f"ওই দিনে {_spoken_list(alts)} সময়গুলো ফাঁকা আছে। কোনটা চান?")
+        return f"ওই দিনে আর কোনো সময় ফাঁকা নেই। {_UNCHANGED} অন্য কোনো দিন বলবেন?"
+    if reason == "doctor_not_available_that_day":
+        return f"{_UNCHANGED} {reschedule_day_unavailable_reply(appointment, result)}"
+    if reason == "same_slot":
+        return "এটা তো আপনার এখনকার সময়ই। অন্য কোনো দিন বা সময় বলবেন?"
+    if reason == "conflict":
+        # Somebody else changed it between the readback and the "yes": the
+        # slot the caller confirmed no longer exists, so do NOT claim the old
+        # one is intact.
+        return ("এর মধ্যে অ্যাপয়েন্টমেন্টটা বদলে গেছে, তাই এখন কিছু করলাম না। "
+                "কাউন্টারে একবার মিলিয়ে নেবেন, দয়া করে।")
+    return f"দুঃখিত, এই অ্যাপয়েন্টমেন্টটা সরানো গেল না। {_UNCHANGED} কাউন্টারে যোগাযোগ করতে পারেন।"
+
+
+def reschedule_kept_reply(appointment: dict | None = None) -> str:
+    """The caller said no. Nothing was written, and they are told so."""
+    if appointment:
+        return (f"ঠিক আছে, কিছু বদলানো হয়নি। আপনার অ্যাপয়েন্টমেন্ট "
+                f"{_resched_slot(appointment['date'], appointment['time_slot'])}, যেমন ছিল তেমনই থাকছে।")
+    return "ঠিক আছে, কিছু বদলানো হয়নি। আর কিছু জানতে চান?"
+
+
+def reschedule_not_changed_reply() -> str:
+    """Only where the write provably did not happen: the flow gave up after
+    repeated unparseable replies, or the PATCH was never applied."""
+    return (f"এই মুহূর্তে অ্যাপয়েন্টমেন্ট সরাতে পারলাম না। {_UNCHANGED} "
+            f"একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।")
+
+
+def reschedule_outcome_unknown_reply() -> str:
+    """The write may or may not have committed -- claim neither."""
+    return ("দুঃখিত, পরিবর্তনটা হয়েছে কিনা এই মুহূর্তে নিশ্চিত হতে পারছি না। "
+            "কাউন্টারে একবার মিলিয়ে নেবেন, দয়া করে।")
+
+
+# ---------------------------------------------------------------- cancellation
+# story title: Caller cancels an appointment (E4-S4)
+# user story: As a patient who cannot attend, I want to cancel and be told any
+#   charge clearly, so that I am not surprised by a deduction later.
+# acceptance criteria: Cancellation applies the configured window rules and
+#   states refund eligibility from policy, never improvised. A cancellation
+#   within a charging window is confirmed explicitly with the charge stated
+#   before it is applied.
+#
+# Every charge, refund eligibility, date, time and doctor below comes from the
+# clinic-api quote/cancel response -- computed from the admin's rules file
+# (clinic-api/cancellation_rules.txt) -- never from the model, never
+# improvised. There is no payment system, so no line may say money was
+# deducted or refunded: a charge is "recorded" (নথিভুক্ত), a refund is
+# "eligible" (যোগ্য). A refund is never spoken as an amount.
+#
+# The rules the reschedule section above keeps hold here too: the doctor by
+# their Bengali alias, no field-label colon, and _NOTHING_CANCELLED only where
+# it is provably true -- never after a conflict, never when the outcome is
+# unknown.
+
+_NOTHING_CANCELLED = "কিছু বাতিল করা হয়নি, আপনার অ্যাপয়েন্টমেন্ট যেমন ছিল তেমনই আছে।"
+_SAY_CONSENT = ("চার্জ মেনে বাতিল করতে চাইলে বলুন, হ্যাঁ, বাতিল করুন। "
+                "অ্যাপয়েন্টমেন্ট রাখতে চাইলে বলুন, থাক। অন্য দিনে সরাতে চাইলে বলুন, সরাতে চাই।")
+
+
+def cancel_choice_prompt() -> str:
+    """The first question after a cancel request: cancel, keep, or move
+    instead (the E4-S3 reschedule flow)."""
+    return ("আপনি কি অ্যাপয়েন্টমেন্টটা বাতিল করতে চান, নাকি বাতিল না করে অন্য দিনে বা অন্য সময়ে "
+            "সরাতে চান? বাতিল করতে চাইলে হ্যাঁ বলুন, না চাইলে না বলুন। "
+            "অন্য দিনে সরাতে চাইলে বলুন, সরাতে চাই।")
+
+
+def cancel_prompt(field: str) -> str:
+    """The question for one step of the cancel flow. Also the re-ask after a
+    reply that could not be understood."""
+    prompts = {
+        "choice": "বাতিল করতে চাইলে হ্যাঁ বলুন, রাখতে চাইলে না বলুন, অন্য দিনে সরাতে চাইলে বলুন, সরাতে চাই।",
+        "phone": ("অ্যাপয়েন্টমেন্টটা খুঁজে বের করতে, যে ফোন নম্বরে বুক করেছিলেন সেটা বলবেন? "
+                  "কনফার্মেশন নম্বর থাকলে সেটাও বলতে পারেন।"),
+        "name": "রোগীর নামটা বলবেন?",
+        "pick": "কোনটা বাতিল করতে চান, প্রথম, দ্বিতীয় না তৃতীয়?",
+        "confirm": "অ্যাপয়েন্টমেন্টটা বাতিল করব কিনা, হ্যাঁ বা না বলবেন?",
+    }
+    return prompts.get(field, "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
+
+
+def cancel_pick_prompt(matches: list[dict]) -> str:
+    """Two or three matched. Read them out; never pick the likeliest."""
+    shown = matches[:len(_ORDINAL_WORDS)]
+    parts = [f"{_ORDINAL_WORDS[i]} {_resched_doctor(m)}, {_resched_slot(m['date'], m['time_slot'])}"
+             for i, m in enumerate(shown)]
+    choices = "প্রথম না দ্বিতীয়" if len(shown) == 2 else "প্রথম, দ্বিতীয় না তৃতীয়"
+    count = _MATCH_COUNT_WORDS.get(len(shown), "কয়েকটা")
+    return (f"এই তথ্যে {count} অ্যাপয়েন্টমেন্ট পেয়েছি। " + "; ".join(parts)
+            + f"। কোনটা বাতিল করতে চান, {choices}?")
+
+
+def cancel_not_found_reply() -> str:
+    """Nothing matched -- identical whether nothing exists or the details
+    disagree, so the line cannot be used to probe."""
+    return ("দুঃখিত, এই তথ্যে কোনো আগামী অ্যাপয়েন্টমেন্ট খুঁজে পেলাম না, তাই কিছু বাতিল করিনি। "
+            "কাউন্টারে যোগাযোগ করতে পারেন।")
+
+
+def _refund_sentence(quote: dict) -> str:
+    eligibility = quote.get("refund_eligibility")
+    if eligibility == "full":
+        return "নিয়ম অনুযায়ী আপনি পুরো রিফান্ডের যোগ্য।"
+    if eligibility == "partial" and quote.get("refund_percent"):
+        return f"নিয়ম অনুযায়ী আপনি {quote['refund_percent']} শতাংশ রিফান্ডের যোগ্য।"
+    return "নিয়ম অনুযায়ী এক্ষেত্রে কোনো রিফান্ড প্রযোজ্য নয়।"
+
+
+def _charge_sentence(quote: dict) -> str:
+    if quote["charge_inr"] > 0:
+        return f"নিয়ম অনুযায়ী এখন বাতিল করলে {quote['charge_inr']} টাকা চার্জ লাগবে।"
+    return "নিয়ম অনুযায়ী এখন বাতিল করলে কোনো চার্জ লাগবে না।"
+
+
+def cancel_confirm_prompt(appointment: dict, quote: dict) -> str:
+    """Readback when the rules charge nothing. A yes here is NEVER reused as
+    agreement to a charge."""
+    return (f"একটু মিলিয়ে নিই। {_resched_doctor(appointment)}, "
+            f"{_resched_slot(appointment['date'], appointment['time_slot'])}, "
+            f"এই অ্যাপয়েন্টমেন্টটা বাতিল করা হবে। "
+            f"{_charge_sentence(quote)} {_refund_sentence(quote)} বাতিল করব?")
+
+
+def cancel_charge_prompt(appointment: dict, quote: dict) -> str:
+    """AC2: the separate, explicit charge question -- the amount is stated
+    before anything is applied, and the caller is told exactly what to say."""
+    return (f"একটু মিলিয়ে নিই। {_resched_doctor(appointment)}, "
+            f"{_resched_slot(appointment['date'], appointment['time_slot'])}। "
+            f"{_charge_sentence(quote)} {_refund_sentence(quote)} {_SAY_CONSENT}")
+
+
+def cancel_charge_retry_prompt(quote: dict) -> str:
+    """Re-ask after anything that is not explicit consent. The charge is
+    restated every time."""
+    return f"{_charge_sentence(quote)} {_SAY_CONSENT}"
+
+
+def cancel_quote_changed_prompt(appointment: dict, quote: dict) -> str:
+    """The charge changed between the question and the answer (a window
+    boundary passed, or the rules were edited): say so, state the NEW charge,
+    and ask again. The earlier yes does not carry over."""
+    lead = "এর মধ্যে বাতিলের চার্জের হিসেব বদলে গেছে, তাই এখনও কিছু বাতিল করিনি।"
+    if quote["charge_inr"] > 0:
+        return f"{lead} {_charge_sentence(quote)} {_refund_sentence(quote)} {_SAY_CONSENT}"
+    return f"{lead} {_charge_sentence(quote)} {_refund_sentence(quote)} বাতিল করব?"
+
+
+def cancel_unavailable_reply(reason: str | None) -> str:
+    """Why nothing was cancelled, for a refusal from the quote or cancel
+    endpoint. Every line is true only because nothing was written."""
+    if reason == "already_cancelled":
+        return "এই অ্যাপয়েন্টমেন্টটা আগেই বাতিল হয়ে গেছে। নতুন অ্যাপয়েন্টমেন্ট করতে চাইলে বলুন।"
+    if reason == "after_start":
+        return ("অ্যাপয়েন্টমেন্টের সময় পেরিয়ে গেছে, তাই ফোনে এটা বাতিল করা যাচ্ছে না। "
+                "কাউন্টারে যোগাযোগ করুন, দয়া করে।")
+    if reason == "policy_unavailable":
+        return ("বাতিলের চার্জের নিয়ম এই মুহূর্তে নিশ্চিত করে বলতে পারছি না, তাই ফোনে বাতিল করছি না। "
+                f"{_NOTHING_CANCELLED} কাউন্টারে যোগাযোগ করুন, দয়া করে।")
+    if reason == "conflict":
+        # Someone else changed it in between: do NOT claim it is as it was.
+        return ("এর মধ্যে অ্যাপয়েন্টমেন্টটা বদলে গেছে, তাই এখন কিছু বাতিল করলাম না। "
+                "কাউন্টারে একবার মিলিয়ে নেবেন, দয়া করে।")
+    if reason == "not_found":
+        return ("দুঃখিত, অ্যাপয়েন্টমেন্টটা আর খুঁজে পাচ্ছি না, তাই কিছু বাতিল করিনি। "
+                "কাউন্টারে যোগাযোগ করুন, দয়া করে।")
+    return f"দুঃখিত, এই অ্যাপয়েন্টমেন্টটা বাতিল করা গেল না। {_NOTHING_CANCELLED} কাউন্টারে যোগাযোগ করতে পারেন।"
+
+
+def cancel_reply(result: dict) -> str:
+    """Success only, spoken from the COMMITTED response. States the charge
+    that was RECORDED -- never that anything was taken."""
+    head = (f"আপনার অ্যাপয়েন্টমেন্ট বাতিল হয়েছে। {_resched_doctor(result)}, "
+            f"{_resched_slot(result['date'], result['time_slot'])}।")
+    if result.get("charge_inr", 0) > 0:
+        charge = (f"নিয়ম অনুযায়ী {result['charge_inr']} টাকা বাতিলের চার্জ নথিভুক্ত হয়েছে। "
+                  "চার্জটা কীভাবে মেটাবেন, কাউন্টারে জেনে নেবেন।")
+    else:
+        charge = "কোনো চার্জ লাগেনি।"
+    return f"{head} {charge} {_refund_sentence(result)}"
+
+
+def cancel_kept_reply(appointment: dict | None = None) -> str:
+    """The caller said no. Nothing was written, and they are told so."""
+    if appointment:
+        return (f"ঠিক আছে, কিছু বাতিল করা হয়নি। আপনার অ্যাপয়েন্টমেন্ট "
+                f"{_resched_slot(appointment['date'], appointment['time_slot'])}, যেমন ছিল তেমনই থাকছে।")
+    return "ঠিক আছে, কিছু বাতিল করা হয়নি। আর কিছু জানতে চান?"
+
+
+def cancel_not_cancelled_reply() -> str:
+    """Only where the write provably did not happen: the flow gave up after
+    repeated unusable replies, or the cancel was never applied."""
+    return (f"এই মুহূর্তে অ্যাপয়েন্টমেন্ট বাতিল করতে পারলাম না। {_NOTHING_CANCELLED} "
+            f"একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।")
+
+
+def cancel_outcome_unknown_reply() -> str:
+    """The write may or may not have committed -- claim neither."""
+    return ("দুঃখিত, অ্যাপয়েন্টমেন্টটা বাতিল হয়েছে কিনা এই মুহূর্তে নিশ্চিত হতে পারছি না। "
+            "কাউন্টারে একবার মিলিয়ে নেবেন, দয়া করে।")
+
+
+# ------------------------------------------------------ one-sentence booking
+# story title: Caller gives everything in one sentence (E13-S7)
+# user story: As a caller who already knows what I want, I want to say it all
+#   at once and only confirm, so that a simple booking takes one exchange
+#   rather than five.
+# acceptance criteria: A caller who states doctor, day, time and patient name
+#   in the opening utterance is asked only to confirm. Every slot is filled
+#   from that single turn and no question already answered is asked again.
+#   The confirmation reads back all four values. Median turns for this
+#   scenario is two.
+#
+# Three questions that ask for ONE field again, because the clinic said the
+# value the caller gave cannot be booked -- asked BEFORE the readback, so the
+# caller never confirms a booking that would then be refused. Every fact in
+# them (the doctor's next sitting day, their chamber hours) is read off the
+# clinic-api doctor-availability `result`; the doctor is spoken through
+# _spoken_doctor_name(), so the Bengali sentence uses the Bengali name. Same
+# four languages as the rest of the booking flow. No label colons.
+
+def booking_doctor_not_found_prompt(language: str = "bengali") -> str:
+    """No doctor matches the name the caller gave. The caller's words are not
+    repeated back: they may be Latin script, which the Bengali voice drops."""
+    if language == "english":
+        return "Sorry, I couldn't find a doctor by that name. Which doctor would you like to book with?"
+    if language == "hinglish":
+        return "Maaf kijiye, us naam se koi doctor nahi mila. Kis doctor ke saath appointment chahiye?"
+    if language == "banglish":
+        return "Sorry, oi naame kono doctor khuje pelam na. Kon doctor-er kache appointment chan?"
+    return "দুঃখিত, ওই নামে কোনো ডাক্তার খুঁজে পেলাম না। কোন ডাক্তারের কাছে অ্যাপয়েন্টমেন্ট চান?"
+
+
+def booking_day_unavailable_prompt(slots: dict, result: dict, language: str = "bengali") -> str:
+    """The doctor does not sit on the day asked. Offer their next day; a
+    plain "হ্যাঁ" then takes it (main.py stores it as the offered date)."""
+    doctor = _spoken_doctor_name(slots, result, language=language)
+    next_date = result.get("next_available_date")
+    if language == "english":
+        if next_date:
+            return (f"{doctor} is not in on that day. The next day is {next_date}. "
+                    f"Shall I book that day, or would you like another day?")
+        return f"{doctor} is not in on that day. Which other day would you like?"
+    if language == "hinglish":
+        if next_date:
+            return (f"{doctor} us din nahi baithte. Agla din {next_date} hai. "
+                    f"Us din book karun, ya koi aur din?")
+        return f"{doctor} us din nahi baithte. Koi aur din bataiye?"
+    if language == "banglish":
+        if next_date:
+            return (f"{doctor} oi din bosen na. Porer din {next_date}. "
+                    f"Oi dine book korbo, naki onno kono din?")
+        return f"{doctor} oi din bosen na. Onno kono din bolben?"
+    if next_date:
+        return (f"{doctor} ওই দিন বসেন না। পরের দিন {next_date} তারিখে বসবেন। "
+                f"ওই দিনে করব, নাকি অন্য কোনো দিন বলবেন?")
+    return f"{doctor} ওই দিন বসেন না। অন্য কোনো দিন বলবেন?"
+
+
+def booking_time_outside_hours_prompt(slots: dict, result: dict, language: str = "bengali") -> str:
+    """The time asked is outside the doctor's chamber hours that day. Say
+    the hours and ask for a time inside them."""
+    doctor = _spoken_doctor_name(slots, result, language=language)
+    hours = result.get("chamber_hours")
+    if language == "english":
+        return f"{doctor} is in the chamber {hours} that day. What time within those hours would you like?"
+    if language == "hinglish":
+        return f"{doctor} us din {hours} chamber mein rahenge. Is samay ke andar kaunsa time chahiye?"
+    if language == "banglish":
+        return f"{doctor} oi din {hours} chamber-e thakben. Er moddhe kon somoy chan?"
+    return f"{doctor} সেদিন {hours} চেম্বারে থাকবেন। এই সময়ের মধ্যে কোন সময়ে চান?"
+
+
+# ------------------------------------------- a calculated date, rechecked
+# E13-S7 follow-up. When the caller names the day with a word the agent has
+# to CALCULATE ("আজ", "কাল", "পরশু", a weekday), the date it worked out is
+# said back -- with the caller's word and the weekday -- before it is used:
+#     "আগামীকাল মানে রবিবার, সেপ্টেম্বর মাসের কুড়ি তারিখ। ঠিক আছে?"
+# The date comes from agent/date_calc / slot_parse.parse_date (code, never
+# the model); main.py stores what the word meant ("tomorrow") and the
+# weekday (0-6) on the slots, and these helpers only put them into words.
+
+_DAY_WORDS = {
+    "bengali": {"today": "আজ", "tomorrow": "আগামীকাল", "day_after_tomorrow": "পরশু"},
+    "english": {"today": "Today", "tomorrow": "Tomorrow", "day_after_tomorrow": "The day after tomorrow"},
+    "hinglish": {"today": "Aaj", "tomorrow": "Kal", "day_after_tomorrow": "Parson"},
+    "banglish": {"today": "Aaj", "tomorrow": "Kal", "day_after_tomorrow": "Porshu"},
+}
+_WEEKDAY_WORDS = {
+    "bengali": ("সোমবার", "মঙ্গলবার", "বুধবার", "বৃহস্পতিবার", "শুক্রবার", "শনিবার", "রবিবার"),
+    "english": ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
+    "hinglish": ("Somvaar", "Mangalvaar", "Budhvaar", "Guruvaar", "Shukravaar", "Shanivaar", "Ravivaar"),
+    "banglish": ("Sombar", "Mongolbar", "Budhbar", "Brihospotibar", "Shukrobar", "Shonibar", "Robibar"),
+}
+
+
+def _day_parts(slots: dict, language: str) -> tuple[str | None, str] | None:
+    """-> (the day word or None for a weekday name, the weekday), or None
+    when the date was not calculated from a day word."""
+    said, weekday = slots.get("date_said"), slots.get("date_weekday")
+    if not said or not isinstance(weekday, int) or not 0 <= weekday <= 6:
+        return None
+    lang = language if language in _WEEKDAY_WORDS else "bengali"
+    return _DAY_WORDS[lang].get(said), _WEEKDAY_WORDS[lang][weekday]
+
+
+def _spoken_day(slots: dict, language: str = "bengali") -> str | None:
+    """The day as the readback names it: "আগামীকাল রবিবার", or just
+    "রবিবার" when the caller named the weekday."""
+    parts = _day_parts(slots, language)
+    if parts is None:
+        return None
+    word, weekday = parts
+    if not word:
+        return weekday
+    return f"{word} {weekday}" if language == "bengali" else f"{word.lower()}, {weekday}"
+
+
+def booking_date_check_prompt(slots: dict, language: str = "bengali") -> str:
+    """Recheck a calculated date with the caller before anything else is
+    asked. Only called when slots carry date_said (main.py)."""
+    date = slots.get("date") or ""
+    if slots.get("date_said") == "date":
+        # "Caller says tomorrow, ...": a calendar date the caller said
+        # ("২৫ তারিখ") is checked too -- read back with its weekday.
+        weekday = _weekday_of(date, language)
+        if language == "english":
+            return f"{weekday}, {date}. Is that right?"
+        if language == "hinglish":
+            return f"{weekday}, {date}. Sahi hai?"
+        if language == "banglish":
+            return f"{weekday}, {date}. Thik ache?"
+        return f"{weekday}, {date} তারিখ। ঠিক আছে?"
+    parts = _day_parts(slots, language) or (None, "")
+    word, weekday = parts
+    if language == "english":
+        head = f"{word} means {weekday}, {date}" if word else f"{weekday} means {date}"
+        return f"{head}. Is that right?"
+    if language == "hinglish":
+        head = f"{word} matlab {weekday}, {date}" if word else f"{weekday} matlab {date}"
+        return f"{head}. Sahi hai?"
+    if language == "banglish":
+        head = f"{word} mane {weekday}, {date}" if word else f"{weekday} mane {date}"
+        return f"{head}. Thik ache?"
+    head = f"{word} মানে {weekday}, {date} তারিখ" if word else f"{weekday} মানে {date} তারিখ"
+    return f"{head}। ঠিক আছে?"
+
+
+# ------------------------------------------------- caller names only a doctor
+# "Caller names only a doctor" (docs/stories/doctor-only-booking-plan.md).
+# The booking path is the existing one; these only change what is ASKED:
+# the doctor is confirmed with their next sitting, and the remaining fields
+# are asked two at a time (day + time, then name + phone).
+
+def booking_doctor_offer_prompt(slots: dict, result: dict, language: str = "bengali") -> str:
+    """The doctor was found and no day was given: confirm the doctor, say
+    their next sitting and hours, and ask for the day (and the time, when
+    that is not known yet). A plain "হ্যাঁ" takes the day offered."""
+    doctor = _spoken_doctor_name(slots, result, language=language)
+    next_date = result.get("date") if result.get("available") else None
+    hours = result.get("chamber_hours")
+    ask_time = not slots.get("time_slot")
+    if language == "english":
+        if not next_date:
+            return (f"{doctor} has no sitting in the next two weeks. "
+                    f"Which other day would you like?")
+        tail = " And at what time?" if ask_time else ""
+        return (f"Yes, {doctor}. The next sitting is {next_date}, in the chamber {hours}. "
+                f"Shall I book that day, or another day?{tail}")
+    if language == "hinglish":
+        if not next_date:
+            return f"{doctor} agle do hafte nahi baithenge. Koi aur din bataiye?"
+        tail = " Aur kis time?" if ask_time else ""
+        return (f"Haan, {doctor}. Agla din {next_date} hai, chamber ka time {hours}. "
+                f"Us din book karun, ya koi aur din?{tail}")
+    if language == "banglish":
+        if not next_date:
+            return f"{doctor} samner du soptaho bosben na. Onno kono din bolben?"
+        tail = " Ar kon somoy?" if ask_time else ""
+        return (f"Hyan, {doctor}. Porer din {next_date}, chamber-er somoy {hours}. "
+                f"Oi dine korbo, naki onno kono din?{tail}")
+    if not next_date:
+        return f"{doctor} সামনের দুই সপ্তাহে বসবেন না। অন্য কোনো দিন বলবেন?"
+    tail = " আর কোন সময়ে চান?" if ask_time else ""
+    return (f"হ্যাঁ, {doctor}। ওঁর পরের বসার দিন {next_date} তারিখ, চেম্বারের সময় {hours}। "
+            f"ওই দিনে করব, নাকি অন্য কোনো দিন?{tail}")
+
+
+def booking_date_time_prompt(language: str = "bengali") -> str:
+    """Day and time both still missing: asked together."""
+    if language == "english":
+        return "Which day and what time would you like?"
+    if language == "hinglish":
+        return "Kis din aur kis time chahiye?"
+    if language == "banglish":
+        return "Kon din ar kon somoy chan?"
+    return "কোন দিন আর কোন সময়ে চান, একটু বলবেন?"
+
+
+def booking_patient_contact_prompt(language: str = "bengali") -> str:
+    """Patient name and phone both still missing: asked together."""
+    if language == "english":
+        return "Could you tell me the patient's name and a phone number for confirmation?"
+    if language == "hinglish":
+        return "Patient ka naam aur confirmation ke liye ek phone number bataiye?"
+    if language == "banglish":
+        return "Rogir naam ar confirmation-er jonno ekta phone number bolben?"
+    return "রোগীর নাম আর কনফার্মেশনের জন্য একটা ফোন নম্বর বলবেন?"
+
+
+# ------------------------------------------- caller asks for the earliest slot
+# "Caller asks for the earliest available appointment"
+# (docs/stories/earliest-appointment-plan.md). Every date and time is read off
+# clinic-api's earliest-slots `result`; nothing is composed by the model.
+
+_ORDINAL_ASK = {
+    "bengali": ("ওই সময়ে করব, নাকি অন্য কোনো দিন বলবেন?",
+                "কোনটা নেব, প্রথমটা নাকি দ্বিতীয়টা? অন্য কোনো দিন চাইলে সেটাও বলতে পারেন।",
+                "কোনটা নেব, প্রথমটা, দ্বিতীয়টা, নাকি তৃতীয়টা? অন্য কোনো দিন চাইলে সেটাও বলতে পারেন।"),
+    "english": ("Shall I book that, or would you like another day?",
+                "Which one shall I book, the first or the second? You can also name another day.",
+                "Which one shall I book, the first, the second or the third? You can also name another day."),
+    "hinglish": ("Wahi book karun, ya koi aur din?",
+                 "Kaunsa book karun, pehla ya doosra? Koi aur din bhi bata sakte hain.",
+                 "Kaunsa book karun, pehla, doosra ya teesra? Koi aur din bhi bata sakte hain."),
+    "banglish": ("Oi somoy korbo, naki onno kono din?",
+                 "Konta nebo, prothomta na ditiyota? Onno kono din chaile setao bolte paren.",
+                 "Konta nebo, prothomta, ditiyota, naki tritiyota? Onno kono din chaile setao bolte paren."),
+}
+
+
+def _weekday_of(date_iso: str | None, language: str) -> str:
+    """"সোমবার" for "2026-09-21" -- the day NAME, worked out from the date
+    clinic-api returned (no clock involved)."""
+    try:
+        idx = datetime.date.fromisoformat(date_iso).weekday()
+    except (TypeError, ValueError):
+        return ""
+    return _WEEKDAY_WORDS.get(language, _WEEKDAY_WORDS["bengali"])[idx]
+
+
+def _earliest_slot_phrase(slot: dict, first_date: str | None, language: str) -> str:
+    """One offered slot. The day is said only when it differs from the
+    first slot's, so three slots on one day read as three times."""
+    date, time_slot = slot.get("date"), slot.get("time_slot")
+    day = _weekday_of(date, language)
+    if language == "english":
+        return f"{time_slot}" if date == first_date else f"{day} {date} at {time_slot}"
+    if language == "hinglish":
+        return f"{time_slot}" if date == first_date else f"{day} {date} ko {time_slot}"
+    if language == "banglish":
+        return f"{time_slot}" if date == first_date else f"{day}, {date}, {time_slot}"
+    return f"সময় {time_slot}" if date == first_date else f"{day}, {date} তারিখ, সময় {time_slot}"
+
+
+def booking_earliest_slots_prompt(slots: dict, result: dict, language: str = "bengali") -> str:
+    """The earliest free slot with its day and time, plus the next ones (up
+    to two), and which one to book. A plain "হ্যাঁ" takes the first."""
+    doctor = _spoken_doctor_name(slots, result, language=language)
+    offered = (result.get("slots") or [])[:3]
+    first = offered[0]
+    rest = [_earliest_slot_phrase(s, first.get("date"), language) for s in offered[1:]]
+    ask = _ORDINAL_ASK.get(language, _ORDINAL_ASK["bengali"])[len(offered) - 1]
+    d, t = first.get("date"), first.get("time_slot")
+    day = _weekday_of(d, language)
+    if language == "english":
+        head = f"The earliest free time with {doctor} is {day} {d} at {t}."
+        more = f" After that, {' and '.join(rest)} are also free." if rest else ""
+    elif language == "hinglish":
+        head = f"{doctor} ka sabse pehla khali time {day} {d} ko {t} hai."
+        more = f" Uske baad {' aur '.join(rest)} bhi khali hai." if rest else ""
+    elif language == "banglish":
+        head = f"{doctor}-er shob theke ager khali somoy {day}, {d}, {t}."
+        more = f" Er pore {' ar '.join(rest)}-o khali ache." if rest else ""
+    else:
+        head = f"{doctor} সবচেয়ে আগে বসছেন {day}, {d} তারিখে, সময় {t} খালি আছে।"
+        more = f" এছাড়া খালি আছে {', আর '.join(rest)}।" if rest else ""
+    return f"{head}{more} {ask}"
+
+
+def booking_earliest_none_prompt(slots: dict, result: dict, language: str = "bengali",
+                                 ask_phone: bool = True) -> str:
+    """Nothing free within the horizon: say so, and offer a callback when a
+    slot opens -- made by a staff member, never promised as automatic."""
+    doctor = _spoken_doctor_name(slots, result, language=language)
+    days = result.get("horizon_days")
+    if language == "english":
+        tail = " Could you give me a phone number for that?" if ask_phone else ""
+        return (f"{doctor} has no free time in the next {days} days. When a time opens, "
+                f"someone from our clinic can call you.{tail}")
+    if language == "hinglish":
+        tail = " Uske liye ek phone number bataiye?" if ask_phone else ""
+        return (f"{doctor} ka agle {days} din mein koi khali time nahi hai. Time khali hone par "
+                f"hamare clinic se koi aapko call kar sakta hai.{tail}")
+    if language == "banglish":
+        tail = " Tar jonno ekta phone number bolben?" if ask_phone else ""
+        return (f"{doctor}-er samner {days} dine kono khali somoy nei. Somoy khali hole "
+                f"amader clinic theke keu apnake phone kore janate paren.{tail}")
+    tail = " তার জন্য একটা ফোন নম্বর বলবেন?" if ask_phone else ""
+    return (f"{doctor} সামনের {days} দিনে কোনো খালি সময় নেই। সময় খালি হলে "
+            f"আমাদের ক্লিনিক থেকে কেউ আপনাকে ফোন করে জানাতে পারেন।{tail}")
+
+
+# ------------------------------------------------ requested slot already taken
+# "Requested slot is already taken" (docs/stories/slot-taken-alternatives-plan.md).
+# ONE sentence: the time asked is gone; the nearest free times that day; the
+# same time on the nearest other day. Every value read off clinic-api's
+# `result` (alternative_slots, other_day_slot); the time asked off `slots`.
+
+def booking_slot_taken_prompt(slots: dict, result: dict, language: str = "bengali") -> str:
+    asked = slots.get("time_slot")
+    # clinic-api decides how many (two); every one it returned is spoken.
+    alts = result.get("alternative_slots") or []
+    other = result.get("other_day_slot") or {}
+    o_date, o_time = other.get("date"), other.get("time_slot")
+    o_day = _weekday_of(o_date, language) if o_date else ""
+    if language == "english":
+        parts = [f"that day {' or '.join(alts)} {'is' if len(alts) == 1 else 'are'} free"] if alts else []
+        if o_date:
+            parts.append(f"{o_day} {o_date} at the same time, {o_time}, is free")
+        head = f"{asked} is" if asked else "That time is"
+        return f"{head} already booked, but {', or '.join(parts)}, which one shall I book?"
+    if language == "hinglish":
+        parts = [f"us din {' ya '.join(alts)} khali hai"] if alts else []
+        if o_date:
+            parts.append(f"{o_day} {o_date} ko usi time {o_time} khali hai")
+        return f"{asked or 'Wo time'} book ho chuka hai, lekin {', ya '.join(parts)}, kaunsa book karun?"
+    if language == "banglish":
+        parts = [f"shedin {' ba '.join(alts)} khali ache"] if alts else []
+        if o_date:
+            parts.append(f"{o_day}, {o_date} ekoi somoye {o_time} khali ache")
+        return f"{asked or 'Oi somoy'} book hoye geche, tobe {', othoba '.join(parts)}, konta nebo?"
+    parts = [f"সেদিন {' বা '.join(alts)} খালি আছে"] if alts else []
+    if o_date:
+        parts.append(f"{o_day}, {o_date} তারিখে একই সময়ে {o_time} খালি আছে")
+    return f"{asked or 'ওই সময়টা'} বুক হয়ে গেছে, তবে {', অথবা '.join(parts)}, কোনটা নেব?"
+
+
+# ----------------------------------------------- a spoken date, checked first
+# "Caller says tomorrow, day after, or next Monday"
+# (docs/stories/relative-dates-plan.md). The dates come from agent/date_calc
+# (code); these only put them into words. A date that parser and model agree
+# on is confirmed with booking_date_check_prompt; these two ASK.
+
+def date_ask_prompt(candidates, language: str = "bengali") -> str:
+    """The two readings of the caller's day differ (or only one exists):
+    offer the date(s) and ask which. No date at all -> an open question."""
+    days = [(_weekday_of(d, language), d) for d in list(candidates)[:2]]
+    if language == "english":
+        if not days:
+            return "Which date do you mean?"
+        if len(days) == 1:
+            return f"Do you mean {days[0][0]}, {days[0][1]}, or another day?"
+        return f"Do you mean {days[0][0]}, {days[0][1]}, or {days[1][0]}, {days[1][1]}?"
+    if language == "hinglish":
+        if not days:
+            return "Kaunsi tareekh ki baat kar rahe hain?"
+        if len(days) == 1:
+            return f"Kya aap {days[0][0]}, {days[0][1]} ki baat kar rahe hain, ya koi aur din?"
+        return f"Kya aap {days[0][0]}, {days[0][1]} ki baat kar rahe hain, ya {days[1][0]}, {days[1][1]} ki?"
+    if language == "banglish":
+        if not days:
+            return "Kon tarikher kotha bolchen?"
+        if len(days) == 1:
+            return f"Apni ki {days[0][0]}, {days[0][1]} tarikher kotha bolchen, naki onno kono din?"
+        return f"Apni ki {days[0][0]}, {days[0][1]} tarikher kotha bolchen, naki {days[1][0]}, {days[1][1]} tarikher?"
+    if not days:
+        return "কোন তারিখের কথা বলছেন, একটু বলবেন?"
+    if len(days) == 1:
+        return f"আপনি কি {days[0][0]}, {days[0][1]} তারিখের কথা বলছেন, নাকি অন্য কোনো দিন?"
+    return f"আপনি কি {days[0][0]}, {days[0][1]} তারিখের কথা বলছেন, নাকি {days[1][0]}, {days[1][1]} তারিখের?"
+
+
+def date_range_pick_prompt(start_iso: str, end_iso: str, language: str = "bengali") -> str:
+    """A range ("next week") while booking: say which days it covers and ask
+    for one."""
+    if language == "english":
+        return f"That is {start_iso} to {end_iso}. Which day would you like?"
+    if language == "hinglish":
+        return f"Yaani {start_iso} se {end_iso} tak. Kaunsa din chahiye?"
+    if language == "banglish":
+        return f"Mane {start_iso} theke {end_iso}. Kon din chan?"
+    return f"মানে {start_iso} থেকে {end_iso} তারিখ। এর মধ্যে কোন দিন চান?"

@@ -1,0 +1,98 @@
+IMPLEMENTATION REPORT - Merge of main_pcm.py (dev_sourav + dev_rajarshee -> test)
+Prepared for: sourav / InnoFissionAI          Repo: innofissionaigit-design/ivr_dev_2
+=====================================================================================
+
+1. TASK
+   Merge main_pcm.py from branches dev_sourav and dev_rajarshee into the test branch,
+   using the owner's rules:
+     1. Items new on only one side -> merge directly.
+     2. Items changed differently on both sides -> show conflict, owner decides.
+     3. Show exact code from both sides for 1 and 2.
+     4. After merge, comment every point of 1 and 2, plus the owner's reason for 2.
+
+2. METHOD AND KEY FINDING
+   main_pcm.py is the PCM-audio-streaming entry point, ~96% identical to main.py (the
+   WAV-per-turn entry point) -- same booking/callback/reschedule/cancel/complaint/
+   silence/etc. state machine, differing only in the audio transport plumbing. Diffing
+   this file's 8 conflicting regions against main.py's 8 conflicting regions showed
+   they are BYTE-FOR-BYTE IDENTICAL: both branches edited main.py and main_pcm.py in
+   lockstep for every story in this merge. So this merge reused the exact decisions
+   already given for main.py's C1-C8, rather than asking the same questions twice.
+   Scope: test 4267 lines | dev_sourav 6005 lines (61 one-sided spots) |
+   dev_rajarshee 5536 lines (39 one-sided spots) | 8 conflicts.
+
+3. RULE 1 - MERGED DIRECTLY (100 one-sided items, exact code in the attached review file)
+   61 spots from dev_sourav, 39 from dev_rajarshee -- new intent handling (clinical
+   interpretation, human-direct-request, complaint, doctor-personal-request), the
+   correction-acknowledgment story, silence-flow, and (from rajarshee) the reschedule/
+   cancel flow plumbing and Latin-script/Hinglish date parsing hookups. All merged
+   directly, no collisions.
+
+4. RULE 2 - CONFLICTS (8, identical to main.py's C1-C8; owner's decisions re-applied)
+   C1  reply_templates imports                          -> KEEP BOTH
+   C2  new booking-parsing helper block                  -> KEEP BOTH
+   C3  correction-check vs offered-slot/date-candidate    -> KEEP BOTH, sourav's
+                                                              correction check first
+   C4/C5/C6  write field / re-open booking / ask next     -> HYBRID: rajarshee's
+                                                              structure (_apply_booking_date /
+                                                              _open_booking / _next_booking_step)
+                                                              + sourav's correction marker/
+                                                              acknowledgment layered on top
+   C7  booking given in one sentence (multi-part path)    -> dev_rajarshee's version
+                                                              (supersedes sourav's fix --
+                                                              detect_language already threaded)
+   C8  _MULTI_INTENT_NEEDS_SEPARATE_FLOW                  -> UNION of both sets
+   Reason for reusing rather than re-asking: every one of the 8 conflicts here matched
+   main.py's corresponding conflict character-for-character (verified programmatically,
+   not by inspection alone), so applying different answers would have produced a
+   main.py and main_pcm.py that disagree on identical code -- the one outcome the
+   dependency-audit work in this whole merge was specifically trying to prevent.
+
+5. COMMENTS ADDED (rule 4)
+   Same MERGE NOTE comments as main.py, in the same 8 locations, carried over verbatim:
+   - Inside the VALID-set-equivalent (_MULTI_INTENT_NEEDS_SEPARATE_FLOW): reasoning for
+     the union.
+   - Above the C4/C5/C6 block: reasoning for the hybrid structure, and the flagged
+     two-_speak()-calls behavior difference (see section 7).
+   - Above the C7 replacement: reasoning for why rajarshee's version was taken wholesale
+     and why sourav's language fix isn't lost.
+
+6. VERIFICATION
+   - Python syntax check of merged file: OK.
+   - 0 leftover conflict markers.
+   - No duplicate top-level function/class definitions.
+   - Completeness check: every line dev_sourav or dev_rajarshee added is present in the
+     merged file, except the lines each conflict resolution deliberately supersedes (20
+     sourav lines / 2 rajarshee lines) -- these counts match main.py's merge exactly,
+     confirming the two files were resolved consistently.
+   - Cross-checked that every helper name this file's merged code depends on
+     (_apply_booking_date, _next_booking_step, _open_booking, _booking_slots_from_turn,
+     wants_earliest, spoken_day_word, correction_acknowledged_reply,
+     detect_booking_correction, is_clinical_interpretation, is_immediate_human_request,
+     is_complaint, is_anger, is_doctor_personal_request, resolve_symptom_department,
+     detect_unverifiable_claim, silence_flow, etc.) resolves to an actual definition in
+     the already-merged agent/*.py and clinic-api/*.py files delivered earlier in this
+     session.
+
+7. OPEN ITEM CARRIED OVER FROM main.py's MERGE (applies identically here)
+   C5/C6: the correction acknowledgment is spoken as its OWN _speak() call immediately
+   before _open_booking()/_next_booking_step() runs, rather than threaded into those
+   functions as an argument (which would have touched their signatures and every other
+   call site). Net effect: when a correction lands here, the caller hears TWO short
+   spoken lines back to back (the acknowledgment, then the availability recheck or next
+   question) instead of ONE combined sentence, unlike every other correction spot in
+   this file. Flagged for a listening-test check before shipping -- same flag as
+   main.py's, since it's the same code.
+
+8. DELIVERABLES (this merge)
+   - main_pcm.py                              merged file (already saved earlier this
+                                                session to the merged_code folder)
+   - main_pcm_merge_review.txt                 exact code from both branches for every
+                                                Rule-1 item and Rule-2 conflict
+   - this report
+
+9. RISKS / OPEN ITEMS (repository-wide, not specific to this file)
+   - tests/ (34 files), docs/stories/ (7 files), deploy/ (4 rajarshee-only infra
+     scripts), and one sourav-only report file still differ across branches and have
+     not been merged -- flagged in this session's earlier full-repository audit.
+   - Not tested against a live PCM audio stream in this session.

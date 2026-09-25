@@ -112,6 +112,42 @@ class ToolCallError(Exception):
     not-found/unavailable result, which is not an error."""
 
 
+# story title: Caller moves an existing appointment (E4-S3)
+# user story: As a patient whose plans changed, I want to move my appointment
+#   without cancelling it, so that I do not lose my place entirely.
+# acceptance criteria: The booking is found by contact number, name or
+#   reference. The new slot is swapped atomically, holding the old one until
+#   the new commits, and a failed swap leaves the original intact.
+#   Confirmation is sent on both channels.
+#
+# A READ that fails has one honest sentence: "I could not check". A WRITE that
+# fails has two, and they are opposites, so they are separate classes rather
+# than a message to be parsed. Both subclass ToolCallError: any handler that
+# does not know about them still speaks the infrastructure apology instead of
+# crashing the turn.
+class ToolWriteNotApplied(ToolCallError):
+    """The write provably did not happen: never sent (connection refused /
+    connect timeout), or the service answered with an error status, and
+    clinic-api rolls back before any error response. The caller may be told
+    their existing booking is unchanged."""
+
+
+class ToolOutcomeUnknown(ToolCallError):
+    """The write was SENT and no usable answer came back (answer lost twice,
+    or a 200 the contract cannot read). It may or may not have committed.
+    The caller must be told neither "done" nor "unchanged"."""
+
+
+# Reads keep DEFAULT_TIMEOUT_S. A write that times out has an UNKNOWN outcome,
+# which costs a counter visit, so it gets more room before being given up on.
+WRITE_TIMEOUT_S = 8.0
+
+# At most this many sends of the SAME write, with the same idempotency key.
+# clinic-api replays the stored result for a key it has already committed, so
+# the second send can never move an appointment twice.
+WRITE_ATTEMPTS = 2
+
+
 class ClinicToolsClient:
     # ADDED BY SOURAV -- "fetch from cache instead of DB directly" request.
     # `cache_ttl_s` covers only the RARELY-CHANGING, admin-set endpoints
@@ -204,7 +240,8 @@ class ClinicToolsClient:
     #                {"found": true, ..., "available": false,
     #                 "next_available_date": "2026-08-27"}
     #   found=false: {"found": false, "query": "..."}
-    async def get_doctor_availability(self, doctor_name: str, date: str | None) -> dict:
+    async def get_doctor_availability(self, doctor_name: str, date: str | None,
+                                      time: str | None = None) -> dict:
         # ADDED BY SOURAV -- reference-data cache: deliberately EXCLUDED.
         # This resolves a SPECIFIC day's slot state, which another caller
         # can change (book/cancel) between two questions about the same
@@ -213,6 +250,10 @@ class ClinicToolsClient:
         params = {"name": doctor_name}
         if date:
             params["date"] = date
+            # "Requested slot is already taken": with a time, clinic-api also
+            # says whether that slot is free now, and the alternatives if not.
+            if time:
+                params["time"] = time
         try:
             r = await self._client.get("/api/v1/doctors/availability", params=params)
             r.raise_for_status()
@@ -240,6 +281,31 @@ class ClinicToolsClient:
         except ValueError as e:
             self._unreachable("doctor_availability")
             raise ToolCallError(f"get_doctor_availability: malformed response body: {e}") from e
+
+    # "Caller asks for the earliest available appointment". The doctor's
+    # first free slots across days. NOT cached, for the same reason as
+    # get_doctor_availability(): another caller can book or cancel between
+    # two questions, and the answer must be the live one.
+    #   found=true:  {"found": true, "doctor_name", "doctor_name_bn",
+    #                 "horizon_days": 14, "as_of": "...",
+    #                 "slots": [{"date", "time_slot", "chamber_hours"}, ...]}
+    #   found=false: {"found": false, "query": "..."}   (or the ambiguous shape)
+    async def get_earliest_slots(self, doctor_name: str, limit: int = 3) -> dict:
+        try:
+            r = await self._client.get("/api/v1/doctors/earliest-slots",
+                                       params={"name": doctor_name, "limit": limit})
+            r.raise_for_status()
+            return self._answered("doctor_earliest_slots",
+                                  _validate("doctor_earliest_slots", _parse_exact(r)))
+        except httpx.HTTPError as e:
+            self._unreachable("doctor_earliest_slots")
+            raise ToolCallError(f"get_earliest_slots({doctor_name!r}): {e}") from e
+        except ToolContractError as e:
+            self._unreachable("doctor_earliest_slots")
+            raise ToolCallError(f"get_earliest_slots: clinic-api contract violation: {e}") from e
+        except ValueError as e:
+            self._unreachable("doctor_earliest_slots")
+            raise ToolCallError(f"get_earliest_slots: malformed response body: {e}") from e
 
     # ADDED BY SOURAV -- "Caller asks when a doctor sits" story. Mirrors
     # get_doctor_availability() just above exactly (same error-handling
@@ -721,3 +787,151 @@ class ClinicToolsClient:
             return _parse_exact(r)
         except httpx.HTTPError as e:
             raise ToolCallError(f"submit_complaint({body!r}): {e}") from e
+
+    # =========================================================================
+    # E4-S3 -- Caller moves an existing appointment. Plan and decisions:
+    # docs/stories/E4-S3-reschedule-plan.md.
+    #
+    # PII RULE for all three: an exception message carries the exception TYPE
+    # only. httpx's own message includes the request URL, and the lookup URL
+    # carries the caller's phone number and name as query parameters.
+    # Never cached: identity-bound, and changes with every booking.
+    # =========================================================================
+
+    # ---- GET /api/v1/appointments/lookup ----
+    #   {"found": false, "reason": "insufficient_identification", "matches": []}
+    #   {"found": bool, "matches": [{"reference", "doctor_name",
+    #    "doctor_name_bn", "date", "time_slot"}, ...]}
+    # Phone and patient name are never in the response.
+    async def find_appointments(self, phone: str | None = None, name: str | None = None,
+                                reference: str | None = None) -> dict:
+        params = {k: v for k, v in (("phone", phone), ("name", name),
+                                    ("reference", reference)) if v}
+        try:
+            r = await self._client.get("/api/v1/appointments/lookup", params=params)
+            r.raise_for_status()
+            return self._answered("find_appointments",
+                                  _validate("find_appointments", _parse_exact(r)))
+        except httpx.HTTPError as e:
+            self._unreachable("find_appointments")
+            raise ToolCallError(f"find_appointments: {type(e).__name__}") from None
+        except (ToolContractError, ValueError) as e:
+            self._unreachable("find_appointments")
+            raise ToolCallError(f"find_appointments: {type(e).__name__}") from None
+
+    # ---- GET /api/v1/appointments/{reference}/availability?date= ----
+    #   {"found": true, "date", "available", "chamber_hours", "next_available_date"}
+    # Scoped to the appointment's own doctor -- never re-matched by name.
+    async def get_appointment_availability(self, reference: str, date: str) -> dict:
+        try:
+            r = await self._client.get(f"/api/v1/appointments/{reference}/availability",
+                                       params={"date": date})
+            r.raise_for_status()
+            return self._answered("appointment_availability",
+                                  _validate("appointment_availability", _parse_exact(r)))
+        except httpx.HTTPError as e:
+            self._unreachable("appointment_availability")
+            raise ToolCallError(f"get_appointment_availability: {type(e).__name__}") from None
+        except (ToolContractError, ValueError) as e:
+            self._unreachable("appointment_availability")
+            raise ToolCallError(f"get_appointment_availability: {type(e).__name__}") from None
+
+    # ---- PATCH /api/v1/appointments/{reference} ----
+    #   success: {"success": true, "reference", "doctor_name", "doctor_name_bn",
+    #             "old_date", "old_time_slot", "new_date", "new_time_slot", ...}
+    #   refused: {"success": false, "reason": slot_taken | conflict | past |
+    #             same_slot | not_found | invalid_date |
+    #             doctor_not_available_that_day, ...}
+    async def reschedule_appointment(self, reference: str, new_date: str, new_time_slot: str,
+                                     expected_date: str, expected_time_slot: str,
+                                     idempotency_key: str, call_id: str | None = None) -> dict:
+        """THREE outcomes, not two: a result (written or refused), or
+        ToolWriteNotApplied (provably not written), or ToolOutcomeUnknown.
+
+        A lost ANSWER is retried with the SAME body and key -- the only
+        failure a retry can fix. Anything that proves the request never took
+        effect is not retried: it raises at once.
+        """
+        body = {"new_date": new_date, "new_time_slot": new_time_slot,
+                "expected_date": expected_date, "expected_time_slot": expected_time_slot,
+                "idempotency_key": idempotency_key, "call_id": call_id}
+        return await self._keyed_write("PATCH", f"/api/v1/appointments/{reference}", body,
+                                       "reschedule_appointment")
+
+    async def _keyed_write(self, method: str, url: str, body: dict, tool: str) -> dict:
+        """One idempotency-keyed write, shared by reschedule (E4-S3) and
+        cancel (E4-S4). Moved here unchanged from reschedule_appointment:
+        the messages are the same, with the tool name as their prefix.
+
+        A lost ANSWER is retried with the SAME body and key -- the only
+        failure a retry can fix. Anything that proves the request never took
+        effect is not retried: it raises at once.
+        """
+        for attempt in range(1, WRITE_ATTEMPTS + 1):
+            try:
+                r = await self._client.request(method, url, json=body, timeout=WRITE_TIMEOUT_S)
+                r.raise_for_status()
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                self._unreachable(tool)
+                raise ToolWriteNotApplied(f"{tool}: not sent ({type(e).__name__})") from None
+            except httpx.HTTPStatusError as e:
+                self._unreachable(tool)
+                raise ToolWriteNotApplied(f"{tool}: HTTP {e.response.status_code}") from None
+            except httpx.TransportError as e:
+                # Sent, answer lost (ReadTimeout, RemoteProtocolError, ...).
+                if attempt < WRITE_ATTEMPTS:
+                    continue
+                self._unreachable(tool)
+                raise ToolOutcomeUnknown(
+                    f"{tool}: answer lost {attempt}x ({type(e).__name__})") from None
+            try:
+                return self._answered(tool, _validate(tool, _parse_exact(r)))
+            except (ToolContractError, ValueError) as e:
+                # The service processed the request -- it may well have
+                # committed. Unreadable is not the same as not written.
+                self._unreachable(tool)
+                raise ToolOutcomeUnknown(
+                    f"{tool}: unreadable response ({type(e).__name__})") from None
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    # ---- GET /api/v1/appointments/{reference}/cancellation-quote ----
+    # E4-S4 "Caller cancels an appointment". What cancelling NOW would cost,
+    # computed by clinic-api from the admin's rules file -- never here.
+    #   {"found": true, "reference", "cancellable", "reason", "window_id",
+    #    "hours_before", "charge_inr", "refund_eligibility", "refund_percent",
+    #    "policy_version"}
+    #   {"found": false, "reason": "not_found" | "already_cancelled", "query"}
+    async def get_cancellation_quote(self, reference: str) -> dict:
+        try:
+            r = await self._client.get(f"/api/v1/appointments/{reference}/cancellation-quote")
+            r.raise_for_status()
+            return self._answered("cancellation_quote",
+                                  _validate("cancellation_quote", _parse_exact(r)))
+        except httpx.HTTPError as e:
+            self._unreachable("cancellation_quote")
+            raise ToolCallError(f"get_cancellation_quote: {type(e).__name__}") from None
+        except (ToolContractError, ValueError) as e:
+            self._unreachable("cancellation_quote")
+            raise ToolCallError(f"get_cancellation_quote: {type(e).__name__}") from None
+
+    # ---- POST /api/v1/appointments/{reference}/cancel ----
+    #   success: {"success": true, "reference", "doctor_name", "doctor_name_bn",
+    #             "date", "time_slot", "charge_inr", "charge_status",
+    #             "refund_eligibility", "refund_percent", "window_id",
+    #             "policy_version"}
+    #   refused: {"success": false, "reason": not_found | already_cancelled |
+    #             conflict | policy_unavailable | after_start | quote_changed |
+    #             charge_not_confirmed, "quote"?: {...}}
+    # The same three outcomes as reschedule_appointment (see _keyed_write).
+    async def cancel_appointment(self, reference: str, expected_date: str,
+                                 expected_time_slot: str, expected_window_id: str,
+                                 expected_charge_inr: int, policy_version: str,
+                                 charge_confirmed: bool, idempotency_key: str,
+                                 call_id: str | None = None) -> dict:
+        body = {"expected_date": expected_date, "expected_time_slot": expected_time_slot,
+                "expected_window_id": expected_window_id,
+                "expected_charge_inr": expected_charge_inr, "policy_version": policy_version,
+                "charge_confirmed": charge_confirmed, "idempotency_key": idempotency_key,
+                "call_id": call_id}
+        return await self._keyed_write("POST", f"/api/v1/appointments/{reference}/cancel",
+                                       body, "cancel_appointment")

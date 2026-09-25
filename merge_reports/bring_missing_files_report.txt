@@ -1,0 +1,253 @@
+IMPLEMENTATION REPORT - Bring missing files into merged_code
+Prepared for: sourav / InnoFissionAI          Repo: innofissionaigit-design/ivr_dev_2
+Source folders (local): ivr_dev_2-dev_rajarshee, ivr_dev_2-dev_sourav
+Target folder  (local): merged_code
+=====================================================================================
+
+1. TASK
+   Compare both local source folders against merged_code, find every file that
+   exists in either source but not in merged_code, and bring it over. Owner's
+   constraint: "don't touch any github actions or work".
+
+2. HOW THE CONSTRAINT WAS APPLIED
+   - GitHub Actions: neither source folder contains a .github/ folder or any
+     workflow file, so there was nothing of that kind to avoid. No git or
+     GitHub operation of any kind was performed (no commit, push, branch or
+     PR) -- this was a local folder-to-folder copy only.
+   - "work": workLog.md was HELD BACK. It is an empty (0-byte) file,
+     identical in both folders, so leaving it out loses nothing; it is the only
+     file whose name matches the word, and taking the cautious reading costs
+     nothing. Say the word and it is one copy.
+   - Excluded as not project content: "Claude outputs/main_py_merge_review.txt"
+     in the rajarshee folder -- a review file an earlier step of this session
+     wrote there. Verified it is NOT part of the dev_rajarshee git branch.
+   - Nothing that already existed in merged_code was modified or overwritten.
+
+3. METHOD
+   a. Listed all three folders recursively on the local machine.
+   b. Missing from merged_code: 136 paths (after the exclusion above).
+   c. Pulled BOTH copies of every shared file and compared by sha256 -- equal
+      file size is not proof of equal content.
+   d. Confirmed each local folder is byte-identical to its git branch for every
+      file involved (0 mismatches), so the git common ancestor 6cbeb0b (== test)
+      is a valid base for three-way merging.
+   e. Files that differ in both folders: three-way merged against 6cbeb0b
+      (dev_sourav as "ours", dev_rajarshee as "theirs" -- same order as every
+      other file in this merge). Each clean result then checked for syntax
+      errors and for any test function or class defined twice (a clean TEXT
+      merge can still silently drop a test that way). 16 of 17 clean, all 16
+      passed both checks.
+   f. Wrote the results into merged_code.
+
+4. RESULT
+   Brought into merged_code:       134 files
+     A. only in dev_rajarshee           15
+     B. only in dev_sourav              11
+     C. in both, byte-identical         92
+     D. in both, differed, clean merge  16
+   Held back:                           2
+     - workLog.md                        (see section 2)
+     - tests/test_spoken_punctuation.py  (3 real conflicts -- see section 5)
+   Rejected by the local machine:       0
+
+5. THE ONE CONFLICT -- tests/test_spoken_punctuation.py  [AWAITING OWNER DECISION]
+   This file is the "no colon or bracket is ever spoken" gate. All 3 conflicts
+   have an EMPTY base: both branches inserted new code at the same three spots,
+   nothing in common was edited. Each branch adds its own new reply functions
+   to the same three lists:
+     C1  the `from agent.reply_templates import (...)` list
+           dev_sourav +51 lines (KCD-454 coverage, correction, clinical,
+           silence, complaint, doctor-personal, symptom, unverifiable, anger)
+           dev_rajarshee +23 lines (reschedule E4-S3, cancel E4-S4, one-sentence
+           booking E13-S7, doctor-only, earliest, slot-taken, relative dates)
+     C2  the `_replies()` case generator (the sentences actually checked)
+           dev_sourav +252 lines, dev_rajarshee +112 lines
+     C3  the `exercised` set in test_the_gate_covers_every_public_reply_function
+           dev_sourav +44 lines, dev_rajarshee +18 lines
+   One overlap: both sides list `booking_confirmation_prompt` in C1 and in C3.
+
+   ALL THREE OPTIONS WERE RUN against the full merged tree (merged_code plus
+   the 134 files above), with the repo's own pinned pytest 7.4.3:
+     keep both (duplicate name listed once)  -> 278 passed
+     dev_sourav only                         -> FAILS: 36 of dev_rajarshee's
+                                                public reply functions (in the
+                                                merged reply_templates.py) have
+                                                no case in the gate
+     dev_rajarshee only                      -> CANNOT LOAD: NameError
+                                                'symptom_routing_reply' -- cases
+                                                from dev_sourav elsewhere in the
+                                                file (outside the conflicts,
+                                                already merged) need his imports
+   Recommendation: keep both. Not applied yet -- per rule 2 this is the owner's
+   call.
+
+6. FILE-BY-FILE LIST
+
+A. ONLY IN dev_rajarshee -- copied byte-for-byte (15)
+-------------------------------------------------------------------------------
+  deploy/env_vast.sh
+  deploy/setup_vast.sh
+  deploy/start_vast.sh
+  deploy/vast_push.py
+  docs/stories/E13-S7-one-sentence-booking-plan.md
+  docs/stories/E4-S3-reschedule-plan.md
+  docs/stories/E4-S4-cancel-plan.md
+  docs/stories/doctor-only-booking-plan.md
+  docs/stories/earliest-appointment-plan.md
+  docs/stories/relative-dates-plan.md
+  docs/stories/slot-taken-alternatives-plan.md
+  tests/code_level_test_rajarshee/low_confidence_turn is confirmed never acted upon/unit_test/test_booking_write_gate.py
+  tests/code_level_test_rajarshee/low_confidence_turn is confirmed never acted upon/unit_test/test_confidence_zone.py
+  tests/test_asr_split_words_and_day_words.py
+  tests/test_name_phone_split.py
+
+B. ONLY IN dev_sourav -- copied byte-for-byte (11)
+-------------------------------------------------------------------------------
+  Caller_anger_implementation_report.txt
+  tests/test_anger_flow.py
+  tests/test_clinical_interpretation_safety.py
+  tests/test_complaint_flow.py
+  tests/test_correction_flow.py
+  tests/test_doctor_personal_request.py
+  tests/test_immediate_human_request.py
+  tests/test_report_access_authorization.py
+  tests/test_silence_flow.py
+  tests/test_symptom_routing.py
+  tests/test_unverifiable_claim.py
+
+C. IN BOTH, BYTE-IDENTICAL (sha256) -- copied once (92)
+-------------------------------------------------------------------------------
+  .gitignore
+  NUMBER_FIDELITY_IMPLEMENTATION.md
+  README.md
+  agent/__init__.py
+  agent/answer_ledger.py
+  agent/call_state.py
+  agent/callback_config.py
+  agent/callback_flow.py
+  agent/compare_flow.py
+  agent/confidence.py
+  agent/pcm_buffer.py
+  agent/reference_data_cache.py
+  agent/speakability.py
+  agent/state.py
+  agent/tts.py
+  agent/turn_log.py
+  agent/turn_parts.py
+  agent/vad_stream.py
+  clinic-api/company_config.py
+  clinic-api/db.py
+  clinic-api/match_band.py
+  clinic-api/otp_messaging_config.py
+  clinic-api/report_delivery_config.py
+  clinic-api/requirements.txt
+  clinic-api/seed.py
+  clinic-api/setup_db.sh
+  deploy/env.sh
+  deploy/start_all.sh
+  deploy/status.sh
+  docs/evaluations/README.md
+  docs/listening-test.md
+  pytest.ini
+  requirements.txt
+  responses/__init__.py
+  responses/speech_policy.py
+  scripts/gate-report.py
+  scripts/gate.sh
+  setup_addon.sh
+  static/index.html
+  static/pcm/index.html
+  static/pcm/pcm-worklet.js
+  tests/__init__.py
+  tests/conftest.py
+  tests/data/multipart_bn.jsonl
+  tests/test_billing_balance_api.py
+  tests/test_callback_api.py
+  tests/test_clinic_api_health_and_info.py
+  tests/test_clinic_api_reports.py
+  tests/test_clinic_info_reply.py
+  tests/test_date_flow.py
+  tests/test_doctor_schedule.py
+  tests/test_doctor_schedule_dispatch.py
+  tests/test_doctor_schedule_reply.py
+  tests/test_dual_intent_handling.py
+  tests/test_fact_provenance.py
+  tests/test_fast_path_duration_cue.py
+  tests/test_fast_path_schedule_cue.py
+  tests/test_figure_pacing.py
+  tests/test_finish_booking_insufficient_information.py
+  tests/test_follow_up_resolution.py
+  tests/test_health_package_and_clinic_info_intent.py
+  tests/test_health_package_reply.py
+  tests/test_hinglish_fidelity.py
+  tests/test_human_fallback.py
+  tests/test_insufficient_verified_information.py
+  tests/test_insurance_coverage_api.py
+  tests/test_language_detection_dispatch.py
+  tests/test_live_insufficient_information_demo.py
+  tests/test_multilingual_templates.py
+  tests/test_multipart.py
+  tests/test_near_match_offers.py
+  tests/test_otp_not_hardcoded.py
+  tests/test_out_of_scope.py
+  tests/test_outcome_distinction.py
+  tests/test_phase1_reply_templates.py
+  tests/test_prescription_requirements_api.py
+  tests/test_reference_data_cache.py
+  tests/test_report_phone_spoken_digits_dispatch.py
+  tests/test_report_reply_templates.py
+  tests/test_speak_gate.py
+  tests/test_speakability.py
+  tests/test_test_duration_intent.py
+  tests/test_test_duration_reply.py
+  tests/test_test_preparation_api.py
+  tests/test_test_preparation_intent.py
+  tests/test_test_preparation_reply.py
+  tests/test_walkin_eligibility_api.py
+  tools/bench_transport.py
+  tools/hooks/pre-commit
+  tools/listening_stimuli.py
+  tools/make_pcm_variant.py
+  tts_server.py
+
+D. IN BOTH, DIFFERENT -- clean 3-way merge (rule 1), MERGE NOTE header added (16)
+-------------------------------------------------------------------------------
+  tests/test_answer_consistency.py
+      -> clean 3-way merge (1 sou / 0 raj regions)
+  tests/test_booking_readback.py
+      -> clean 3-way merge (8 sou / 0 raj regions)
+  tests/test_compare_options.py
+      -> clean 3-way merge (4 sou / 0 raj regions)
+  tests/test_health_package_and_clinic_info_dispatch.py
+      -> clean 3-way merge (4 sou / 0 raj regions)
+  tests/test_live_test_price_lookup.py
+      -> clean 3-way merge (3 sou / 0 raj regions)
+  tests/test_multi_intent_dispatch.py
+      -> clean 3-way merge (0 sou / 40 raj regions)
+  tests/test_number_fidelity.py
+      -> clean 3-way merge (3 sou / 0 raj regions)
+  tests/test_number_fidelity_review_fixes.py
+      -> clean 3-way merge (3 sou / 0 raj regions)
+  tests/test_phase1_end_to_end_integration.py
+      -> clean 3-way merge (4 sou / 0 raj regions)
+  tests/test_phase1_intents_and_dispatch.py
+      -> clean 3-way merge (4 sou / 0 raj regions)
+  tests/test_reply_templates_fidelity.py
+      -> clean 3-way merge (2 sou / 0 raj regions)
+  tests/test_report_flow.py
+      -> clean 3-way merge (13 sou / 0 raj regions)
+  tests/test_report_status_send_dispatch.py
+      -> clean 3-way merge (10 sou / 0 raj regions)
+  tests/test_request_callback.py
+      -> clean 3-way merge (5 sou / 0 raj regions)
+  tests/test_slot_parse_phone.py
+      -> clean 3-way merge (0 sou / 1 raj regions)
+  tests/test_test_sample_intent.py
+      -> clean 3-way merge (3 sou / 0 raj regions)
+
+7. NOT DONE / OPEN
+   - tests/test_spoken_punctuation.py pending the owner's decision (section 5).
+   - workLog.md held back (section 2).
+   - Only the one conflicting test file was actually RUN. The other test files
+     were checked for syntax and duplicate names, not executed -- running the
+     full suite needs the service dependencies (fastapi, sqlalchemy, torch...).

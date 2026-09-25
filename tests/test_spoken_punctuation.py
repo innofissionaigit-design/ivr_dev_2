@@ -39,6 +39,18 @@ from agent.reply_templates import (  # noqa: E402
     booking_correction_prompt, booking_reply, date_range_confirm_prompt,
     doctor_availability_reply, doctors_by_department_reply, heard_confirm_prompt,
     missing_slot_prompt, test_rate_reply as rate_reply, with_change_notice,
+    # MERGE NOTE (sourav) -- C1 (rule 2, conflict). Both branches added
+    # their own new reply functions to this import list at this same point (empty base: nothing in
+    # common was edited). Resolved KEEP BOTH, owner's decision:
+    # dev_sourav's block first, then dev_rajarshee's.
+    # `booking_confirmation_prompt` was imported by both; kept once
+    # (in dev_sourav's line) -- a duplicate import is legal but noise.
+    # Owner's reason: the merged reply_templates.py carries BOTH branches' reply functions,
+    # and this file's own test_the_gate_covers_every_public_reply_function
+    # fails if any public one lacks a case. Run against the merged tree:
+    # keep-both 278 passed; dev_sourav-only FAILS (36 of dev_rajarshee's
+    # functions uncovered); dev_rajarshee-only CANNOT LOAD (NameError --
+    # dev_sourav's cases elsewhere in this file need his imports).
     # ADDED BY SOURAV -- KCD-454. reply_templates.py grew a lot of public
     # functions after this gate's original corpus was written, and none of
     # them ever got a case here -- see test_the_gate_covers_every_public_
@@ -90,6 +102,29 @@ from agent.reply_templates import (  # noqa: E402
     # verify" story.
     unverifiable_claim_reply,
     anger_reply,
+    # MERGE NOTE (sourav) -- dev_rajarshee's half of the kept-both block starts here.
+    # story title: Caller moves an existing appointment (E4-S3)
+    reschedule_prompt, reschedule_found_prompt, reschedule_pick_prompt,
+    reschedule_not_found_reply, reschedule_day_unavailable_reply,
+    reschedule_time_prompt, reschedule_confirm_prompt, reschedule_reply,
+    reschedule_kept_reply, reschedule_not_changed_reply,
+    reschedule_outcome_unknown_reply,
+    # story title: Caller cancels an appointment (E4-S4)
+    cancel_choice_prompt, cancel_prompt, cancel_pick_prompt, cancel_not_found_reply,
+    cancel_confirm_prompt, cancel_charge_prompt, cancel_charge_retry_prompt,
+    cancel_quote_changed_prompt, cancel_unavailable_reply, cancel_reply,
+    cancel_kept_reply, cancel_not_cancelled_reply, cancel_outcome_unknown_reply,
+    # story title: Caller gives everything in one sentence (E13-S7)
+    booking_doctor_not_found_prompt, booking_day_unavailable_prompt,
+    booking_time_outside_hours_prompt, booking_date_check_prompt,
+    # story title: Caller names only a doctor
+    booking_doctor_offer_prompt, booking_date_time_prompt, booking_patient_contact_prompt,
+    # story title: Caller asks for the earliest available appointment
+    booking_earliest_slots_prompt, booking_earliest_none_prompt,
+    # story title: Requested slot is already taken
+    booking_slot_taken_prompt,
+    # story title: Caller says tomorrow, day after, or next Monday
+    date_ask_prompt, date_range_pick_prompt,
 )
 # ADDED BY SOURAV -- bugfix for the "Caller goes silent" story's close
 # message (validation report Bug #2): silence_close_reply() now branches
@@ -240,6 +275,16 @@ def _replies():
     yield "near/no-spoken-name", near_match_prompt(
         [{"name": "Some Test", "name_bn": None}])
 
+    # MERGE NOTE (sourav) -- C2 (rule 2, conflict). Both branches added
+    # their own reply-sentence cases to _replies() at this same point (empty base: nothing in
+    # common was edited). Resolved KEEP BOTH, owner's decision:
+    # dev_sourav's block first, then dev_rajarshee's.
+    # Owner's reason: the merged reply_templates.py carries BOTH branches' reply functions,
+    # and this file's own test_the_gate_covers_every_public_reply_function
+    # fails if any public one lacks a case. Run against the merged tree:
+    # keep-both 278 passed; dev_sourav-only FAILS (36 of dev_rajarshee's
+    # functions uncovered); dev_rajarshee-only CANNOT LOAD (NameError --
+    # dev_sourav's cases elsewhere in this file need his imports).
     # ADDED BY SOURAV -- KCD-454. One case per branch for every reply
     # function that grew up after this gate's original corpus was
     # written (see the import block's own comment above). Same "named so
@@ -492,6 +537,119 @@ def _replies():
                   "callback_time_window"):
         yield f"correction/{field}", correction_acknowledged_reply(field, _CORRECTION_SLOTS)
 
+    # MERGE NOTE (sourav) -- dev_rajarshee's half of the kept-both block starts here.
+    # story title: Caller moves an existing appointment (E4-S3)
+    # Every branch. The originals carried three label colons ("পেয়েছি:",
+    # "ফাঁকা আছে:", "থাকছে:") that this gate would have failed.
+    _appt = {"reference": "KCD-20260915-4F0C", "doctor_name": "Dr. A Sen",
+             "doctor_name_bn": "সেন", "date": "2026-09-15", "time_slot": "10:00"}
+    for field in ("phone", "name", "pick", "date", "time_slot", "confirm", "other"):
+        yield f"resched/prompt/{field}", reschedule_prompt(field)
+    yield "resched/found", reschedule_found_prompt(_appt)
+    yield "resched/pick-2", reschedule_pick_prompt([_appt, _appt])
+    yield "resched/pick-3", reschedule_pick_prompt([_appt, _appt, _appt])
+    yield "resched/not-found", reschedule_not_found_reply()
+    yield "resched/day-off", reschedule_day_unavailable_reply(
+        _appt, {"next_available_date": "2026-09-19"})
+    yield "resched/day-off-none", reschedule_day_unavailable_reply(
+        _appt, {"next_available_date": None})
+    yield "resched/time", reschedule_time_prompt(
+        _appt, "2026-09-17", {"chamber_hours": "10:00-12:00"})
+    yield "resched/readback", reschedule_confirm_prompt(_appt, "2026-09-17", "10:30")
+    yield "resched/success", reschedule_reply(
+        {"success": True, **_appt, "new_date": "2026-09-17", "new_time_slot": "10:30"}, _appt)
+    for reason, extra in (("slot_taken", {"alternative_slots": ["10:45", "11:00"]}),
+                          ("slot_taken", {"alternative_slots": []}),
+                          ("doctor_not_available_that_day", {"next_available_date": "2026-09-19"}),
+                          ("same_slot", {}), ("conflict", {}), ("past", {})):
+        yield (f"resched/{reason}{'-alts' if extra.get('alternative_slots') else ''}",
+               reschedule_reply({"success": False, "reason": reason, **extra}, _appt))
+    yield "resched/kept", reschedule_kept_reply(_appt)
+    yield "resched/kept-none", reschedule_kept_reply(None)
+    yield "resched/not-changed", reschedule_not_changed_reply()
+    yield "resched/unknown", reschedule_outcome_unknown_reply()
+
+    # story title: Caller cancels an appointment (E4-S4)
+    # Every branch, for a free, a part-refund and a no-refund window.
+    yield "cancel/choice", cancel_choice_prompt()
+    for field in ("choice", "phone", "name", "pick", "confirm", "other"):
+        yield f"cancel/prompt/{field}", cancel_prompt(field)
+    yield "cancel/pick-2", cancel_pick_prompt([_appt, _appt])
+    yield "cancel/pick-3", cancel_pick_prompt([_appt, _appt, _appt])
+    yield "cancel/not-found", cancel_not_found_reply()
+    for name, quote in (("free", {"charge_inr": 0, "refund_eligibility": "full",
+                                  "refund_percent": None}),
+                        ("part", {"charge_inr": 150, "refund_eligibility": "partial",
+                                  "refund_percent": 50}),
+                        ("late", {"charge_inr": 320, "refund_eligibility": "none",
+                                  "refund_percent": None})):
+        yield f"cancel/confirm/{name}", cancel_confirm_prompt(_appt, quote)
+        yield f"cancel/charge/{name}", cancel_charge_prompt(_appt, quote)
+        yield f"cancel/retry/{name}", cancel_charge_retry_prompt(quote)
+        yield f"cancel/changed/{name}", cancel_quote_changed_prompt(_appt, quote)
+        yield f"cancel/success/{name}", cancel_reply({**_appt, **quote})
+    for reason in ("already_cancelled", "after_start", "policy_unavailable", "conflict",
+                   "not_found", None):
+        yield f"cancel/unavailable/{reason}", cancel_unavailable_reply(reason)
+    yield "cancel/kept", cancel_kept_reply(_appt)
+    yield "cancel/kept-none", cancel_kept_reply(None)
+    yield "cancel/not-cancelled", cancel_not_cancelled_reply()
+    yield "cancel/unknown", cancel_outcome_unknown_reply()
+
+    # story title: Caller gives everything in one sentence (E13-S7)
+    # The three "ask that one field again" questions, Bengali.
+    _doc = {"doctor_name": "Dr. A. Sen", "doctor_name_bn": "সেন"}
+    _avail = dict(_doc, next_available_date="2026-09-24", chamber_hours="10:00-13:00")
+    yield "onesentence/doctor-not-found", booking_doctor_not_found_prompt()
+    yield "onesentence/day-off", booking_day_unavailable_prompt(_doc, _avail)
+    yield "onesentence/day-off-none", booking_day_unavailable_prompt(
+        _doc, dict(_avail, next_available_date=None))
+    yield "onesentence/outside-hours", booking_time_outside_hours_prompt(_doc, _avail)
+    # A date calculated from "কাল" / a weekday, rechecked, and the readback
+    # that names it.
+    _calc = dict(_doc, date="2026-09-20", date_said="tomorrow", date_weekday=6)
+    yield "onesentence/date-check", booking_date_check_prompt(_calc)
+    yield "onesentence/date-check-weekday", booking_date_check_prompt(
+        dict(_calc, date_said="sunday"))
+    yield "onesentence/readback-day-word", booking_confirmation_prompt(
+        dict(_calc, time_slot="10:15", patient_name="রাহুল দাস", phone="9876543210"))
+
+    # story title: Caller names only a doctor
+    _next = dict(_doc, available=True, date="2026-09-22", chamber_hours="10:00-13:00")
+    yield "doctoronly/offer", booking_doctor_offer_prompt(_doc, _next)
+    yield "doctoronly/offer-time-known", booking_doctor_offer_prompt(
+        dict(_doc, time_slot="10:30"), _next)
+    yield "doctoronly/offer-none", booking_doctor_offer_prompt(
+        _doc, dict(_doc, available=False, date=None))
+    yield "doctoronly/date-time", booking_date_time_prompt()
+    yield "doctoronly/patient-contact", booking_patient_contact_prompt()
+
+    # story title: Caller asks for the earliest available appointment
+    _early = dict(_doc, found=True, horizon_days=14, slots=[
+        {"date": "2026-09-22", "time_slot": "10:00"}, {"date": "2026-09-22", "time_slot": "10:15"},
+        {"date": "2026-09-24", "time_slot": "10:00"}])
+    yield "earliest/three", booking_earliest_slots_prompt(_doc, _early)
+    yield "earliest/one", booking_earliest_slots_prompt(_doc, dict(_early, slots=_early["slots"][:1]))
+    yield "earliest/none", booking_earliest_none_prompt(_doc, dict(_early, slots=[]))
+    yield "earliest/none-no-phone", booking_earliest_none_prompt(
+        _doc, dict(_early, slots=[]), ask_phone=False)
+
+    # story title: Requested slot is already taken
+    _asked = dict(_doc, time_slot="11:15")
+    _taken = {"success": False, "reason": "slot_taken", "alternative_slots": ["11:00", "11:30"],
+              "other_day_slot": {"date": "2026-09-26", "time_slot": "11:15"}}
+    yield "taken/all-three", booking_slot_taken_prompt(_asked, _taken)
+    yield "taken/same-day-only", booking_slot_taken_prompt(_asked, dict(_taken, other_day_slot=None))
+    yield "taken/other-day-only", booking_slot_taken_prompt(_asked, dict(_taken, alternative_slots=[]))
+
+    # story title: Caller says tomorrow, day after, or next Monday
+    yield "dates/ask-none", date_ask_prompt(())
+    yield "dates/ask-one", date_ask_prompt(("2026-09-22",))
+    yield "dates/ask-two", date_ask_prompt(("2026-09-28", "2026-10-05"))
+    yield "dates/range-pick", date_range_pick_prompt("2026-09-28", "2026-10-04")
+    yield "dates/check-explicit", booking_date_check_prompt(
+        {"date": "2026-09-25", "date_said": "date", "date_weekday": 4})
+
     for intent in ("test_rate", "doctor_availability", "doctors_by_department",
                    "book_appointment"):
         for field in ("test_name", "doctor_name", "department", "date",
@@ -576,6 +734,17 @@ def test_the_gate_covers_every_public_reply_function():
         "booking_reply", "booking_confirm_prompt", "booking_correction_prompt",
         "date_range_confirm_prompt", "heard_confirm_prompt", "missing_slot_prompt",
         "with_change_notice", "near_match_prompt", "unanswered_part_prompt",
+        # MERGE NOTE (sourav) -- C3 (rule 2, conflict). Both branches added
+        # their own function names to this `exercised` set at this same point (empty base: nothing in
+        # common was edited). Resolved KEEP BOTH, owner's decision:
+        # dev_sourav's block first, then dev_rajarshee's.
+        # `booking_confirmation_prompt` was listed by both; kept once.
+        # Owner's reason: the merged reply_templates.py carries BOTH branches' reply functions,
+        # and this file's own test_the_gate_covers_every_public_reply_function
+        # fails if any public one lacks a case. Run against the merged tree:
+        # keep-both 278 passed; dev_sourav-only FAILS (36 of dev_rajarshee's
+        # functions uncovered); dev_rajarshee-only CANNOT LOAD (NameError --
+        # dev_sourav's cases elsewhere in this file need his imports).
         # ADDED BY SOURAV -- KCD-454. The 33 functions the import block
         # above grew to cover.
         "ambiguous_reference_reply", "billing_balance_reply",
@@ -620,6 +789,24 @@ def test_the_gate_covers_every_public_reply_function():
         # ADDED BY SOURAV -- "Caller is angry about a previous experience"
         # story. See the eight yields above (two branches x four languages).
         "anger_reply",
+        # MERGE NOTE (sourav) -- dev_rajarshee's half of the kept-both block starts here.
+        "reschedule_prompt", "reschedule_found_prompt", "reschedule_pick_prompt",
+        "reschedule_not_found_reply", "reschedule_day_unavailable_reply",
+        "reschedule_time_prompt", "reschedule_confirm_prompt", "reschedule_reply",
+        "reschedule_kept_reply", "reschedule_not_changed_reply",
+        "reschedule_outcome_unknown_reply",
+        "cancel_choice_prompt", "cancel_prompt", "cancel_pick_prompt",
+        "cancel_not_found_reply", "cancel_confirm_prompt", "cancel_charge_prompt",
+        "cancel_charge_retry_prompt", "cancel_quote_changed_prompt",
+        "cancel_unavailable_reply", "cancel_reply", "cancel_kept_reply",
+        "cancel_not_cancelled_reply", "cancel_outcome_unknown_reply",
+        "booking_doctor_not_found_prompt", "booking_day_unavailable_prompt",
+        "booking_time_outside_hours_prompt", "booking_date_check_prompt",
+        "booking_doctor_offer_prompt", "booking_date_time_prompt",
+        "booking_patient_contact_prompt",
+        "booking_earliest_slots_prompt", "booking_earliest_none_prompt",
+        "booking_slot_taken_prompt",
+        "date_ask_prompt", "date_range_pick_prompt",
     }
     assert public <= exercised, (
         f"reply function(s) {sorted(public - exercised)} have no case in this gate"

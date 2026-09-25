@@ -185,7 +185,28 @@ VALID_INTENTS = {"test_rate", "test_sample", "test_duration", "test_preparation"
                   # speak one back (agent/reply_templates.
                   # doctor_personal_request_reply() takes no doctor-name
                   # argument at all).
-                  "doctor_personal_request"}
+                  "doctor_personal_request",
+                  # MERGE NOTE (sourav) -- C1 (rule 2, conflict) and R1-D: the two
+                  # branches both rewrote this closing line; both sets of intents are
+                  # kept. Reason (owner's decision): dev_sourav adds
+                  # clinical_interpretation / human_direct_request / complaint /
+                  # doctor_personal_request, dev_rajarshee adds
+                  # reschedule_appointment / cancel_appointment. No name is edited
+                  # differently by the two sides, so nothing is lost by keeping both.
+                  # Flow: extract_intent() -> _validate() checks the model's intent
+                  # against this set, so every intent the prompt can emit MUST be here.
+                  # E4-S3 "Caller moves an existing appointment". Split out
+                  # of book_appointment, whose description used to say
+                  # "book, confirm, or reschedule" -- so a caller moving a
+                  # Tuesday appointment to Thursday was walked through a NEW
+                  # booking and left holding two. The model only
+                  # classifies; main.py ignores this intent's slots and
+                  # collects every detail itself.
+                  "reschedule_appointment",
+                  # E4-S4 "Caller cancels an appointment". The model only
+                  # recognises the wish; it never states a charge, a refund
+                  # or a rule -- those come from clinic-api's rules file.
+                  "cancel_appointment"}
 
 # story title: The model never originates a fact
 # user story: As a clinical lead, I want every price, date and identifier to
@@ -217,6 +238,36 @@ _DATE_EXPR_LIST = ", ".join(sorted(DATE_EXPRESSIONS))
 # answer_ledger, main.py's dispatch), and "parts" is the new, optional list a
 # second (or third) question shows up in. parts[0] is guaranteed to mirror the
 # top level, so nothing downstream has to learn two shapes.
+# MERGE NOTES (sourav) -- dev_sourav + dev_rajarshee merged into test.
+# Why: both branches edited the intent classifier prompt below, from the same
+# base commit (6cbeb0b). These notes stay OUTSIDE the prompt string on purpose
+# so the model never reads them.
+# Flow: rule 1 = an item present/changed on only ONE side is merged as-is;
+# rule 2 = an item changed differently on BOTH sides is a conflict and was
+# resolved by the owner's explicit decision (recorded below).
+#
+# RULE 1 (new / one-sided items, merged directly):
+#  R1-A  sourav    "smalltalk" bullet: extra clause -- never confirm/deny an
+#                  unverifiable claim, never react to anger (kept as-is).
+#  R1-B  sourav    NEW bullets clinical_interpretation, human_direct_request,
+#                  complaint, doctor_personal_request; "unclear" bullet now
+#                  points to them (kept as-is).
+#  R1-C  sourav    NEW notes: CLINICAL SAFETY, NO-RETENTION, NO-ARGUMENT,
+#                  NO-PROMISE (kept as-is).
+#  R1-D  rajarshee "book_appointment" narrowed to NEW bookings + multi-slot /
+#                  earliest-slot guidance; NEW bullets reschedule_appointment
+#                  and cancel_appointment (kept as-is).
+#  R1-E  rajarshee "date_expr" rule: "saturday" = the coming Saturday,
+#                  "next_saturday" = the one after (kept as-is).
+# RULE 2 (conflicts, both sides edited the same line):
+#  C1    VALID_INTENTS set above: BOTH sides kept (see the MERGE NOTE inside
+#        the set). Owner's reason: the sides add different, non-overlapping
+#        intent names, so keeping both loses nothing.
+#  C2    JSON "intent" enum at the end of the prompt: SUPERSET of both sides
+#        (base list + reschedule_appointment/cancel_appointment after
+#        book_appointment + the 4 sourav intents before "unclear"). Owner's
+#        reason: the enum must list every intent VALID_INTENTS accepts, or the
+#        model is never told it may emit the new ones.
 SYSTEM_PROMPT_TEMPLATE = """You are the intent-and-slot extractor for a diagnostic clinic's Bengali phone assistant. You will be given ONE caller utterance, transcribed by automatic speech recognition from live phone audio -- it may contain ASR errors, missing punctuation, or code-switched English words written in Bengali script.
 
 You do NOT have a calendar and you are not given today's date. You never need one: when the caller mentions a day, you say WHICH EXPRESSION they used and a separate calculator works out the actual dates afterwards.
@@ -231,7 +282,9 @@ INTENTS (one per part -- see MULTI-PART below):
 - "doctor_availability": caller is asking whether a named doctor is available/in chamber on a SPECIFIC day -- today, tomorrow, a named weekday, an explicit date -- OR asking for the doctor's NEXT available date going forward (e.g. "is Dr Sen available today", "Dr Sen কি আজ আছেন", "Dr Sen kobe next available"). This intent always resolves to one particular day. Do NOT use this for a general "which days does he usually sit" question with no date attached -- that is "doctor_schedule" below.
 - "doctor_schedule": caller is asking about a named doctor's GENERAL, RECURRING weekly schedule -- which day(s) of the week they usually sit, with NO reference to today/tomorrow/a specific date and NOT asking for the next available date either (e.g. "Dr Sen কবে বসেন", "ডাক্তার সেন কোন কোন দিন বসেন", "which days does Dr Sen sit", "Dr Sen ka schedule kya hai", "Dr Sen kon din boshen"). If the caller's question is tied to a specific day, or to "next available", use "doctor_availability" instead.
 - "doctors_by_department": caller is asking for doctors in a specific department (e.g., "ortho", "cardiology", "অর্থো").
-- "book_appointment": caller wants to book, confirm, or reschedule an appointment.
+- "book_appointment": caller wants to book or confirm a NEW appointment. A caller may give the doctor, the day, the time, the patient's name and the phone number all in ONE sentence (e.g. "কাল সকাল দশটায় ডাক্তার সেনের কাছে রাহুল দাসের নামে একটা অ্যাপয়েন্টমেন্ট চাই, নম্বর ৯৮৭৬৫৪৩২১০") -- then fill EVERY one of those slots from that sentence ("doctor_name", "date_expr"/"date", "time_slot", "patient_name", "phone"); leave null only what was not said. A caller asking for the EARLIEST / soonest appointment with a doctor ("ডাক্তার সেনের কাছে সবচেয়ে তাড়াতাড়ি কবে পাব", "Dr Sen earliest slot", "jaldi se jaldi") is also "book_appointment": fill "doctor_name" and leave "date"/"date_expr" null -- never guess a day.
+- "reschedule_appointment": caller wants to move an EXISTING appointment to a different day or time (e.g. "অ্যাপয়েন্টমেন্টটা অন্য দিনে সরাতে চাই", "বুকিংটা পিছিয়ে দিন", "appointment ta shift korte chai", "can I change my appointment date"). Not a new booking -- the caller already has one. Leave every slot null for this intent; the details are collected afterwards, not by you.
+- "cancel_appointment": caller wants to CANCEL an EXISTING appointment, or says they cannot come to it (e.g. "অ্যাপয়েন্টমেন্টটা বাতিল করতে চাই", "বুকিংটা ক্যানসেল করুন", "কাল আসতে পারব না", "appointment ta cancel kore din", "I want to cancel my appointment"). If the caller also asks for another day or time, that is "reschedule_appointment", not this. Leave every slot null for this intent; the details are collected afterwards. Never state a charge, a refund or a cancellation rule yourself.
 - "report_status": caller is asking whether their LAB REPORT is ready, not yet ready, still processing, or asking about it generally (e.g. "is my CBC report ready", "amar report ready hoyeche", "রিপোর্ট তৈরি হয়েছে?", "আসতে হবে নাকি রিপোর্ট হয়ে গেছে" -- asking to check before travelling counts as this intent too). Use this whenever the caller is asking ABOUT a report's status, even indirectly (e.g. asking whether they need to visit the clinic). Do NOT use this if they are asking about a test's PRICE or SAMPLE requirement instead -- those are "test_rate"/"test_sample".
 - "report_send": caller wants their report DELIVERED/SENT to them (e.g. "send my report", "report ta phone e pathiye dao", "রিপোর্টটা ফোনে পাঠিয়ে দিন", "amar report ta pete pari ki") -- opening directly with a delivery request, not first asking whether it's ready. If the caller only asks whether it's ready (with no request to send it), use "report_status" instead.
 - "health_package": caller is asking about a health checkup/screening PACKAGE (a bundle of tests sold together, e.g. "Diabetes Screening Package"), either about ONE named package (e.g. "diabetes package koto", "ডায়াবেটিস প্যাকেজে কি কি টেস্ট আছে", "what's in the full body package") or asking what packages exist AT ALL with none named (e.g. "what health packages do you have", "কি কি হেলথ প্যাকেজ আছে", "health package ache kina"). Do NOT use this for a question about a single, standalone lab test's price/sample/duration -- those are "test_rate"/"test_sample"/"test_duration".
@@ -264,7 +317,7 @@ NO-PROMISE NOTE for "doctor_personal_request": your ONLY job for this intent is 
 
 SLOT RULES:
 - Only fill a slot if the caller's words support it. Leave it null rather than inferring.
-- "date_expr": if the caller referred to a day or a period, name it using EXACTLY ONE of these values and nothing else: {date_expr_list}. NEVER output a calendar date -- not in this field, not anywhere. You have no way to know what today is, so any yyyy-mm-dd you produced would be invented. Examples: আজ -> "today", কাল/আগামীকাল -> "tomorrow", পরশু -> "day_after_tomorrow", আগামী সপ্তাহে -> "next_week", আগামী শনিবার -> "next_saturday", শনিবার -> "saturday". If the caller DID refer to a day but none of the values above fit it, use "other" -- never guess a value that is merely close. If the caller mentioned no day at all, leave it null -- do not assume "today".
+- "date_expr": if the caller referred to a day or a period, name it using EXACTLY ONE of these values and nothing else: {date_expr_list}. NEVER output a calendar date -- not in this field, not anywhere. You have no way to know what today is, so any yyyy-mm-dd you produced would be invented. Examples: আজ -> "today", কাল/আগামীকাল -> "tomorrow", পরশু -> "day_after_tomorrow", আগামী সপ্তাহে -> "next_week", শনিবার / আগামী শনিবার / সামনের শনিবার / this saturday -> "saturday" (the COMING one), পরের সপ্তাহের শনিবার / saturday of next week / agle hafte shanivaar -> "next_saturday" (the one AFTER the coming one). Use "next_<day>" ONLY when the caller clearly means the week after; the agent checks the day with the caller either way. If the caller DID refer to a day but none of the values above fit it, use "other" -- never guess a value that is merely close. If the caller mentioned no day at all, leave it null -- do not assume "today".
 - "date": ONLY if the caller spoke a calendar date out loud ("১৫ তারিখ", "তেসরা সেপ্টেম্বর"), copy their words EXACTLY as they said them, the same way you copy a test name. Do not convert it to digits or to any date format. Otherwise null.
 - "test_name" / "doctor_name": copy the term as the caller said it (Bengali or transliterated English), do not translate or normalize it -- the lookup service handles matching.
 - "department": copy the department name as the caller said it (e.g., "ortho", "cardiology", "অর্থোপেডিক্স"), do not translate or normalize it -- the lookup service handles matching.
@@ -288,7 +341,7 @@ MULTI-PART: a caller in a hurry may ask more than one distinct, independent ques
 
 Output ONLY a single valid JSON object, no other text, in exactly this shape:
 {{
-  "intent": "test_rate" | "test_sample" | "test_duration" | "test_preparation" | "doctor_availability" | "doctor_schedule" | "doctors_by_department" | "book_appointment" | "report_status" | "report_send" | "health_package" | "clinic_info" | "walkin_eligibility" | "prescription_requirements" | "insurance_coverage" | "billing_balance" | "compare_options" | "request_callback" | "smalltalk" | "out_of_scope" | "clinical_interpretation" | "human_direct_request" | "complaint" | "doctor_personal_request" | "unclear",
+  "intent": "test_rate" | "test_sample" | "test_duration" | "test_preparation" | "doctor_availability" | "doctor_schedule" | "doctors_by_department" | "book_appointment" | "reschedule_appointment" | "cancel_appointment" | "report_status" | "report_send" | "health_package" | "clinic_info" | "walkin_eligibility" | "prescription_requirements" | "insurance_coverage" | "billing_balance" | "compare_options" | "request_callback" | "smalltalk" | "out_of_scope" | "clinical_interpretation" | "human_direct_request" | "complaint" | "doctor_personal_request" | "unclear",
   "slots": {{
     "test_name": string or null,
     "doctor_name": string or null,

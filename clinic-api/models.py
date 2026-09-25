@@ -45,6 +45,14 @@ from __future__ import annotations
 
 import secrets
 
+# MERGE NOTE (sourav) -- R1-A (rule 1, one-sided: dev_rajarshee only).
+# dev_rajarshee adds `Index` and `text` to this import block for the partial
+# unique index on `appointments` (see R1-C below). dev_sourav changed nothing
+# here at all -- his ComplaintRecord uses only Column/Integer/String/Text/
+# DateTime, every one of which the `test` branch already imported -- so this
+# merged directly with no decision needed. Verified `UniqueConstraint` is
+# STILL used by three other tables in this file, so it does not become an
+# unused import after R1-C swaps the one on `appointments`.
 from sqlalchemy import (
     Column,
     Integer,
@@ -55,6 +63,9 @@ from sqlalchemy import (
     DateTime,
     UniqueConstraint,
     Text,
+    # E4-S4: the partial unique index on appointments (active rows only).
+    Index,
+    text,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -1165,6 +1176,32 @@ class Appointment(Base):
         nullable=False,
     )
 
+    # MERGE NOTE (sourav) -- R1-B (rule 1, one-sided: dev_rajarshee only).
+    # dev_rajarshee adds these two columns to the EXISTING Appointment table
+    # for the cancel story (E4-S4); dev_sourav does not touch Appointment
+    # anywhere in his branch, so there was nothing to weigh here -- merged
+    # directly. Deployment caveat worth knowing (dev_rajarshee's own comment
+    # just below says the same thing): create_all() never ADDS a column to a
+    # table that already exists, so an already-deployed clinic.db only gains
+    # `status`/`cancelled_at` when clinic-api/migrations.py is actually run.
+    # E4-S4 "Caller cancels an appointment". A cancelled appointment is KEPT,
+    # marked "cancelled" -- never deleted: foreign keys are ON and E4-S3's
+    # history and outbox rows point at it, and it is the record of what the
+    # caller was charged. Every query that means "live bookings" filters
+    # status == "active". An existing database gains these two columns
+    # through clinic-api/migrations.py (create_all cannot add them).
+    status = Column(
+        String,
+        nullable=False,
+        default="active",
+        server_default="active",
+    )
+
+    cancelled_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
     doctor = relationship(
         "Doctor",
     )
@@ -1174,12 +1211,41 @@ class Appointment(Base):
         back_populates="appointments",
     )
 
+    # MERGE NOTE (sourav) -- R1-C/D/E (rule 1, one-sided: dev_rajarshee only;
+    # difflib splits it into three hunks, it is one logical change).
+    # The `test` branch had:
+    #     __table_args__ = (
+    #         UniqueConstraint(
+    #             "doctor_id",
+    #             "date",
+    #             "time_slot",
+    #             name="uq_doctor_slot",
+    #         ),
+    #     )
+    # dev_rajarshee replaces that table-wide constraint with the partial
+    # unique Index below. dev_sourav made no change here, so it merged
+    # directly. FLAGGED, because this one is silent if missed: the
+    # constraint is also RENAMED (uq_doctor_slot -> uq_doctor_slot_active)
+    # and create_all() will not alter an existing database, so an
+    # un-migrated clinic.db keeps the OLD table-wide constraint. On such a
+    # database cancelling would appear to work while the freed slot still
+    # could not be re-booked. clinic-api/migrations.py (dev_rajarshee's new
+    # file, already in this merged set) is what makes this real.
+    # E4-S4: was UniqueConstraint(doctor_id, date, time_slot, name=
+    # "uq_doctor_slot") over EVERY row, which would let a cancelled
+    # appointment hold its slot for ever. Now unique over ACTIVE rows only,
+    # so a cancelled slot can be booked again -- and a second ACTIVE row in
+    # a slot is still refused by the database itself, which the booking
+    # race and the reschedule swap (E4-S3) both rely on.
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_doctor_slot_active",
             "doctor_id",
             "date",
             "time_slot",
-            name="uq_doctor_slot",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
         ),
     )
 
@@ -1267,6 +1333,38 @@ class CallbackRequest(Base):
     )
 
 
+# ============================================================================
+# MERGE NOTE (sourav) -- C1 (rule 2, THE ONE CONFLICT IN THIS FILE)
+# ============================================================================
+#
+# WHAT COLLIDED: both branches append new ORM table classes at the very end
+# of this file -- the identical insertion point (the `test` branch's last
+# line, closing CallbackRequest). git's 3-way merge cannot know whose block
+# comes first, which is the whole of the conflict. It is POSITIONAL, not
+# semantic: checked programmatically for collisions and there are none --
+#   dev_sourav     -> ComplaintRecord        / complaint_records
+#   dev_rajarshee  -> AppointmentChange      / appointment_changes
+#                     NotificationOutbox     / notification_outbox
+#                     AppointmentCancellation/ appointment_cancellations
+# No shared class name, no shared __tablename__, no shared column.
+#
+# RESOLUTION: KEEP BOTH -- dev_sourav's ComplaintRecord first (immediately
+# below), then dev_rajarshee's three tables after it.
+#
+# THE OWNER'S REASON: keeping both is the only resolution that does not break
+# code already merged in this same set. clinic-api/main.py imports
+# ComplaintRecord for dev_sourav's complaint endpoint AND AppointmentChange /
+# NotificationOutbox / AppointmentCancellation for dev_rajarshee's
+# reschedule/cancel endpoints -- that was that file's own C1 conflict, itself
+# resolved as "keep both". Dropping either side here would leave
+# clinic-api/main.py importing a class that does not exist, so this is a
+# conflict of ORDERING only. Order chosen to match the sequence the two
+# stories were merged in everywhere else in this set (dev_sourav's story
+# blocks before dev_rajarshee's), and because these tables are independent
+# -- SQLAlchemy resolves its ForeignKey("appointments.id") strings by table
+# name at mapper-configuration time, not by class definition order, so the
+# order is a readability choice with no runtime effect either way.
+#
 # ============================================================================
 # COMPLAINT RECORDS
 # ============================================================================
@@ -1359,3 +1457,117 @@ class ComplaintRecord(Base):
         DateTime,
         nullable=False,
     )
+
+# ----------------------------------------------------------------------------
+# MERGE NOTE (sourav) -- C1 continued: everything from here to the end of the
+# file is dev_rajarshee's half of the kept-both resolution (see the full C1
+# note above ComplaintRecord). Nothing below was modified during the merge.
+# ----------------------------------------------------------------------------
+# ============================================================================
+# APPOINTMENT CHANGES + NOTIFICATION OUTBOX
+# ============================================================================
+#
+# story title: Caller moves an existing appointment (E4-S3)
+# user story: As a patient whose plans changed, I want to move my appointment
+#   without cancelling it, so that I do not lose my place entirely.
+# acceptance criteria: The booking is found by contact number, name or
+#   reference. The new slot is swapped atomically, holding the old one until
+#   the new commits, and a failed swap leaves the original intact.
+#   Confirmation is sent on both channels.
+#
+# TWO NEW TABLES, AND DELIBERATELY NO NEW COLUMN ON `appointments`.
+# clinic-api builds its schema with Base.metadata.create_all(), which creates
+# MISSING TABLES but never adds a column to a table that already exists. With
+# no migration tool (E0-S4 is absent), a new column would silently not exist
+# in the live /workspace/clinic.db. New tables are created on the next start.
+#
+# Both rows are written in the SAME transaction as the move itself (see
+# clinic-api/main.py's reschedule_appointment()), so a history row or a
+# queued confirmation can never exist for a move that rolled back, and can
+# never be missing for one that committed.
+class AppointmentChange(Base):
+    """One committed move. Append-only.
+
+    Doubles as the IDEMPOTENCY RECORD (Blueprint 4.9): `idempotency_key` is
+    unique, and `result_json` is the exact response the first request got,
+    so a retry of the same request replays it instead of moving twice.
+    """
+    __tablename__ = "appointment_changes"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    old_date = Column(String, nullable=False)
+    old_time_slot = Column(String, nullable=False)
+    new_date = Column(String, nullable=False)
+    new_time_slot = Column(String, nullable=False)
+    call_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=False, unique=True)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+
+
+class NotificationOutbox(Base):
+    """A confirmation waiting to be sent on a non-voice channel.
+
+    NOTHING READS THIS TABLE YET. There is no SMS gateway and no
+    DLT-registered template (E1-S10 is absent), so rows stay "pending". The
+    voice agent therefore never says a message was sent.
+
+    `payload_json` carries field values only -- NO phone and NO patient name.
+    A sender joins `appointment_id` for the number at send time, so the
+    queue is not a second copy of the patient's contact details.
+    """
+    __tablename__ = "notification_outbox"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    kind = Column(String, nullable=False)          # "reschedule_confirmation"
+    channel = Column(String, nullable=False)       # "sms"
+    template_id = Column(String, nullable=False)   # "reschedule_confirmation_v1"
+    payload_json = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="pending")
+    created_at = Column(DateTime, nullable=False)
+
+
+# ============================================================================
+# E4-S4 -- Caller cancels an appointment
+# ============================================================================
+#
+# story title: Caller cancels an appointment
+# user story: As a patient who cannot attend, I want to cancel and be told any
+#   charge clearly, so that I am not surprised by a deduction later.
+# acceptance criteria: Cancellation applies the configured window rules and
+#   states refund eligibility from policy, never improvised. A cancellation
+#   within a charging window is confirmed explicitly with the charge stated
+#   before it is applied.
+#
+# Written in the SAME transaction as the status change (see clinic-api/
+# main.py's cancel_appointment()), with a NotificationOutbox row, so a
+# charge can never be recorded for a cancellation that rolled back, and can
+# never be missing for one that committed.
+class AppointmentCancellation(Base):
+    """One committed cancellation and the charge it carried. Append-only.
+
+    There is no payment system: `charge_status` is "none" or
+    "pending_collection" and nothing moves it yet. `refund_eligibility` is
+    what the rules said the caller is entitled to -- not a payment.
+
+    Doubles as the IDEMPOTENCY RECORD (Blueprint 4.9): `idempotency_key` is
+    unique, and `result_json` is the exact response the first request got,
+    so a retry replays it instead of cancelling -- or charging -- twice.
+    """
+    __tablename__ = "appointment_cancellations"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    policy_version = Column(String, nullable=False)   # the rules file's `version`
+    window_id = Column(String, nullable=False)        # e.g. "0-12h"
+    hours_before = Column(Float, nullable=False)
+    charge_inr = Column(Integer, nullable=False)
+    charge_status = Column(String, nullable=False)    # "none" | "pending_collection"
+    refund_eligibility = Column(String, nullable=False)   # "full" | "partial" | "none"
+    refund_percent = Column(Integer, nullable=True)
+    call_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=False, unique=True)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)

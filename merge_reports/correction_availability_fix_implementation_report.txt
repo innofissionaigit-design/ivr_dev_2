@@ -1,0 +1,118 @@
+IMPLEMENTATION REPORT - Booking correction paths now revalidate availability
+Prepared for: sourav / InnoFissionAI          Repo: innofissionaigit-design/ivr_dev_2
+Files: main.py, main_pcm.py (inside merged_code)
+=====================================================================================
+
+1. TASK
+   Follow-up to the main.py / main_pcm.py merges. The owner asked whether
+   dev_sourav's correction logic and dev_rajarshee's booking logic conflict,
+   and whether dev_sourav's correction detection can act as a universal layer
+   that defers to dev_rajarshee's booking-specific logic once inside the
+   booking flow. The analysis (given first, in plain text) found they do not
+   conflict, but surfaced a real, unaddressed gap: two of dev_sourav's own
+   correction entry points bypassed dev_rajarshee's availability-revalidation
+   logic for date corrections. The owner reviewed a proposed fix and asked to
+   implement it, plus check whether it required changes to any other file in
+   merged_code.
+
+2. THE GAP (confirmed by reading agent/correction_flow.py and main.py directly)
+   dev_sourav's correction system has three entry points into a booking
+   correction:
+     a. Mid-collection, cue-gated spontaneous check (already hybridised with
+        dev_rajarshee's logic during the original merge -- C4/C5/C6).
+     b. The "confirm_booking" readback shortcut -- correcting a value while
+        hearing the final readback, no "no" needed first.
+     c. The "confirm_correction" state's one-breath shortcut -- naming the
+        field and giving its new value together, after the two-step menu.
+   (b) and (c) are both entirely dev_sourav's own code, untouched by the
+   original 8 conflicts, so they were merged as-is. Both wrote
+   `pending["slots"][field] = new_value` directly. For "date", that skipped
+   `_apply_booking_date()` (dev_rajarshee), so stale date metadata
+   (date_said, date_weekday, date_checked, date_candidates, date_range) from
+   the OLD date was never cleared, and `_open_booking()` was never re-entered
+   to re-check availability with clinic-api -- meaning a date or time_slot
+   corrected through either path could be re-confirmed even if it was no
+   longer actually bookable, exactly the failure mode _open_booking()'s own
+   docstring says it exists to prevent (E13-S6).
+
+3. FIX IMPLEMENTED (identical in both main.py and main_pcm.py; verified
+   byte-for-byte equal after the change)
+   - New helper `_apply_booking_correction(slots, field, value, text)`,
+     inserted right after `_apply_booking_date()`: routes "date" through
+     `_apply_booking_date()` so stale metadata is cleared exactly as it
+     already is on the mid-collection path; every other field (including
+     "time_slot", which has no metadata of its own to clear) is written
+     directly.
+   - New `_BOOKING_REOPEN_FIELDS = ("date", "time_slot")`, mirroring the
+     tuple the already-approved C4/C5/C6 block checks.
+   - Both call sites (b) and (c) now call `_apply_booking_correction()`
+     instead of writing the slot directly, then -- when the corrected field
+     is date or time_slot and a doctor is already known -- speak the
+     acknowledgment and re-enter `_open_booking(session, pending["slots"],
+     language, turns=pending.get("turns", 1),
+     offered_date=pending.get("offered_date"))` instead of going straight to
+     the readback / next-missing-field prompt.
+   - Every change is commented in-file with a MERGE NOTE (sourav) crediting
+     the story this follows up on and explaining the reasoning, per the
+     owner's standing convention for this codebase.
+
+4. WHY "time_slot" WAS ADDED (not just "date", as the owner's own chat
+   proposal only mentioned)
+   Read agent/correction_flow.py directly: `_BOOKING_SPONTANEOUS_FIELDS =
+   ("date", "time_slot", "phone")`, and the "confirm_correction" state's own
+   `parse_correction_field()` also recognises "time_slot" as a nameable
+   field. A date-only fix would have left the identical class of bug in
+   place for time corrections made through the same two paths, so the fix
+   covers both.
+
+5. SCOPE CHECK -- OTHER FILES IN merged_code
+   Explicitly checked whether this required any change outside main.py /
+   main_pcm.py:
+   - Every name the new code calls (_apply_booking_date, _open_booking,
+     spoken_day_word, correction_acknowledged_reply, _next_missing,
+     missing_slot_prompt, booking_confirmation_prompt) was already defined
+     or imported in both files before this change -- confirmed by grepping
+     each name individually. No new import was added to either file.
+   - No existing function's signature was changed, so nothing that already
+     calls _apply_booking_date() or _open_booking() elsewhere is affected.
+   - The callback flow (confirm_callback / confirm_callback_correction)
+     only ever corrects "phone" (agent/correction_flow.py:
+     _CALLBACK_SPONTANEOUS_FIELDS = ("phone",)) -- no date/availability
+     concept applies there, so it was deliberately left untouched.
+   - The doctor_name correction branch already makes its own
+     get_doctor_availability() call as part of validating the name, so it
+     is already availability-aware by a separate, already-correct
+     mechanism.
+   CONCLUSION: no other file in merged_code (agent/*.py or clinic-api/*)
+   needed any change. This fix is fully self-contained to main.py and
+   main_pcm.py.
+
+6. VERIFICATION
+   - python -m py_compile main.py main_pcm.py: both OK.
+   - 0 leftover conflict markers in either file.
+   - AST-level check: exactly one definition of _apply_booking_correction
+     per file.
+   - Programmatic diff confirmed the new helper and both call-site edits
+     are byte-for-byte identical between main.py and main_pcm.py -- same
+     parity bar the original 8 conflicts were held to.
+   - Cross-checked every name the new code references resolves inside the
+     same file; no new cross-file dependency was introduced.
+   - Not yet exercised against a live call / listening test (see below).
+
+7. OPEN ITEM (behavioural, not a code defect)
+   When the new reopen path fires, the caller hears the acknowledgment and
+   _open_booking()'s own line as two separate short _speak() calls, not one
+   combined sentence -- the same shape already flagged for the original
+   C4/C5/C6 block and already awaiting a listening-test check. This fix
+   reuses that shape at the two new call sites for consistency, so the
+   existing recommendation now covers three spots total instead of one:
+     - mid-collection date/time_slot correction (original C4/C5/C6)
+     - "confirm_booking" readback shortcut, date/time_slot correction (new)
+     - "confirm_correction" one-breath shortcut, date/time_slot correction (new)
+   Recommend a listening test covering all three before shipping.
+
+8. DELIVERABLES (this task)
+   - main.py, main_pcm.py -- updated, re-saved to the merged_code folder.
+   - correction_availability_fix_review.txt -- exact before/after code for
+     the new helper and both call sites.
+   - this report.

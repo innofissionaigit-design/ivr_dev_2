@@ -1,3 +1,10 @@
+# MERGE NOTE (sourav) -- this test file differed between dev_sourav and
+# dev_rajarshee. Merged 3-way against their common ancestor (6cbeb0b ==
+# test): every change from each branch touches a different part of the
+# file, so it merged with NO conflicts -- rule 1, both sides kept whole.
+# Changed regions vs the ancestor: 1 from dev_sourav, 0 from
+# dev_rajarshee. Checked after merging: parses, and no test function or
+# class name is defined twice (which would silently drop a test).
 """Asking twice does not produce two answers.
 
 story title: The same question gets the same answer within one call

@@ -572,6 +572,15 @@ _RE_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b(\s*তারিখে?)?")
 _RE_TIME_RANGE = re.compile(r"\b(\d{1,2}):(\d{2})\s*[-–—to]{1,2}\s*(\d{1,2}):(\d{2})\b")
 _RE_TIME = re.compile(r"\b(\d{1,2}):(\d{2})\b")
 _RE_PHONE = re.compile(r"\b(\d{10,})\b")
+# MERGE NOTE (sourav) -- dev_sourav and dev_rajarshee independently fixed
+# this exact same bug (KCD-445 / E4-S3: the confirmation-id regex stopped
+# before the trailing "-<hex>" suffix clinic-api actually generates).
+# Both regexes are functionally identical (only differ in hyphen-optional
+# and character-class ordering, e.g. [-]? vs -?, [A-Z0-9] vs [0-9A-Z]).
+# dev_sourav's version is kept below since its comment has the fuller
+# root-cause writeup; dev_rajarshee's equivalent regex was
+# r"\b([A-Z]{2,}-?\d{3,}(?:-[0-9A-Z]{2,})?)\b" -- same behaviour, dropped
+# as a duplicate, not a conflict to resolve either way.
 # FIXED BY SOURAV -- KCD-445 ("Numbers are never rounded, reordered or
 # approximated"). This pattern only ever matched the FIRST hyphen group of
 # an identifier. That was invisible while every real confirmation ID was
