@@ -1,0 +1,1573 @@
+"""
+SQLAlchemy models for the clinic's dummy PostgreSQL data.
+
+Prototype-grade on purpose: this exists so the voice agent can call
+a realistic backend while being bench-tested.
+
+All data is fictional and intended only for testing.
+
+======================================================================
+CHATGPT ADDITION NOTE
+======================================================================
+
+
+1. Add clinic opening and closing time.
+2. Add clinic address and directions.
+3. Add health packages.
+4. Add patient details such as name and phone number.
+5. Add patient-specific laboratory reports.
+6. Support testing whether a patient's report is ready or not ready.
+7. Support report-not-found cases.
+8. Add OTP verification for sending reports.
+9. Add report delivery tracking and audit information.
+10. Add expiring signed-link information instead of permanent attachments.
+11. Support English, Hinglish/Banglish and Bengali-script caller inputs.
+12. Add enough structure to test edge cases for:
+       - report ready
+       - report not ready
+       - report not found
+       - wrong patient
+       - wrong phone
+       - wrong OTP
+       - expired OTP
+       - expired report link
+       - failed delivery
+       - successful delivery
+       - repeated delivery attempts
+13. Keep the existing doctor, department, schedule, laboratory and
+    appointment functionality intact.
+
+Created for Sourav.
+======================================================================
+"""
+
+from __future__ import annotations
+
+import secrets
+
+# MERGE NOTE (sourav) -- R1-A (rule 1, one-sided: dev_rajarshee only).
+# dev_rajarshee adds `Index` and `text` to this import block for the partial
+# unique index on `appointments` (see R1-C below). dev_sourav changed nothing
+# here at all -- his ComplaintRecord uses only Column/Integer/String/Text/
+# DateTime, every one of which the `test` branch already imported -- so this
+# merged directly with no decision needed. Verified `UniqueConstraint` is
+# STILL used by three other tables in this file, so it does not become an
+# unused import after R1-C swaps the one on `appointments`.
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Float,
+    Boolean,
+    ForeignKey,
+    DateTime,
+    UniqueConstraint,
+    Text,
+    # E4-S4: the partial unique index on appointments (active rows only).
+    Index,
+    text,
+)
+from sqlalchemy.orm import declarative_base, relationship
+
+
+Base = declarative_base()
+
+
+# ============================================================================
+# CLINIC INFORMATION
+# ============================================================================
+#
+# Used for queries such as:
+#
+# English:
+#   "When do you open?"
+#   "What time does the clinic close?"
+#   "Where is the clinic?"
+#   "Give me directions."
+#
+# Hinglish / Banglish:
+#   "Clinic kab khulta hai?"
+#   "Clinic koto khon porjonto open thake?"
+#   "Address ta ki?"
+#   "Kivabe jabo?"
+#
+# Bengali script:
+#   "ক্লিনিক কখন খোলে?"
+#   "ক্লিনিক কখন বন্ধ হয়?"
+#   "ঠিকানাটা কী?"
+#
+# CHATGPT ADDITION - CREATED BY SOURAV:
+# This section was added to make clinic-information intents testable
+# without hardcoding the information inside the voice agent.
+# ============================================================================
+
+class ClinicInfo(Base):
+    __tablename__ = "clinic_info"
+
+    id = Column(Integer, primary_key=True)
+
+    clinic_name = Column(String, nullable=False)
+
+    # Main contact number of the clinic.
+    phone = Column(String, nullable=False)
+
+    # Full physical address.
+    address = Column(Text, nullable=False)
+
+    # Simple landmark / directions text.
+    directions = Column(Text, nullable=False)
+
+    # Weekly opening and closing times.
+    #
+    # Example:
+    # Monday = 09:00 - 21:00
+    #
+    # Stored as strings intentionally for prototype simplicity.
+    monday_open = Column(String, nullable=False, default="09:00")
+    monday_close = Column(String, nullable=False, default="21:00")
+
+    tuesday_open = Column(String, nullable=False, default="09:00")
+    tuesday_close = Column(String, nullable=False, default="21:00")
+
+    wednesday_open = Column(String, nullable=False, default="09:00")
+    wednesday_close = Column(String, nullable=False, default="21:00")
+
+    thursday_open = Column(String, nullable=False, default="09:00")
+    thursday_close = Column(String, nullable=False, default="21:00")
+
+    friday_open = Column(String, nullable=False, default="09:00")
+    friday_close = Column(String, nullable=False, default="21:00")
+
+    saturday_open = Column(String, nullable=False, default="09:00")
+    saturday_close = Column(String, nullable=False, default="21:00")
+
+    # Nullable because Sunday can be closed.
+    sunday_open = Column(String, nullable=True)
+    sunday_close = Column(String, nullable=True)
+
+    sunday_closed = Column(Boolean, nullable=False, default=True)
+
+
+# ============================================================================
+# HEALTH PACKAGES
+# ============================================================================
+#
+# Used for:
+#
+#   "What health packages do you have?"
+#   "Diabetes package ache?"
+#   "Heart checkup package koto?"
+#   "General health package e ki ki test ache?"
+#
+# CHATGPT ADDITION - CREATED BY SOURAV:
+# Added so package-related calls can be tested against database data
+# instead of hardcoded responses.
+# ============================================================================
+
+class HealthPackage(Base):
+    __tablename__ = "health_packages"
+
+    id = Column(Integer, primary_key=True)
+
+    name = Column(String, nullable=False, unique=True)
+
+    # Bengali / Banglish / English aliases.
+    #
+    # Example:
+    # "diabetes checkup|diabetes package|ডায়াবেটিস প্যাকেজ"
+    aliases = Column(String, nullable=False, default="")
+
+    description = Column(Text, nullable=False)
+
+    price_inr = Column(Float, nullable=False)
+
+    active = Column(Boolean, nullable=False, default=True)
+
+    tests = relationship(
+        "HealthPackageTest",
+        back_populates="package",
+        cascade="all, delete-orphan",
+    )
+
+
+class HealthPackageTest(Base):
+    __tablename__ = "health_package_tests"
+
+    id = Column(Integer, primary_key=True)
+
+    package_id = Column(
+        Integer,
+        ForeignKey("health_packages.id"),
+        nullable=False,
+    )
+
+    lab_test_id = Column(
+        Integer,
+        ForeignKey("lab_tests.id"),
+        nullable=False,
+    )
+
+    package = relationship(
+        "HealthPackage",
+        back_populates="tests",
+    )
+
+    lab_test = relationship("LabTest")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "package_id",
+            "lab_test_id",
+            name="uq_package_test",
+        ),
+    )
+
+
+# ============================================================================
+# DEPARTMENT
+# ============================================================================
+
+class Department(Base):
+    __tablename__ = "departments"
+
+    id = Column(Integer, primary_key=True)
+
+    name = Column(String, nullable=False, unique=True)
+
+    # English + Bengali-script + Banglish aliases.
+    #
+    # Example:
+    # "ortho|orthopedics|অর্থোপেডিক্স|অর্থো|bone"
+    aliases_bn = Column(
+        String,
+        nullable=False,
+        default="",
+    )
+
+    doctors = relationship(
+        "Doctor",
+        back_populates="department",
+    )
+
+
+# ============================================================================
+# DOCTOR
+# ============================================================================
+
+class Doctor(Base):
+    __tablename__ = "doctors"
+
+    id = Column(Integer, primary_key=True)
+
+    name = Column(
+        String,
+        nullable=False,
+    )
+
+    qualifications = Column(
+        String,
+        nullable=False,
+    )
+
+    # Bengali-script and spoken aliases.
+    #
+    # Example:
+    # "সেন|ডক্টর সেন|Dr Sen|doctor sen"
+    aliases_bn = Column(
+        String,
+        nullable=False,
+        default="",
+    )
+
+    department_id = Column(
+        Integer,
+        ForeignKey("departments.id"),
+        nullable=False,
+    )
+
+    department = relationship(
+        "Department",
+        back_populates="doctors",
+    )
+
+    schedule = relationship(
+        "DoctorSchedule",
+        back_populates="doctor",
+        cascade="all, delete-orphan",
+    )
+
+    # ADDED BY SOURAV -- KCD-385 ("Caller asks when a doctor sits"): a
+    # doctor's leave status is a property of the PERSON, not of any one
+    # weekday row in DoctorSchedule -- it is temporary and independent of
+    # which days they normally sit, and it should not require touching (or
+    # deleting) the real schedule rows to represent. is_on_leave is a plain
+    # flag; leave_return_date is a free-text string (not a Date column --
+    # this table has none in use elsewhere, and the value is only ever
+    # spoken, never computed on) so it can be left null when the return
+    # date genuinely is not known yet, and doctor_schedule_reply() in
+    # agent/reply_templates.py speaks that as "no return date given" rather
+    # than a fabricated one. See clinic-api/main.py's doctor_schedule()
+    # endpoint for how this is read, and seed.py for the two doctors seeded
+    # on leave (one with a known return date, one without) so this path is
+    # provable against real data, not just a hand-built fixture.
+    is_on_leave = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+
+    leave_return_date = Column(
+        String,
+        nullable=True,
+    )
+
+
+# ============================================================================
+# DOCTOR SCHEDULE
+# ============================================================================
+
+class DoctorSchedule(Base):
+    """
+    One row per weekday a doctor sits.
+
+    weekday:
+        0 = Monday
+        1 = Tuesday
+        ...
+        6 = Sunday
+    """
+
+    __tablename__ = "doctor_schedule"
+
+    id = Column(Integer, primary_key=True)
+
+    doctor_id = Column(
+        Integer,
+        ForeignKey("doctors.id"),
+        nullable=False,
+    )
+
+    weekday = Column(
+        Integer,
+        nullable=False,
+    )
+
+    start_time = Column(
+        String,
+        nullable=False,
+    )
+
+    end_time = Column(
+        String,
+        nullable=False,
+    )
+
+    doctor = relationship(
+        "Doctor",
+        back_populates="schedule",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "doctor_id",
+            "weekday",
+            name="uq_doctor_weekday",
+        ),
+    )
+
+
+# ============================================================================
+# LAB TEST
+# ============================================================================
+
+class LabTest(Base):
+    __tablename__ = "lab_tests"
+
+    id = Column(Integer, primary_key=True)
+
+    name = Column(
+        String,
+        nullable=False,
+        unique=True,
+    )
+
+    # English + Bengali-script + Banglish aliases.
+    #
+    # Example:
+    # "cbc|সি বি সি|সিবিসি|complete blood count"
+    aliases_bn = Column(
+        String,
+        nullable=False,
+        default="",
+    )
+
+    rate_inr = Column(
+        Float,
+        nullable=False,
+    )
+
+    sample_type = Column(
+        String,
+        nullable=False,
+    )
+
+    report_time_hours = Column(
+        Integer,
+        nullable=False,
+    )
+
+    # ========================================================================
+    # ADDED BY SOURAV -- "Caller asks how to prepare for a test" story.
+    #
+    # Every column below is nullable with NO default, on purpose: only the
+    # tests the business has actually supplied real preparation content
+    # for (see clinic-api/seed.py's LAB_TEST_ADVISORIES) ever get these
+    # filled in. Every other LabTest row leaves them all as None.
+    #
+    # This is a deliberate safety choice, not an oversight. Defaulting
+    # fasting_required to False for a test nobody has actually reviewed
+    # would be FABRICATING a medical instruction -- "no fasting needed"
+    # is not a safe guess, it is a specific claim that could be wrong.
+    # Same discipline as RULE 1 elsewhere in this file ("never invent a
+    # report"), applied here to something with real physical stakes if
+    # gotten wrong: the API layer and the voice agent must both treat
+    # "no advisory row" as "we don't know yet, don't answer", never as
+    # "assume no restrictions".
+    # ========================================================================
+
+    # Whether the caller must fast before this test. None = not seeded
+    # yet (see above) -- never treat as False.
+    fasting_required = Column(Boolean, nullable=True)
+
+    # Free text, not an int: real fasting windows are given as ranges
+    # ("8-12 hours"), not single numbers.
+    fasting_hours = Column(String, nullable=True)
+
+    # What the caller may drink while fasting/preparing (e.g. "Only plain
+    # water permitted during fasting period").
+    water_allowance = Column(String, nullable=True)
+
+    # Which medications (if any) to hold and until when (e.g. "Hold
+    # morning anti-diabetic medication until after blood collection").
+    medication_hold = Column(Text, nullable=True)
+
+    # Any other timing constraint on the test itself (e.g. "Exactly 2
+    # hours post-meal", "Morning sample collection preferred").
+    timing_rule = Column(String, nullable=True)
+
+    # Ready-to-speak, business-authored advisory sentences, one per
+    # supported language, each containing a literal "{test_name}"
+    # placeholder the reply layer fills in at speak-time (see
+    # agent/reply_templates.py's test_preparation_reply() -- same
+    # canonical-name-vs-Bengali-alias selection every other reply in this
+    # codebase already uses). Stored as real per-language text rather
+    # than composed from the structured fields above, because the
+    # business supplied genuine, reviewed Bengali/Hinglish/Banglish
+    # phrasing for these -- unlike ClinicInfo.address/directions or
+    # HealthPackage.description, this is NOT the English-only gap
+    # flagged elsewhere in this codebase (see those models' own
+    # comments); recomposing it programmatically from the structured
+    # fields would only risk mangling wording the business already
+    # approved.
+    advisory_script_en = Column(Text, nullable=True)
+    advisory_script_hinglish = Column(Text, nullable=True)
+    advisory_script_banglish = Column(Text, nullable=True)
+    advisory_script_bn = Column(Text, nullable=True)
+
+    # ========================================================================
+    # ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Walk-in
+    # Eligibility + Prescription Requirements stories.
+    #
+    # Same discipline as the advisory columns just above, extended to two
+    # more regulatory/operational facts: every column below is nullable
+    # with NO default. None means "nobody has reviewed this test for
+    # walk-in/prescription policy yet" -- never treat that as "eligible"
+    # or "not required". Defaulting walkin_eligible to True, or
+    # prescription_required to False, for a test nobody actually
+    # confirmed would be fabricating an operational/regulatory fact
+    # exactly like guessing a fasting rule would be a medical one -- see
+    # this class's own comment above for the identical reasoning.
+    # ========================================================================
+
+    # Whether a caller can walk in for this test without a prior
+    # appointment. None = not reviewed yet, never treat as False.
+    walkin_eligible = Column(Boolean, nullable=True)
+
+    # Free text, not structured hours: real walk-in windows are given as
+    # day-specific ranges ("Mon-Sat 7am-11am, no walk-ins Sunday"), not a
+    # single machine-parseable value -- same reasoning as fasting_hours
+    # above being a string, not an int.
+    walkin_hours = Column(String, nullable=True)
+
+    # Whether this test requires a doctor's prescription before it can be
+    # performed. None = not reviewed yet, never treat as False.
+    prescription_required = Column(Boolean, nullable=True)
+
+    # Pipe-delimited list of accepted submission channels for the
+    # prescription (e.g. "whatsapp_photo|email|counter_in_person") --
+    # same delimited-list convention as aliases_bn above and
+    # HealthPackage.aliases below, not a JSON column (nothing else in
+    # this file uses one). Split on "|" at the API layer, same as
+    # aliases_bn is split on "|" wherever it's read.
+    prescription_channels = Column(String, nullable=True)
+
+
+# ============================================================================
+# INSURANCE PROVIDER / INSURANCE POLICY
+# ============================================================================
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Insurance
+# Coverage Policy story.
+#
+# A caller asks "does my Star Health cover this test" by naming their
+# insurer OUT LOUD, the same way they name a test or a doctor -- so
+# InsuranceProvider gets the same name+aliases voice-matching shape as
+# LabTest.aliases_bn / Doctor.aliases_bn / HealthPackage.aliases, instead
+# of being a bare fixed string/enum on the policy row. InsurancePolicy
+# itself is a (test, provider) pair, per the plan: one row is "does
+# provider X cover test Y", never a whole-provider blanket answer --
+# a real insurer's coverage differs test-by-test.
+# ============================================================================
+
+class InsuranceProvider(Base):
+    __tablename__ = "insurance_providers"
+
+    id = Column(Integer, primary_key=True)
+
+    name = Column(String, nullable=False, unique=True)
+
+    # English + Bengali-script + Hinglish/Banglish aliases, same "|"-joined
+    # convention as LabTest.aliases_bn.
+    #
+    # Example:
+    # "star health|স্টার হেলথ|star"
+    aliases = Column(String, nullable=False, default="")
+
+    active = Column(Boolean, nullable=False, default=True)
+
+    policies = relationship(
+        "InsurancePolicy",
+        back_populates="provider",
+        cascade="all, delete-orphan",
+    )
+
+
+class InsurancePolicy(Base):
+    __tablename__ = "insurance_policies"
+
+    id = Column(Integer, primary_key=True)
+
+    test_id = Column(
+        Integer,
+        ForeignKey("lab_tests.id"),
+        nullable=False,
+    )
+
+    provider_id = Column(
+        Integer,
+        ForeignKey("insurance_providers.id"),
+        nullable=False,
+    )
+
+    # COVERED / NOT_COVERED / PARTIAL. Nullable with no default, same
+    # reasoning as LabTest's advisory/walk-in/prescription columns: no
+    # row for a (test, provider) pair means "we don't know", never a
+    # guessed COVERED or NOT_COVERED.
+    coverage_status = Column(String, nullable=True)
+
+    pre_auth_required = Column(Boolean, nullable=True)
+
+    lab_test = relationship("LabTest")
+
+    provider = relationship(
+        "InsuranceProvider",
+        back_populates="policies",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "test_id",
+            "provider_id",
+            name="uq_test_provider_policy",
+        ),
+    )
+
+
+# ============================================================================
+# PATIENT
+# ============================================================================
+#
+# This is one of the most important additions.
+#
+# The old database had patient_name and phone directly inside Appointment.
+#
+# That is not enough for report-related testing because the system needs
+# to identify the SAME patient across multiple reports and conversations.
+#
+# CHATGPT ADDITION - CREATED BY SOURAV:
+# Added patient identity, phone, language preference and spoken-name aliases
+# so the agent can test patient-specific report queries.
+# ============================================================================
+
+class Patient(Base):
+    __tablename__ = "patients"
+
+    id = Column(Integer, primary_key=True)
+
+    # Patient's canonical name.
+    name = Column(
+        String,
+        nullable=False,
+    )
+
+    # Alternate names / spellings.
+    #
+    # Example:
+    # "Sourav Upadhyay|Sourav|সৌরভ|সৌরভ উপাধ্যায়"
+    #
+    # This helps test ASR variations.
+    name_aliases = Column(
+        String,
+        nullable=False,
+        default="",
+    )
+
+    # Phone number used for patient verification and report delivery.
+    phone = Column(
+        String,
+        nullable=False,
+        unique=True,
+    )
+
+    # Optional secondary phone.
+    alternate_phone = Column(
+        String,
+        nullable=True,
+    )
+
+    # Preferred caller language.
+    #
+    # Supported test values:
+    #   english
+    #   hinglish
+    #   banglish
+    #   bengali
+    language = Column(
+        String,
+        nullable=False,
+        default="english",
+    )
+
+    date_of_birth = Column(
+        String,
+        nullable=True,
+    )
+
+    gender = Column(
+        String,
+        nullable=True,
+    )
+
+    active = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+    )
+
+    reports = relationship(
+        "LabReport",
+        back_populates="patient",
+        cascade="all, delete-orphan",
+    )
+
+    appointments = relationship(
+        "Appointment",
+        back_populates="patient",
+    )
+
+
+# ============================================================================
+# PATIENT BILLING
+# ============================================================================
+#
+# ADDED BY SOURAV -- Phase 1: Database Schema & Policy Tables. Outstanding
+# Balance / Billing story.
+#
+# One row per patient (per the plan's schema), not itemized per invoice --
+# a running "what do they currently owe" total, mirroring how a caller
+# actually asks ("do I have any dues pending"), not an itemized statement.
+# NO ROW for a patient is a real, distinct outcome from a row with
+# outstanding_amount=0.0: the former means "we have no billing record for
+# this patient at all" (honest not-found, same as LabTest's advisory
+# columns being None), the latter is a real, reviewed "confirmed zero
+# balance". Never create a row just to fill it with a guessed 0.
+#
+# Identity is resolved by PHONE (patient_id, via Patient.phone), same
+# RULE 14/15 discipline as reports -- never by name. Per an explicit
+# scoping decision for this first pass: a balance is spoken after a plain
+# phone-based lookup, the same friction level as report_status, NOT
+# gated behind OTP verification the way report delivery is. Revisit this
+# if it should be tightened later -- it was a deliberate choice, not an
+# oversight.
+# ============================================================================
+
+class PatientBilling(Base):
+    __tablename__ = "patient_billing"
+
+    id = Column(Integer, primary_key=True)
+
+    patient_id = Column(
+        Integer,
+        ForeignKey("patients.id"),
+        nullable=False,
+        unique=True,
+    )
+
+    # None = no billing record for this patient (see class docstring
+    # above) -- never treat as 0.
+    outstanding_amount = Column(Float, nullable=True)
+
+    due_date = Column(DateTime, nullable=True)
+
+    # When this row was last reviewed/updated -- lets a future story
+    # answer "how current is this" without guessing.
+    updated_at = Column(DateTime, nullable=True)
+
+    patient = relationship("Patient")
+
+
+# ============================================================================
+# LAB REPORT
+# ============================================================================
+#
+# This directly supports:
+#
+#   "Is my report ready?"
+#   "Amar report ready?"
+#   "Amar report ta ready hoyeche?"
+#   "Report ready na?"
+#
+# Important statuses:
+#
+#   READY
+#   NOT_READY
+#   PROCESSING
+#   CANCELLED
+#
+# A separate NOT_FOUND case happens when no report exists for the
+# requested patient/report/test.
+#
+# CHATGPT ADDITION - CREATED BY SOURAV:
+# Added patient-specific report status so the voice agent can test
+# ready vs not-ready vs missing-report outcomes.
+# ============================================================================
+
+class LabReport(Base):
+    __tablename__ = "lab_reports"
+
+    id = Column(Integer, primary_key=True)
+
+    # Human-readable report identifier.
+    #
+    # Example:
+    # LAB-2026-0001
+    report_number = Column(
+        String,
+        nullable=False,
+        unique=True,
+    )
+
+    patient_id = Column(
+        Integer,
+        ForeignKey("patients.id"),
+        nullable=False,
+    )
+
+    lab_test_id = Column(
+        Integer,
+        ForeignKey("lab_tests.id"),
+        nullable=False,
+    )
+
+    # Sample collection date.
+    collected_at = Column(
+        DateTime,
+        nullable=False,
+    )
+
+    # Expected completion time.
+    expected_ready_at = Column(
+        DateTime,
+        nullable=False,
+    )
+
+    # Actual completion time.
+    ready_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    # READY / NOT_READY / PROCESSING / CANCELLED
+    status = Column(
+        String,
+        nullable=False,
+        default="PROCESSING",
+    )
+
+    # Optional reason when report is delayed.
+    status_reason = Column(
+        String,
+        nullable=True,
+    )
+
+    # Whether the report can currently be delivered.
+    delivery_enabled = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+
+    # Version helps test situations where a report is regenerated.
+    report_version = Column(
+        Integer,
+        nullable=False,
+        default=1,
+    )
+
+    patient = relationship(
+        "Patient",
+        back_populates="reports",
+    )
+
+    lab_test = relationship(
+        "LabTest",
+    )
+
+    deliveries = relationship(
+        "ReportDelivery",
+        back_populates="report",
+        cascade="all, delete-orphan",
+    )
+
+    otp_verifications = relationship(
+        "ReportOTP",
+        back_populates="report",
+        cascade="all, delete-orphan",
+    )
+
+
+# ============================================================================
+# REPORT OTP
+# ============================================================================
+#
+# Used for:
+#
+#   "Send my report"
+#   "Report pathanor age OTP lagbe?"
+#   "OTP is 123456"
+#
+# Testable states:
+#
+#   valid OTP
+#   wrong OTP
+#   expired OTP
+#   already-used OTP
+#   too many attempts
+#
+# NOTE:
+# In a real production system the OTP should NOT be stored in plaintext.
+# This prototype intentionally stores a dummy value so testing is easy.
+#
+# CHATGPT ADDITION - CREATED BY SOURAV.
+# ============================================================================
+
+# ADDED BY SOURAV -- the user's own explicit instruction: "the otp and
+# other things will not be hardcoded". This replaces two previously
+# hardcoded, guessable literals:
+#   - clinic-api/main.py's own FRESH_OTP_CODE constant ("135790"), minted
+#     every time request_report_delivery() has no reusable OTP row to
+#     hand back out.
+#   - clinic-api/seed.py's OTP_DATA list, which used to give every seeded
+#     ReportOTP row ("482913", "615204", "903217", "731846") a fixed
+#     literal too.
+# Both call sites now call THIS function instead, so there is exactly one
+# place in the whole codebase that decides what an OTP code looks like.
+# `secrets.randbelow` (not `random`) because this is a real, security-
+# relevant credential (RULE 9: it gates report delivery) even though this
+# is a prototype -- see this class's own "Production should store a hash
+# instead" comment just below for the next hardening step past this one.
+def generate_otp_code() -> str:
+    """A real random 6-digit OTP, zero-padded (e.g. "042913") -- never a
+    fixed, predictable value. How this code actually reaches the patient
+    is a separate, deliberately pluggable concern -- see
+    clinic-api/otp_messaging_config.py, the one file a deploying company
+    edits to connect this to their own SMS/WhatsApp/e-mail provider."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+class ReportOTP(Base):
+    __tablename__ = "report_otps"
+
+    id = Column(Integer, primary_key=True)
+
+    report_id = Column(
+        Integer,
+        ForeignKey("lab_reports.id"),
+        nullable=False,
+    )
+
+    patient_id = Column(
+        Integer,
+        ForeignKey("patients.id"),
+        nullable=False,
+    )
+
+    # Phone number to which OTP was sent.
+    phone = Column(
+        String,
+        nullable=False,
+    )
+
+    # Prototype-only OTP.
+    #
+    # Production should store a hash instead.
+    otp_code = Column(
+        String,
+        nullable=False,
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+    )
+
+    expires_at = Column(
+        DateTime,
+        nullable=False,
+    )
+
+    verified_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    used = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+
+    attempt_count = Column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    max_attempts = Column(
+        Integer,
+        nullable=False,
+        default=3,
+    )
+
+    report = relationship(
+        "LabReport",
+        back_populates="otp_verifications",
+    )
+
+    patient = relationship(
+        "Patient",
+    )
+
+
+# ============================================================================
+# REPORT DELIVERY
+# ============================================================================
+#
+# This handles the second story:
+#
+#   "Send my report."
+#
+# The acceptance criteria require:
+#
+#   - OTP verification
+#   - expiring signed link
+#   - audit trail
+#   - recipient
+#   - verification path
+#   - failed verification should offer collection in person
+#
+# CHATGPT ADDITION - CREATED BY SOURAV:
+# Added explicit delivery state and signed-link expiry so the test system
+# can intentionally create success and failure scenarios.
+# ============================================================================
+
+class ReportDelivery(Base):
+    __tablename__ = "report_deliveries"
+
+    id = Column(Integer, primary_key=True)
+
+    report_id = Column(
+        Integer,
+        ForeignKey("lab_reports.id"),
+        nullable=False,
+    )
+
+    patient_id = Column(
+        Integer,
+        ForeignKey("patients.id"),
+        nullable=False,
+    )
+
+    # Phone/email destination.
+    recipient = Column(
+        String,
+        nullable=False,
+    )
+
+    # PHONE / EMAIL / WHATSAPP etc.
+    delivery_channel = Column(
+        String,
+        nullable=False,
+        default="SMS",
+    )
+
+    # OTP_REQUIRED / VERIFIED / FAILED / EXPIRED
+    verification_status = Column(
+        String,
+        nullable=False,
+        default="OTP_REQUIRED",
+    )
+
+    # PENDING / SENT / FAILED / EXPIRED
+    delivery_status = Column(
+        String,
+        nullable=False,
+        default="PENDING",
+    )
+
+    # Unique signed URL identifier.
+    #
+    # Do NOT use a real permanent URL in this prototype.
+    signed_link_token = Column(
+        String,
+        nullable=True,
+        unique=True,
+    )
+
+    # When the signed link becomes invalid.
+    signed_link_expires_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    # Number of times delivery was attempted.
+    attempt_count = Column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+    )
+
+    verified_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    sent_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    failed_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    # Human-readable failure reason.
+    #
+    # Examples:
+    # "WRONG_OTP"
+    # "OTP_EXPIRED"
+    # "LINK_EXPIRED"
+    # "DELIVERY_PROVIDER_FAILURE"
+    # "PHONE_MISMATCH"
+    failure_reason = Column(
+        String,
+        nullable=True,
+    )
+
+    # Audit information.
+    #
+    # Example:
+    # "OTP verified on registered phone ending 1234"
+    audit_note = Column(
+        Text,
+        nullable=True,
+    )
+
+    report = relationship(
+        "LabReport",
+        back_populates="deliveries",
+    )
+
+    patient = relationship(
+        "Patient",
+    )
+
+
+# ============================================================================
+# APPOINTMENT
+# ============================================================================
+
+class Appointment(Base):
+    __tablename__ = "appointments"
+
+    id = Column(Integer, primary_key=True)
+
+    confirmation_id = Column(
+        String,
+        nullable=False,
+        unique=True,
+    )
+
+    doctor_id = Column(
+        Integer,
+        ForeignKey("doctors.id"),
+        nullable=False,
+    )
+
+    date = Column(
+        String,
+        nullable=False,
+    )
+
+    time_slot = Column(
+        String,
+        nullable=False,
+    )
+
+    # Keep these fields for backward compatibility with the existing
+    # appointment seed/tooling.
+    patient_name = Column(
+        String,
+        nullable=False,
+    )
+
+    phone = Column(
+        String,
+        nullable=False,
+    )
+
+    # Optional connection to the new Patient table.
+    #
+    # Existing appointments can still work even if patient_id is NULL.
+    patient_id = Column(
+        Integer,
+        ForeignKey("patients.id"),
+        nullable=True,
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+    )
+
+    # MERGE NOTE (sourav) -- R1-B (rule 1, one-sided: dev_rajarshee only).
+    # dev_rajarshee adds these two columns to the EXISTING Appointment table
+    # for the cancel story (E4-S4); dev_sourav does not touch Appointment
+    # anywhere in his branch, so there was nothing to weigh here -- merged
+    # directly. Deployment caveat worth knowing (dev_rajarshee's own comment
+    # just below says the same thing): create_all() never ADDS a column to a
+    # table that already exists, so an already-deployed clinic.db only gains
+    # `status`/`cancelled_at` when clinic-api/migrations.py is actually run.
+    # E4-S4 "Caller cancels an appointment". A cancelled appointment is KEPT,
+    # marked "cancelled" -- never deleted: foreign keys are ON and E4-S3's
+    # history and outbox rows point at it, and it is the record of what the
+    # caller was charged. Every query that means "live bookings" filters
+    # status == "active". An existing database gains these two columns
+    # through clinic-api/migrations.py (create_all cannot add them).
+    status = Column(
+        String,
+        nullable=False,
+        default="active",
+        server_default="active",
+    )
+
+    cancelled_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    doctor = relationship(
+        "Doctor",
+    )
+
+    patient = relationship(
+        "Patient",
+        back_populates="appointments",
+    )
+
+    # MERGE NOTE (sourav) -- R1-C/D/E (rule 1, one-sided: dev_rajarshee only;
+    # difflib splits it into three hunks, it is one logical change).
+    # The `test` branch had:
+    #     __table_args__ = (
+    #         UniqueConstraint(
+    #             "doctor_id",
+    #             "date",
+    #             "time_slot",
+    #             name="uq_doctor_slot",
+    #         ),
+    #     )
+    # dev_rajarshee replaces that table-wide constraint with the partial
+    # unique Index below. dev_sourav made no change here, so it merged
+    # directly. FLAGGED, because this one is silent if missed: the
+    # constraint is also RENAMED (uq_doctor_slot -> uq_doctor_slot_active)
+    # and create_all() will not alter an existing database, so an
+    # un-migrated clinic.db keeps the OLD table-wide constraint. On such a
+    # database cancelling would appear to work while the freed slot still
+    # could not be re-booked. clinic-api/migrations.py (dev_rajarshee's new
+    # file, already in this merged set) is what makes this real.
+    # E4-S4: was UniqueConstraint(doctor_id, date, time_slot, name=
+    # "uq_doctor_slot") over EVERY row, which would let a cancelled
+    # appointment hold its slot for ever. Now unique over ACTIVE rows only,
+    # so a cancelled slot can be booked again -- and a second ACTIVE row in
+    # a slot is still refused by the database itself, which the booking
+    # race and the reschedule swap (E4-S3) both rely on.
+    __table_args__ = (
+        Index(
+            "uq_doctor_slot_active",
+            "doctor_id",
+            "date",
+            "time_slot",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
+
+
+# ============================================================================
+# CALLBACK REQUESTS
+# ============================================================================
+#
+# ADDED BY SOURAV -- "Caller asks to be called back" story.
+#
+# Evidence: "No outbound capability" -- this stack cannot itself place a
+# phone call, so a callback "request" is not something this system ever
+# fulfils on its own. It is a durable, queryable RECORD that a human staff
+# member picks up and acts on -- Acceptance Criterion 2's "tracked to
+# fulfilment (e.g., stored in a DB table/queue with pending status)".
+# `status` starts at "pending" and is expected to move to "fulfilled" or
+# "cancelled" by whatever staff-facing process consumes this queue -- no
+# such process exists in this prototype (there is no admin UI anywhere in
+# this codebase), so this table alone is the entire scope of that AC: a
+# real, persisted, greppable queue, not an in-memory list that a process
+# restart would silently lose.
+#
+# Deliberately its OWN table, not a repurposed Appointment row: a callback
+# has no doctor, no date/time_slot pair, and no patient_name -- forcing it
+# into Appointment's shape would mean either fabricating those fields or
+# making them nullable on a table that today guarantees they are always
+# present for every real appointment (see Appointment.doctor_id/date/
+# time_slot's own `nullable=False` above).
+class CallbackRequest(Base):
+    __tablename__ = "callback_requests"
+
+    id = Column(Integer, primary_key=True)
+
+    # Human-readable reference, same style/format as Appointment's own
+    # confirmation_id (see clinic-api/main.py's book_appointment()) -- a
+    # caller or staff member can read this back over the phone or on a
+    # printout.
+    callback_id = Column(
+        String,
+        nullable=False,
+        unique=True,
+    )
+
+    # The number a human should actually dial. Not a foreign key into
+    # Patient -- a caller asking for a callback is never required to be an
+    # already-registered patient (unlike report_status/report_send/
+    # billing_balance, which look up an EXISTING Patient row by phone).
+    phone = Column(
+        String,
+        nullable=False,
+    )
+
+    # The caller's own words for when they'd like the call (e.g. "this
+    # evening", "tomorrow morning") -- deliberately a free-text String, not
+    # a resolved clock time: agent/llm.py's own "callback_time_window" slot
+    # rule is explicit that this is copied verbatim, never resolved to a
+    # timestamp, since "this evening" is not a fact this system is in a
+    # position to convert into one on the caller's behalf.
+    time_window = Column(
+        String,
+        nullable=False,
+    )
+
+    # Acceptance Criterion 1's "preserving the conversation context and
+    # reason" -- see agent/callback_flow.py's build_callback_reason() for
+    # exactly how this is built. Nullable: an honest "no reason given" is a
+    # valid, real outcome, never backfilled with an invented one.
+    reason = Column(
+        Text,
+        nullable=True,
+    )
+
+    # "pending" | "fulfilled" | "cancelled" -- see this class's own
+    # docstring above for why nothing in this prototype ever moves it past
+    # "pending" yet.
+    status = Column(
+        String,
+        nullable=False,
+        default="pending",
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+    )
+
+
+# ============================================================================
+# MERGE NOTE (sourav) -- C1 (rule 2, THE ONE CONFLICT IN THIS FILE)
+# ============================================================================
+#
+# WHAT COLLIDED: both branches append new ORM table classes at the very end
+# of this file -- the identical insertion point (the `test` branch's last
+# line, closing CallbackRequest). git's 3-way merge cannot know whose block
+# comes first, which is the whole of the conflict. It is POSITIONAL, not
+# semantic: checked programmatically for collisions and there are none --
+#   dev_sourav     -> ComplaintRecord        / complaint_records
+#   dev_rajarshee  -> AppointmentChange      / appointment_changes
+#                     NotificationOutbox     / notification_outbox
+#                     AppointmentCancellation/ appointment_cancellations
+# No shared class name, no shared __tablename__, no shared column.
+#
+# RESOLUTION: KEEP BOTH -- dev_sourav's ComplaintRecord first (immediately
+# below), then dev_rajarshee's three tables after it.
+#
+# THE OWNER'S REASON: keeping both is the only resolution that does not break
+# code already merged in this same set. clinic-api/main.py imports
+# ComplaintRecord for dev_sourav's complaint endpoint AND AppointmentChange /
+# NotificationOutbox / AppointmentCancellation for dev_rajarshee's
+# reschedule/cancel endpoints -- that was that file's own C1 conflict, itself
+# resolved as "keep both". Dropping either side here would leave
+# clinic-api/main.py importing a class that does not exist, so this is a
+# conflict of ORDERING only. Order chosen to match the sequence the two
+# stories were merged in everywhere else in this set (dev_sourav's story
+# blocks before dev_rajarshee's), and because these tables are independent
+# -- SQLAlchemy resolves its ForeignKey("appointments.id") strings by table
+# name at mapper-configuration time, not by class definition order, so the
+# order is a readability choice with no runtime effect either way.
+#
+# ============================================================================
+# COMPLAINT RECORDS
+# ============================================================================
+#
+# ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+#
+# User story: "As a dissatisfied patient, I want my complaint recorded and
+# routed to a person, so that it is not absorbed by a machine."
+#
+# Same "Evidence: 'No outbound capability'" honesty as CallbackRequest just
+# above, and deliberately modelled on it: this stack cannot itself connect a
+# caller to a live human, so "routed to a person" cannot mean a real call
+# transfer here -- it means a durable, queryable RECORD a human staff member
+# picks up and acts on. `status` starts at "pending" and, exactly like
+# CallbackRequest.status, nothing in this prototype ever moves it past
+# "pending" -- there is no admin UI anywhere in this codebase to do that
+# from. This table is the entire scope of AC 4 ("routed to the complaints
+# path/person-handling path"): a real, persisted, greppable row, never a
+# fabricated transfer.
+#
+# Deliberately its OWN table, not a repurposed CallbackRequest row: a
+# complaint has no time_window (nobody is asking to be called back at a
+# particular time) and its free-text column means something different
+# (what went wrong, not why a callback is wanted) -- conflating the two
+# would make one shared `reason` column carry two unrelated meanings, and a
+# future query for "unresolved complaints" would have to somehow tell them
+# apart from ordinary callback requests again by some other means.
+#
+# WHY THIS COLUMN CAN HOLD THE VERBATIM CALLER TEXT WHEN agent/outcomes.py's
+# ESCALATION_LOG_PATH LEDGER DELIBERATELY NEVER DOES: that ledger is a
+# shared, append-only log file every outcome in this codebase writes to,
+# and its own module docstring is explicit that avoiding caller free text
+# there is "one of the few PHI controls the prototype actually has today"
+# -- a property of THAT shared file, not a blanket rule that no table
+# anywhere may ever store caller-supplied text. This table follows the
+# EXISTING, narrower precedent instead: CallbackRequest.reason already
+# stores a caller's verbatim callback reason in exactly this same
+# database, behind exactly this same access boundary, for exactly the
+# same reason (AC 3's "captured verbatim" needs a durable place to live
+# that a human can actually read back, and a log ledger nobody re-reads in
+# order is not that place).
+class ComplaintRecord(Base):
+    __tablename__ = "complaint_records"
+
+    id = Column(Integer, primary_key=True)
+
+    # Human-readable reference, same style as CallbackRequest.callback_id
+    # (see clinic-api/main.py's request_callback()) -- a caller or staff
+    # member can read this back over the phone or on a printout.
+    complaint_id = Column(
+        String,
+        nullable=False,
+        unique=True,
+    )
+
+    # The caller's own words, stored EXACTLY as ASR transcribed them --
+    # never summarised, translated, or trimmed. AC 3 ("captured verbatim")
+    # is this column, full stop; agent/complaint_flow.py's own docstring
+    # covers why the agent itself never rewrites or interprets this text
+    # before it reaches here. NOT nullable: unlike CallbackRequest.reason
+    # (an optional elaboration on a callback that stands fine without one),
+    # a complaint IS its text -- there is no such thing as a complaint
+    # record with nothing said.
+    complaint_text = Column(
+        Text,
+        nullable=False,
+    )
+
+    # Not a foreign key into Patient -- a caller filing a complaint is
+    # never required to be an already-registered patient, same reasoning
+    # as CallbackRequest.phone above. Nullable: this codebase's complaint
+    # guard fires on the words alone and does not itself collect a phone
+    # number (see agent/complaint_flow.py) -- a null here is an honest "no
+    # callback number was captured for this complaint", not a bug.
+    phone = Column(
+        String,
+        nullable=True,
+    )
+
+    # "pending" | "resolved" | "cancelled" -- see this class's own
+    # docstring above for why nothing in this prototype ever moves it past
+    # "pending" yet.
+    status = Column(
+        String,
+        nullable=False,
+        default="pending",
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+    )
+
+# ----------------------------------------------------------------------------
+# MERGE NOTE (sourav) -- C1 continued: everything from here to the end of the
+# file is dev_rajarshee's half of the kept-both resolution (see the full C1
+# note above ComplaintRecord). Nothing below was modified during the merge.
+# ----------------------------------------------------------------------------
+# ============================================================================
+# APPOINTMENT CHANGES + NOTIFICATION OUTBOX
+# ============================================================================
+#
+# story title: Caller moves an existing appointment (E4-S3)
+# user story: As a patient whose plans changed, I want to move my appointment
+#   without cancelling it, so that I do not lose my place entirely.
+# acceptance criteria: The booking is found by contact number, name or
+#   reference. The new slot is swapped atomically, holding the old one until
+#   the new commits, and a failed swap leaves the original intact.
+#   Confirmation is sent on both channels.
+#
+# TWO NEW TABLES, AND DELIBERATELY NO NEW COLUMN ON `appointments`.
+# clinic-api builds its schema with Base.metadata.create_all(), which creates
+# MISSING TABLES but never adds a column to a table that already exists. With
+# no migration tool (E0-S4 is absent), a new column would silently not exist
+# in the live /workspace/clinic.db. New tables are created on the next start.
+#
+# Both rows are written in the SAME transaction as the move itself (see
+# clinic-api/main.py's reschedule_appointment()), so a history row or a
+# queued confirmation can never exist for a move that rolled back, and can
+# never be missing for one that committed.
+class AppointmentChange(Base):
+    """One committed move. Append-only.
+
+    Doubles as the IDEMPOTENCY RECORD (Blueprint 4.9): `idempotency_key` is
+    unique, and `result_json` is the exact response the first request got,
+    so a retry of the same request replays it instead of moving twice.
+    """
+    __tablename__ = "appointment_changes"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    old_date = Column(String, nullable=False)
+    old_time_slot = Column(String, nullable=False)
+    new_date = Column(String, nullable=False)
+    new_time_slot = Column(String, nullable=False)
+    call_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=False, unique=True)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+
+
+class NotificationOutbox(Base):
+    """A confirmation waiting to be sent on a non-voice channel.
+
+    NOTHING READS THIS TABLE YET. There is no SMS gateway and no
+    DLT-registered template (E1-S10 is absent), so rows stay "pending". The
+    voice agent therefore never says a message was sent.
+
+    `payload_json` carries field values only -- NO phone and NO patient name.
+    A sender joins `appointment_id` for the number at send time, so the
+    queue is not a second copy of the patient's contact details.
+    """
+    __tablename__ = "notification_outbox"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    kind = Column(String, nullable=False)          # "reschedule_confirmation"
+    channel = Column(String, nullable=False)       # "sms"
+    template_id = Column(String, nullable=False)   # "reschedule_confirmation_v1"
+    payload_json = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="pending")
+    created_at = Column(DateTime, nullable=False)
+
+
+# ============================================================================
+# E4-S4 -- Caller cancels an appointment
+# ============================================================================
+#
+# story title: Caller cancels an appointment
+# user story: As a patient who cannot attend, I want to cancel and be told any
+#   charge clearly, so that I am not surprised by a deduction later.
+# acceptance criteria: Cancellation applies the configured window rules and
+#   states refund eligibility from policy, never improvised. A cancellation
+#   within a charging window is confirmed explicitly with the charge stated
+#   before it is applied.
+#
+# Written in the SAME transaction as the status change (see clinic-api/
+# main.py's cancel_appointment()), with a NotificationOutbox row, so a
+# charge can never be recorded for a cancellation that rolled back, and can
+# never be missing for one that committed.
+class AppointmentCancellation(Base):
+    """One committed cancellation and the charge it carried. Append-only.
+
+    There is no payment system: `charge_status` is "none" or
+    "pending_collection" and nothing moves it yet. `refund_eligibility` is
+    what the rules said the caller is entitled to -- not a payment.
+
+    Doubles as the IDEMPOTENCY RECORD (Blueprint 4.9): `idempotency_key` is
+    unique, and `result_json` is the exact response the first request got,
+    so a retry replays it instead of cancelling -- or charging -- twice.
+    """
+    __tablename__ = "appointment_cancellations"
+
+    id = Column(Integer, primary_key=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+    policy_version = Column(String, nullable=False)   # the rules file's `version`
+    window_id = Column(String, nullable=False)        # e.g. "0-12h"
+    hours_before = Column(Float, nullable=False)
+    charge_inr = Column(Integer, nullable=False)
+    charge_status = Column(String, nullable=False)    # "none" | "pending_collection"
+    refund_eligibility = Column(String, nullable=False)   # "full" | "partial" | "none"
+    refund_percent = Column(Integer, nullable=True)
+    call_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=False, unique=True)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
