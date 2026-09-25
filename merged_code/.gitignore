@@ -6,3 +6,4 @@ venv/
 static/fallback_audio/*.wav
 official_doc
 Claude outputs
+vast.env
