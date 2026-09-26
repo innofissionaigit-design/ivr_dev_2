@@ -208,6 +208,19 @@ stage_nemo() {
     # Extra deps this project needs that NeMo's own files do not list.
     pip install -q einops rotary-embedding-torch onnxruntime || true
 
+    # The grep above drops these four because the fork pins them against a 2023
+    # stack (hydra<=1.3.2, plain torch via pytorch-lightning) and honouring the
+    # pins would downgrade the CUDA-matched torch installed in stage_python.
+    # Filtering them out is right; leaving it there was not -- NOTHING else
+    # installs them, so `nemo.collections.asr` died on `import hydra` and took
+    # the patches stage's verification down with it. The failure reads like a
+    # NeMo problem, not a missing dependency, which is why it is called out
+    # here: install them UNPINNED, so they resolve against the torch already
+    # present instead of dictating it.
+    pip install -q "hydra-core>=1.3" "omegaconf>=2.3" \
+                   "pytorch-lightning>=2.0" "torchmetrics>=1.0" \
+        || die "hydra/lightning install failed -- NeMo cannot import without them"
+
     # --no-deps -e: editable so that PYTHONPATH (see env.sh) and the installed
     # package are the SAME tree -- the next stage patches files in place, and a
     # copied install would leave those patches applying to a directory nothing
@@ -463,10 +476,37 @@ stage_vad() {
     # agent/vad_stream.py prefers a LOCAL repo (SILERO_VAD_REPO) and only falls
     # back to torch.hub's GitHub fetch. Cloning it means turn-taking does not
     # depend on github.com being reachable mid-call.
-    if [ ! -d "$SILERO_VAD_REPO/.git" ]; then
+    # Gate on hubconf.py, not .git: torch.hub's source="local" only needs the
+    # tree, and the tarball fallback below leaves no .git behind. Checking for
+    # .git would re-download a perfectly good checkout on every re-run.
+    if [ ! -f "$SILERO_VAD_REPO/hubconf.py" ]; then
         rm -rf "$SILERO_VAD_REPO"
-        git clone --depth=1 https://github.com/snakers4/silero-vad.git "$SILERO_VAD_REPO" \
-            || die "silero-vad clone failed"
+        # git-over-TLS to github.com is the fragile path -- on a pod in a
+        # region that interferes with it, the clone dies with "GnuTLS recv
+        # error (-110)" while plain HTTPS to codeload still works. Try git
+        # first (cheap, gives a real checkout), then fall back to the tarball
+        # rather than failing the whole run over a transport detail.
+        # timeout 120: the interference does not reset the connection, it
+        # STALLS it -- observed here as a clone sitting at 536K of .git for
+        # minutes with no error. Without a cap the fallback never gets its
+        # turn and the stage hangs instead of failing over.
+        if ! timeout 120 git clone --depth=1 \
+                https://github.com/snakers4/silero-vad.git \
+                "$SILERO_VAD_REPO" 2>/dev/null; then
+            warn "git clone failed -- falling back to the source tarball"
+            rm -rf "$SILERO_VAD_REPO" /tmp/silero.tgz
+            curl -fsSL --max-time 600 -o /tmp/silero.tgz \
+                https://codeload.github.com/snakers4/silero-vad/tar.gz/refs/heads/master \
+                || die "silero-vad: git clone AND tarball download both failed"
+            mkdir -p "$SILERO_VAD_REPO"
+            # --strip-components=1: the archive nests everything under
+            # silero-vad-master/, and hubconf.py must sit at the repo root.
+            tar -xzf /tmp/silero.tgz -C "$SILERO_VAD_REPO" --strip-components=1 \
+                || die "silero-vad tarball extract failed"
+            rm -f /tmp/silero.tgz
+        fi
+        [ -f "$SILERO_VAD_REPO/hubconf.py" ] \
+            || die "silero-vad fetched but has no hubconf.py at its root"
     fi
     PYTHONPATH="/workspace/AI4Bharat_NeMo:$REPO" "$VENV_PY" - <<'PY' || die "silero load failed"
 import os, torch
