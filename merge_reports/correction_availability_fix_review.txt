@@ -1,0 +1,188 @@
+CODE REVIEW - Follow-up fix: booking correction paths now revalidate availability
+Applies to: main.py and main_pcm.py (merged_code)          Repo: innofissionaigit-design/ivr_dev_2
+Prepared for: sourav / InnoFissionAI
+=====================================================================================
+
+BACKGROUND
+
+After the main.py / main_pcm.py merges were delivered, the owner asked a conceptual
+question: does dev_sourav's correction logic contradict dev_rajarshee's booking
+logic, and can dev_sourav's correction detection act as a "universal" layer that
+hands off to dev_rajarshee's booking logic once inside the booking flow?
+
+Answer given (plain-text, no code, at that point): they do not contradict -- they
+solve different problems (generic "was this a correction" detection/acknowledgment
+vs. booking-specific state revalidation) -- and the already-merged C4/C5/C6 hybrid
+block already implements exactly that "universal correction, booking-specific
+execution" pattern for ONE of dev_sourav's three correction entry points: the
+mid-collection one, where `awaiting` names the field currently being asked about.
+
+But two more of dev_sourav's own correction entry points -- both untouched by the
+original 8 conflicts, so merged as-is -- did NOT hand off to dev_rajarshee's
+revalidation logic:
+
+  1. The "confirm_booking" readback shortcut -- the caller corrects a value
+     directly while hearing the final readback, without saying "no" first.
+  2. The "confirm_correction" state's one-breath shortcut -- the caller names
+     the field AND gives the new value in the same turn, after the two-step
+     "which one is wrong?" menu.
+
+Both wrote `pending["slots"][field] = new_value` directly. For a "date"
+correction, that bypassed `_apply_booking_date()` (dev_rajarshee) entirely, so:
+  - stale date metadata (date_said, date_weekday, date_checked, date_candidates,
+    date_range) from the OLD date was never cleared under the NEW date, and
+  - `_open_booking()` was never re-entered, so a date or time_slot correction
+    made at either of these two points could re-confirm a booking whose new
+    date/time is no longer actually available with clinic-api -- the exact
+    failure `_open_booking()`'s own docstring says it exists to prevent
+    (E13-S6: "a day the doctor does not sit, or a time outside their hours, is
+    caught before the caller confirms a booking the write would refuse").
+
+This is a genuine gap, not a difference of opinion between the two branches --
+this is ALL dev_sourav's own code, and the fix makes it consistent with the
+revalidation behaviour dev_sourav's own C4/C5/C6-era code already gets for the
+mid-collection correction path.
+
+THE OWNER'S REVIEWED DESIGN
+
+The owner proposed (in chat) a small internal helper, `_apply_booking_correction`,
+that special-cases "date" through `_apply_booking_date()` and writes every other
+field directly, then re-enters `_open_booking()` only for date, with a caution
+about downstream interface breakage. That design was reviewed before
+implementation and confirmed interface-safe (no existing function signature
+changes), with two corrections applied before implementation:
+
+  1. "time_slot" needed the SAME re-open treatment as "date", not just date --
+     confirmed by reading agent/correction_flow.py: `_BOOKING_SPONTANEOUS_FIELDS
+     = ("date", "time_slot", "phone")`, and by reading the "confirm_correction"
+     state itself (`parse_correction_field()` recognises "time_slot" as a
+     nameable field). A time_slot-only fix would have left the same class of
+     bug in place for time corrections.
+  2. `_open_booking()`'s real signature is
+     `_open_booking(session, merged, language, *, turns=1, retries=0,
+     offered_date=None)` -- not just `_open_booking(slots)` as the chat
+     shorthand showed -- so the call sites pass the same arguments the
+     already-approved C4/C5/C6 block passes:
+     `_open_booking(session, pending["slots"], language,
+      turns=pending.get("turns", 1), offered_date=pending.get("offered_date"))`.
+
+WHAT WAS IMPLEMENTED (identical in main.py and main_pcm.py -- verified
+byte-for-byte equal after the edit, same standard used for the original 8
+conflicts)
+
+1. NEW HELPER, inserted immediately after `_apply_booking_date()`:
+
+   def _apply_booking_correction(slots: dict, field: str, value: object, text: str) -> None:
+       if field == "date":
+           _apply_booking_date(slots, value, spoken_day_word(text) or "date")
+       else:
+           slots[field] = value
+
+   _BOOKING_REOPEN_FIELDS = ("date", "time_slot")
+
+   Full in-file MERGE NOTE (sourav) explains: why this exists, which two call
+   sites needed it, why "time_slot" needs no metadata clearing (no
+   _apply_booking_date equivalent exists for it) but DOES need the same
+   _open_booking() re-entry, and why every other field (phone, patient_name)
+   is written directly and unaffected.
+
+2. CALL SITE A -- "confirm_booking" readback shortcut. Before:
+
+       pending["slots"][field] = new_value
+       pending["retries"] = 0
+       ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+       await _speak(session, ack + " " + booking_confirmation_prompt(pending['slots'], language=language))
+       return True
+
+   After:
+
+       _apply_booking_correction(pending["slots"], field, new_value, text)
+       pending["retries"] = 0
+       ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+       if field in _BOOKING_REOPEN_FIELDS and pending["slots"].get("doctor_name"):
+           await _speak(session, ack)
+           await _open_booking(session, pending["slots"], language,
+                               turns=pending.get("turns", 1),
+                               offered_date=pending.get("offered_date"))
+           return True
+       await _speak(session, ack + " " + booking_confirmation_prompt(pending['slots'], language=language))
+       return True
+
+3. CALL SITE B -- "confirm_correction" one-breath shortcut. Before:
+
+       pending["slots"][field] = new_value
+       pending["retries"] = 0
+       missing = _next_missing(pending["slots"])
+       ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+       if missing is None:
+           pending["awaiting"] = "confirm_booking"
+           await _speak(session, ack + " " + booking_confirmation_prompt(pending['slots'], language=language))
+       else:
+           pending["awaiting"] = missing
+           await _speak(session, ack + " " + missing_slot_prompt('book_appointment', missing, language=language))
+       return True
+
+   After:
+
+       _apply_booking_correction(pending["slots"], field, new_value, text)
+       pending["retries"] = 0
+       ack = correction_acknowledged_reply(field, pending["slots"], language=language)
+       if field in _BOOKING_REOPEN_FIELDS and pending["slots"].get("doctor_name"):
+           await _speak(session, ack)
+           await _open_booking(session, pending["slots"], language,
+                               turns=pending.get("turns", 1),
+                               offered_date=pending.get("offered_date"))
+           return True
+       missing = _next_missing(pending["slots"])
+       if missing is None:
+           pending["awaiting"] = "confirm_booking"
+           await _speak(session, ack + " " + booking_confirmation_prompt(pending['slots'], language=language))
+       else:
+           pending["awaiting"] = missing
+           await _speak(session, ack + " " + missing_slot_prompt('book_appointment', missing, language=language))
+       return True
+
+WHY NOT ALSO CHANGE THE CALLBACK FLOW OR THE DOCTOR_NAME CORRECTION BRANCH
+
+Checked and deliberately left untouched:
+  - The callback flow's own two correction shortcuts (confirm_callback /
+    confirm_callback_correction states) only ever correct "phone" --
+    `_CALLBACK_SPONTANEOUS_FIELDS = ("phone",)` in agent/correction_flow.py.
+    There is no date/time-like field and no availability concept in the
+    callback flow, so there is nothing for this fix to apply to there.
+  - The `awaiting == "doctor_name"` correction branch already makes its own
+    `get_doctor_availability()` call directly as part of validating the
+    doctor's name -- it is already availability-aware for the field it
+    handles, by a different (and already correct) mechanism.
+
+DOWNSTREAM / OTHER-FILE IMPACT -- NONE
+
+Every name the new code calls (`_apply_booking_date`, `_open_booking`,
+`spoken_day_word`, `correction_acknowledged_reply`, `_next_missing`,
+`missing_slot_prompt`, `booking_confirmation_prompt`) was already defined or
+imported in main.py / main_pcm.py before this change -- confirmed by direct
+grep against each name. No new import was added. No existing function's
+signature changed. Nothing in agent/*.py or clinic-api/* needed any change:
+this fix is entirely internal to main.py and main_pcm.py, reusing functions
+those two files already depended on. The 30-file merged_code set therefore
+needs no other file touched for this fix.
+
+VERIFICATION
+
+  - python -m py_compile main.py main_pcm.py: OK, both files.
+  - 0 conflict markers in either file.
+  - AST check: exactly one definition of _apply_booking_correction in each
+    file (no accidental duplicate).
+  - The new helper and both call-site edits are byte-for-byte identical
+    between main.py and main_pcm.py (same parity standard the original 8
+    conflicts were held to).
+  - Every name the new code depends on resolves within the same file (no
+    new cross-file dependency introduced).
+
+OPEN ITEM CARRIED FORWARD (behavioural, needs a listening test, not a code
+issue): same as already flagged for C4/C5/C6 -- when the reopen path fires,
+the caller hears the acknowledgment and _open_booking()'s own line as two
+separate short _speak() calls back to back, not one combined sentence. This
+fix reuses that same two-call shape at the two new call sites for
+consistency with the already-shipped pattern, so the existing listening-test
+recommendation now also covers these two spots.

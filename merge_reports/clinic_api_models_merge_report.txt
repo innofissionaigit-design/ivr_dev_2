@@ -1,0 +1,409 @@
+MERGE REPORT - clinic-api/models.py  (dev_sourav + dev_rajarshee -> test)
+Prepared for: sourav / InnoFissionAI          Repo: innofissionaigit-design/ivr_dev_2
+Common ancestor: 6cbeb0b  (== test == main)
+=====================================================================================
+
+THE OWNER'S RULES THIS MERGE FOLLOWS
+  1. Items new on only one side -> merge directly.
+  2. Items changed differently on both sides -> show the conflict, owner decides.
+  3. Show the exact code from both files for 1 and 2.
+  4. After merging, comment every point of 1 and 2 in the file, plus the owner's
+     reason for each point of 2.
+
+SCOPE
+  test (base)      1266 lines
+  dev_sourav       1360 lines   -- 1 changed region
+  dev_rajarshee    1406 lines   -- 6 changed regions
+  merged result    1573 lines   (1500 lines of merged code + 73 lines of the
+                                rule-4 MERGE NOTE comments added by this pass)
+
+  Rule 1 (one-sided, merged directly):  5 items -- ALL of them dev_rajarshee's
+  Rule 2 (conflict, owner decided):     1 item  -- C1
+
+  Worth stating plainly: dev_sourav has ZERO one-sided items in this file. His
+  single change to models.py is the one that collides with dev_rajarshee's, so
+  every Rule-1 item below belongs to dev_rajarshee.
+
+METHOD
+  Three-way diff against the common ancestor with difflib opcodes, then an
+  overlap test on each side's changed BASE line ranges: regions only one side
+  touched are Rule 1, regions both sides touched are Rule 2. One refinement was
+  needed versus the earlier files in this merge -- a PURE INSERTION at base
+  position P on one side versus a REPLACE covering base line P on the other is
+  still both branches touching the same point (which is exactly what git's own
+  3-way merge flags), and a naive half-open-interval test scores that pair as
+  non-overlapping because the insertion's interval is zero-width. With that
+  fixed, the count matches what git's diff3 reported for this file: 1 conflict.
+
+=====================================================================================
+RULE 1 -- NEW ON ONE SIDE ONLY, MERGED DIRECTLY (exact code from both files)
+=====================================================================================
+
+R1-A  IMPORT BLOCK (test line 58)                      dev_rajarshee only
+-------------------------------------------------------------------------------
+  test (base):
+      from sqlalchemy import (
+          Column,
+          Integer,
+          String,
+          Float,
+          Boolean,
+          ForeignKey,
+          DateTime,
+          UniqueConstraint,
+          Text,
+      )
+
+  dev_rajarshee adds two names:
+          # E4-S4: the partial unique index on appointments (active rows only).
+          Index,
+          text,
+
+  dev_sourav: NO CHANGE at this point. His ComplaintRecord uses only
+      Column / Integer / String / Text / DateTime, all of which the test branch
+      already imported -- which is why he needed no import edit at all.
+
+  Checked: UniqueConstraint is STILL used by three other tables (test lines
+  210, 363, 580), so it does not become an unused import after R1-C.
+
+R1-B  Appointment GAINS TWO COLUMNS (test line 1168)   dev_rajarshee only
+-------------------------------------------------------------------------------
+  test (base): no such columns.
+
+  dev_rajarshee:
+      # E4-S4 "Caller cancels an appointment". A cancelled appointment is KEPT,
+      # marked "cancelled" -- never deleted: foreign keys are ON and E4-S3's
+      # history and outbox rows point at it, and it is the record of what the
+      # caller was charged. Every query that means "live bookings" filters
+      # status == "active". An existing database gains these two columns
+      # through clinic-api/migrations.py (create_all cannot add them).
+      status = Column(
+          String,
+          nullable=False,
+          default="active",
+          server_default="active",
+      )
+
+      cancelled_at = Column(
+          DateTime,
+          nullable=True,
+      )
+
+  dev_sourav: NO CHANGE -- he does not touch the Appointment table anywhere.
+
+R1-C/D/E  Appointment.__table_args__: TABLE-WIDE UNIQUE CONSTRAINT BECOMES A
+          PARTIAL UNIQUE INDEX (test lines 1177-1183)  dev_rajarshee only
+-------------------------------------------------------------------------------
+  difflib splits this into three hunks; it is one logical change, shown whole.
+
+  test (base):
+      __table_args__ = (
+          UniqueConstraint(
+              "doctor_id",
+              "date",
+              "time_slot",
+              name="uq_doctor_slot",
+          ),
+      )
+
+  dev_rajarshee:
+      # E4-S4: was UniqueConstraint(doctor_id, date, time_slot, name=
+      # "uq_doctor_slot") over EVERY row, which would let a cancelled
+      # appointment hold its slot for ever. Now unique over ACTIVE rows only,
+      # so a cancelled slot can be booked again -- and a second ACTIVE row in
+      # a slot is still refused by the database itself, which the booking
+      # race and the reschedule swap (E4-S3) both rely on.
+      __table_args__ = (
+          Index(
+              "uq_doctor_slot_active",
+              "doctor_id",
+              "date",
+              "time_slot",
+              unique=True,
+              sqlite_where=text("status = 'active'"),
+              postgresql_where=text("status = 'active'"),
+          ),
+      )
+
+  dev_sourav: NO CHANGE.
+
+  FLAGGED (merges automatically, but it is silent if missed): the constraint is
+  also RENAMED (uq_doctor_slot -> uq_doctor_slot_active) and changes from
+  table-wide to partial. Base.metadata.create_all() never alters an existing
+  table, so an already-deployed clinic.db would keep the OLD table-wide
+  constraint and never gain the partial one -- on such a database cancelling
+  would appear to work while the freed slot still could not be re-booked.
+  RESOLVED IN THIS MERGED SET, verified while writing this report: the merged
+  clinic-api/main.py already calls migrations.upgrade(engine) BEFORE
+  Base.metadata.create_all(engine) at startup (main.py lines 129-135), and
+  clinic-api/migrations.py (dev_rajarshee's new file, already delivered in this
+  merged set) performs exactly this conversion. So no manual migration step is
+  outstanding -- but the ordering in main.py is load-bearing and should not be
+  reordered later.
+
+=====================================================================================
+RULE 2 -- CONFLICT (1), SHOWN TO THE OWNER AND DECIDED BY THE OWNER
+=====================================================================================
+
+C1  BOTH BRANCHES APPEND NEW ORM TABLE CLASSES AT THE END OF THE FILE
+-------------------------------------------------------------------------------
+WHAT COLLIDED
+  Both sides add text at the identical insertion point -- the test branch's
+  final line, closing CallbackRequest. git's 3-way merge cannot know whose
+  block comes first; that ordering is the entire conflict. It is POSITIONAL,
+  not semantic. Checked programmatically for collisions, and there are none:
+
+      dev_sourav     -> ComplaintRecord         / complaint_records
+      dev_rajarshee  -> AppointmentChange       / appointment_changes
+                        NotificationOutbox      / notification_outbox
+                        AppointmentCancellation / appointment_cancellations
+
+  No shared class name, no shared __tablename__, no shared column.
+
+EXACT CODE -- dev_sourav's side (94 lines; the ~45-line explanatory comment
+block is abbreviated here with a marker and is preserved VERBATIM in the
+merged file):
+
+      # ============================================================================
+      # COMPLAINT RECORDS
+      # ============================================================================
+      #
+      # ADDED BY SOURAV -- "Caller wants to make a complaint" story.
+      #
+      # User story: "As a dissatisfied patient, I want my complaint recorded and
+      # routed to a person, so that it is not absorbed by a machine."
+      #
+      # [~40 further comment lines, kept verbatim in the merged file: why this is
+      #  its own table rather than a reused CallbackRequest row; why `status`
+      #  never moves past "pending" in this prototype; and why this table MAY
+      #  hold verbatim caller text when agent/outcomes.py's ESCALATION_LOG_PATH
+      #  ledger deliberately never does]
+      class ComplaintRecord(Base):
+          __tablename__ = "complaint_records"
+
+          id = Column(Integer, primary_key=True)
+
+          # Human-readable reference, same style as CallbackRequest.callback_id
+          # (see clinic-api/main.py's request_callback()) -- a caller or staff
+          # member can read this back over the phone or on a printout.
+          complaint_id = Column(
+              String,
+              nullable=False,
+              unique=True,
+          )
+
+          # The caller's own words, stored EXACTLY as ASR transcribed them --
+          # never summarised, translated, or trimmed. AC 3 ("captured verbatim")
+          # is this column, full stop. NOT nullable: a complaint IS its text.
+          complaint_text = Column(
+              Text,
+              nullable=False,
+          )
+
+          # Not a foreign key into Patient -- a caller filing a complaint is
+          # never required to be an already-registered patient, same reasoning
+          # as CallbackRequest.phone above. Nullable: the complaint guard fires
+          # on the words alone and does not itself collect a phone number.
+          phone = Column(
+              String,
+              nullable=True,
+          )
+
+          # "pending" | "resolved" | "cancelled" -- nothing in this prototype
+          # ever moves it past "pending" yet.
+          status = Column(
+              String,
+              nullable=False,
+              default="pending",
+          )
+
+          created_at = Column(
+              DateTime,
+              nullable=False,
+          )
+
+EXACT CODE -- dev_rajarshee's side (110 lines; story/AC comment blocks
+abbreviated with markers, preserved verbatim in the merged file):
+
+      # ============================================================================
+      # APPOINTMENT CHANGES + NOTIFICATION OUTBOX
+      # ============================================================================
+      #
+      # story title: Caller moves an existing appointment (E4-S3)
+      # user story: As a patient whose plans changed, I want to move my appointment
+      #   without cancelling it, so that I do not lose my place entirely.
+      # acceptance criteria: The booking is found by contact number, name or
+      #   reference. The new slot is swapped atomically, holding the old one until
+      #   the new commits, and a failed swap leaves the original intact.
+      #   Confirmation is sent on both channels.
+      #
+      # TWO NEW TABLES, AND DELIBERATELY NO NEW COLUMN ON `appointments`.
+      # clinic-api builds its schema with Base.metadata.create_all(), which creates
+      # MISSING TABLES but never adds a column to a table that already exists.
+      #
+      # Both rows are written in the SAME transaction as the move itself (see
+      # clinic-api/main.py's reschedule_appointment()), so a history row or a
+      # queued confirmation can never exist for a move that rolled back, and can
+      # never be missing for one that committed.
+      class AppointmentChange(Base):
+          """One committed move. Append-only.
+
+          Doubles as the IDEMPOTENCY RECORD (Blueprint 4.9): `idempotency_key` is
+          unique, and `result_json` is the exact response the first request got,
+          so a retry of the same request replays it instead of moving twice.
+          """
+          __tablename__ = "appointment_changes"
+
+          id = Column(Integer, primary_key=True)
+          appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+          old_date = Column(String, nullable=False)
+          old_time_slot = Column(String, nullable=False)
+          new_date = Column(String, nullable=False)
+          new_time_slot = Column(String, nullable=False)
+          call_id = Column(String, nullable=True)
+          idempotency_key = Column(String, nullable=False, unique=True)
+          result_json = Column(Text, nullable=False)
+          created_at = Column(DateTime, nullable=False)
+
+
+      class NotificationOutbox(Base):
+          """A confirmation waiting to be sent on a non-voice channel.
+
+          NOTHING READS THIS TABLE YET. There is no SMS gateway and no
+          DLT-registered template (E1-S10 is absent), so rows stay "pending". The
+          voice agent therefore never says a message was sent.
+
+          `payload_json` carries field values only -- NO phone and NO patient name.
+          A sender joins `appointment_id` for the number at send time, so the
+          queue is not a second copy of the patient's contact details.
+          """
+          __tablename__ = "notification_outbox"
+
+          id = Column(Integer, primary_key=True)
+          appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+          kind = Column(String, nullable=False)          # "reschedule_confirmation"
+          channel = Column(String, nullable=False)       # "sms"
+          template_id = Column(String, nullable=False)   # "reschedule_confirmation_v1"
+          payload_json = Column(Text, nullable=False)
+          status = Column(String, nullable=False, default="pending")
+          created_at = Column(DateTime, nullable=False)
+
+
+      # ============================================================================
+      # E4-S4 -- Caller cancels an appointment
+      # ============================================================================
+      #
+      # story title: Caller cancels an appointment
+      # user story: As a patient who cannot attend, I want to cancel and be told any
+      #   charge clearly, so that I am not surprised by a deduction later.
+      # acceptance criteria: Cancellation applies the configured window rules and
+      #   states refund eligibility from policy, never improvised. A cancellation
+      #   within a charging window is confirmed explicitly with the charge stated
+      #   before it is applied.
+      #
+      # Written in the SAME transaction as the status change (see clinic-api/
+      # main.py's cancel_appointment()), with a NotificationOutbox row, so a
+      # charge can never be recorded for a cancellation that rolled back, and can
+      # never be missing for one that committed.
+      class AppointmentCancellation(Base):
+          """One committed cancellation and the charge it carried. Append-only.
+
+          There is no payment system: `charge_status` is "none" or
+          "pending_collection" and nothing moves it yet. `refund_eligibility` is
+          what the rules said the caller is entitled to -- not a payment.
+
+          Doubles as the IDEMPOTENCY RECORD (Blueprint 4.9): `idempotency_key` is
+          unique, and `result_json` is the exact response the first request got,
+          so a retry replays it instead of cancelling -- or charging -- twice.
+          """
+          __tablename__ = "appointment_cancellations"
+
+          id = Column(Integer, primary_key=True)
+          appointment_id = Column(Integer, ForeignKey("appointments.id"), nullable=False)
+          policy_version = Column(String, nullable=False)   # the rules file's `version`
+          window_id = Column(String, nullable=False)        # e.g. "0-12h"
+          hours_before = Column(Float, nullable=False)
+          charge_inr = Column(Integer, nullable=False)
+          charge_status = Column(String, nullable=False)    # "none" | "pending_collection"
+          refund_eligibility = Column(String, nullable=False)   # "full" | "partial" | "none"
+          refund_percent = Column(Integer, nullable=True)
+          call_id = Column(String, nullable=True)
+          idempotency_key = Column(String, nullable=False, unique=True)
+          result_json = Column(Text, nullable=False)
+          created_at = Column(DateTime, nullable=False)
+
+RESOLUTION (rule 2)
+  KEEP BOTH -- dev_sourav's ComplaintRecord first, then dev_rajarshee's three
+  tables.
+
+THE OWNER'S REASON (rule 4)
+  Keeping both is the only resolution that does not break code already merged
+  in this same set. clinic-api/main.py imports ComplaintRecord for
+  dev_sourav's complaint endpoint AND AppointmentChange / NotificationOutbox /
+  AppointmentCancellation for dev_rajarshee's reschedule and cancel endpoints
+  -- that was that file's own C1 conflict, itself already resolved as "keep
+  both". Dropping either side here would leave clinic-api/main.py importing a
+  class that does not exist. So the only genuinely open question was ORDER.
+  Order chosen to match the sequence the two developers' story blocks are
+  merged in everywhere else in this set (dev_sourav's before dev_rajarshee's),
+  and it carries no runtime consequence either way: SQLAlchemy resolves
+  ForeignKey("appointments.id") strings by table name at mapper-configuration
+  time, not by class definition order.
+
+=====================================================================================
+RULE 4 -- COMMENTS ADDED TO THE MERGED FILE
+=====================================================================================
+  Four MERGE NOTE (sourav) blocks were added, one per point above, each naming
+  the rule it belongs to and what the other branch did at that spot:
+    - above the sqlalchemy import block      -> R1-A
+    - above Appointment.status/cancelled_at  -> R1-B (incl. the create_all caveat)
+    - above Appointment.__table_args__       -> R1-C/D/E (incl. the rename flag
+                                                and the quoted original code)
+    - above the COMPLAINT RECORDS header     -> C1: what collided, the
+                                                collision check, the resolution,
+                                                and the owner's reason
+  Plus a short boundary marker above dev_rajarshee's APPOINTMENT CHANGES header
+  saying everything from there to EOF is his half of the kept-both resolution.
+  Both branches' own original explanatory comments are preserved verbatim; none
+  were rewritten or trimmed in the file itself.
+
+=====================================================================================
+VERIFICATION
+=====================================================================================
+  - python -m py_compile clinic-api/models.py: OK.
+  - Completeness: every line dev_sourav added vs base (56) and every line
+    dev_rajarshee added vs base (104) is present in the merged file --
+    0 missing on either side.
+  - Exactly ONE base line was dropped: `name="uq_doctor_slot",` -- precisely
+    the line R1-C's Index replaces. No other base content lost.
+  - AST check: 20 classes, 0 duplicate class names; 20 __tablename__ values,
+    0 duplicates.
+  - All four new classes present: ComplaintRecord, AppointmentChange,
+    NotificationOutbox, AppointmentCancellation.
+  - No git conflict markers (checked strictly; note this file's own module
+    docstring legitimately contains three `======` decoration rows that a
+    loose check mistakes for markers -- they are in the test branch too).
+  - Import closure: all 23 names clinic-api/main.py and clinic-api/
+    migrations.py import from models resolve to a definition in the merged
+    models.py -- 0 missing.
+  - Not exercised against a live database in this session (no clinic.db here).
+
+=====================================================================================
+DELIVERABLES
+=====================================================================================
+  - clinic-api/models.py   merged file, re-saved to the merged_code folder with
+                             the rule-4 comments added
+  - this report            merged_code/merge_reports/clinic_api_models_merge_report.txt
+
+NOTE ON SEQUENCE
+  This file was already merged content-wise during the earlier repo-wide
+  dependency merge (same resolution: keep both, sourav first). What this pass
+  adds is the rules-1-to-4 treatment that merge did not do for dependency
+  files: the itemised Rule-1/Rule-2 breakdown with exact code from both
+  branches, the explicit conflict decision, the in-file MERGE NOTE comments,
+  and this report.
+
+OPEN ITEMS (repository-wide, unchanged by this file)
+  - tests/ (34 files), docs/stories/ (7 files), deploy/ (4 rajarshee-only infra
+    scripts) and one sourav-only report file still differ across branches and
+    have not been merged.

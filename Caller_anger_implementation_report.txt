@@ -1,0 +1,423 @@
+================================================================================
+IMPLEMENTATION REPORT
+Story: "Caller is angry about a previous experience"
+Owner: Rajarshee   Reviewer: Saurav
+Basis: Caller_anger_investigation_report.txt (delivered earlier, read-only
+       investigation phase)
+================================================================================
+
+USER STORY
+As a frustrated caller, I want to be heard and offered a person, so that my
+frustration is not compounded by a machine.
+
+ACCEPTANCE CRITERIA
+1. Anger lowers the escalation threshold.
+2. Delivery slows.
+3. A human is offered explicitly rather than continuing to transact.
+4. The agent apologises once.
+5. The agent does not argue.
+6. The agent does not defend the hospital.
+7. The complaint/frustration is captured in the context packet.
+
+================================================================================
+1. AC-BY-AC STATUS
+================================================================================
+
+AC1 -- Anger lowers the escalation threshold: PASS
+    Evidence: The investigation found CallState.escalation_threshold was
+    written by responses/speech_policy.py's dormant "angry" row but had NO
+    reader anywhere in the codebase -- wiring a reader up would have been
+    the "generic escalation framework" instruction 3 explicitly forbade.
+    Per the investigation's own recommendation, the threshold-lowering is
+    implemented as the new guard's own eligibility rule instead: an angry
+    caller reaches an explicit human offer on the VERY FIRST angry
+    utterance (main.py::_finish_anger(), called from both _resolve_intent()
+    and _continue_pending()), with no other justification needed -- the
+    same way agent/human_fast_path.py's mere existence already encodes "a
+    direct human request needs zero other justification to escalate." A
+    normal caller only reaches a human offer via an explicit request, an
+    out_of_scope/clinical_interpretation/unverifiable_claim guard, or three
+    consecutive low-ASR-confidence turns (session.confirm_attempts > 2).
+    Anger skips straight past all of that on turn one. The
+    escalation_threshold="low" field value is also honestly set on
+    session.call_state (see AC2) so it is correctly reported wherever
+    CallState.as_dict() is logged, even though it is not itself the trigger.
+    Tests: tests/test_anger_flow.py::TestCallStateActivation::
+    test_finish_anger_sets_escalation_threshold_low; TestGuardOrderIn
+    ResolveIntent (proves the guard fires on turn one, unconditionally);
+    TestExistingGuardsStillWinWhereTheyShould::test_confirm_attempts_
+    escalation_path_is_untouched_for_non_angry_callers (proves the normal
+    3-strikes path is unmodified).
+
+AC2 -- Delivery slows: PASS
+    Evidence: main.py::_finish_anger() rebuilds session.call_state via the
+    existing agent/call_state.py::build()/responses/speech_policy.py
+    machinery with caller_state="angry", which resolves to
+    speech_rate="slow_normal" -- the exact dormant "angry" row the
+    investigation identified. main.py's own _speak() already reads
+    session.call_state.speech_rate on every turn (a pre-existing, live
+    code path) and threads it into TTSClient.synthesize(), which the
+    already-live SPEECH_RATE_SCALE table maps to a real length_scale. No
+    new speech-rate mechanism was created.
+    Tests: TestCallStateActivation::test_finish_anger_activates_slow_
+    normal_speech_rate; test_the_speech_rate_this_story_writes_is_what_
+    speak_already_reads; test_non_angry_normal_caller_call_state_is_
+    unaffected (regression).
+
+AC3 -- A human is offered explicitly rather than continuing to transact:
+PASS
+    Evidence: Unlike Story 2's complaint flow (a silent, immediate
+    handoff), _finish_anger() speaks anger_reply() -- which explicitly
+    asks "would you like me to connect you with one of our staff, or
+    would you rather contact our counter directly?" -- and then opens
+    session.pending = {"awaiting": "angry_choice", "retries": 0}, the same
+    offer-then-wait pending mechanism "out_of_scope_choice"/"clinical_
+    interpretation_choice"/"unverifiable_claim_choice" already use. "yes"
+    -> human_fallback_reply() + record_human_handoff("caller_angry"); "no"
+    -> out_of_scope_counter_reply(); an unclear answer retries (re-asking
+    the offer only, never re-apologising) then falls through to fresh
+    classification after two retries. No live-transfer promise is made
+    that this system cannot keep -- the offer wording is the same fixed
+    sentence every sibling guard-offered choice already speaks. Per
+    instruction 9, anger also interrupts (rather than finishing) any
+    in-progress booking/report/billing/doctor-lookup/callback flow before
+    making this offer.
+    Tests: TestAngerIntentDispatch (opens the pending state, no false
+    live-transfer wording); TestAngryChoiceHandler (yes/no/retry-then-
+    fall-through); TestAngerInterruptsPendingFlow (booking/report/
+    billing/doctor-lookup).
+
+AC4 -- The agent apologises once: PASS
+    Evidence: Per the story's own binding design decision ("once per
+    call, not once per angry utterance"), a new session.anger_apologized
+    boolean (plain, mutable CallSession attribute -- not on the frozen,
+    wholesale-rebuilt CallState) is read at the top of _finish_anger() and
+    set True at the end. anger_reply(already_apologized, language) has two
+    fixed variants: apology-plus-offer the first time, offer-only every
+    time after -- the human offer is never weakened or dropped on repeat,
+    per the story's own explicit instruction. This deliberately does NOT
+    reuse Story 2's own per-turn-repeatable apology behaviour
+    (complaint_acknowledged_reply() apologises every time a complaint is
+    filed in the same call) -- the two stories keep their own, separately
+    tested apology semantics.
+    Tests: TestApologyOnce (first utterance apologises; second/third/many
+    do not; human offer never weakens); test_apology_flag_lives_on_the_
+    session_not_call_state.
+
+AC5 -- The agent does not argue: PASS
+    Evidence: is_anger() is a deterministic, pure phrase-matching guard
+    (agent/anger_flow.py) checked inside _resolve_intent() and
+    _continue_pending() BEFORE fast_path, the semantic cache, or the LLM
+    ever run -- proven structurally (not just by the reply's wording) by
+    wiring exploding stand-ins for all three and confirming an angry
+    utterance never reaches them. anger_reply()'s own text is a fixed,
+    non-generative template (never model-composed), so the model is never
+    given a turn in which it could argue.
+    Tests: TestGuardOrderInResolveIntent (structural short-circuit proof,
+    parametrised across all three language surfaces); TestAngerReply
+    NeverArguesOrDefends::test_never_contains_forbidden_argue_or_defend_
+    language.
+
+AC6 -- The agent does not defend the hospital: PASS
+    Evidence: Same deterministic fast-path mechanism as AC5 -- anger_
+    reply()'s fixed text never justifies, explains, or defends the
+    hospital or its staff, and the guard's placement means no downstream
+    branch that could generate defensive text is ever reached for an
+    angry turn.
+    Tests: TestAngerReplyNeverArguesOrDefends (forbidden-phrase list
+    checked against both reply variants, all 4 languages spoken-
+    punctuation-clean); TestAngerIntentDispatch::test_no_other_tool_is_
+    called (proves no lookup/resolution attempt is even made).
+
+AC7 -- The complaint/frustration is captured in the context packet: PASS
+    Evidence: _finish_anger() calls agent/tools_client.py::submit_
+    complaint(text) -- the SAME call site and SAME clinic-api
+    ComplaintRecord table Story 2's own complaint flow already uses --
+    with the caller's utterance passed through verbatim. No second
+    complaint-storage system was built, per the story's own explicit
+    design decision. A tool failure here is caught and logged but never
+    blocks the spoken reply or the human offer (AC3 must hold even if
+    context-capture fails). Detection is also recorded in the shared
+    escalation ledger via a NEW, separate event (agent/outcomes.py::
+    record_anger_detected() / ANGER_DETECTED_EVENT) rather than being
+    folded into record_human_handoff() -- see section 3 below for why.
+    Tests: TestAngerIntentDispatch::test_captures_the_utterance_verbatim_
+    via_submit_complaint; test_records_the_anger_detected_audit_event;
+    test_tool_failure_still_speaks_the_reply_and_offers_a_human.
+
+Overall: 7/7 acceptance criteria PASS.
+
+================================================================================
+2. FILES CHANGED
+================================================================================
+
+NEW
+  agent/anger_flow.py
+      Deterministic anger/frustration detector: detect_anger()/is_anger().
+      English, Hinglish/Banglish (Latin script), and Bengali-script phrase
+      lists, all strong/explicit multi-word statements (never a bare "bad"
+      or "issue"). Reuses agent/slot_parse.py::_bn_bounded() for
+      word-boundary-safe Bengali matching. Pure, I/O-free, no state.
+
+  tests/test_anger_flow.py
+      The focused suite for this story (332 tests) -- see section 4.
+
+EDITED
+  agent/reply_templates.py
+      + anger_reply(already_apologized: bool, language: str) -> str
+        Two fixed variants (apology+offer / offer-only) x 4 languages.
+        Inserted immediately after complaint_acknowledged_reply().
+
+  agent/outcomes.py
+      + HUMAN_ANGER_INTENT = "caller_angry"
+      + ANGER_DETECTED_EVENT = "caller_angry_detected"
+      + _anger_detected_counts dict + record_anger_detected() +
+        anger_detected_counts()
+        Deliberately its OWN event/counter pair, NOT routed through
+        record_human_handoff() -- see section 3 for why.
+      _reset_for_testing() updated to clear the new counter dict.
+
+  agent/llm.py
+      One clarifying sentence appended to the "smalltalk" intent
+      description in the system prompt (same precedent as the
+      unverifiable_claim story): tells the model an angry/frustrated
+      utterance is not smalltalk and it must never compose its own
+      apology/argument/defence for it. "caller_angry" was deliberately
+      NOT added to VALID_INTENTS -- this stays guard-only, per the
+      "minimal" instruction and the "LLM is never the primary detector"
+      requirement.
+
+  main.py (source of truth)
+      - Imports: anger_reply, record_anger_detected, is_anger (agent.
+        anger_flow), inserted next to their nearest sibling story's own
+        imports.
+      - CallSession.__init__: + self.anger_apologized = False.
+      - _resolve_intent(): new is_anger(text) guard, checked immediately
+        after is_complaint() (guard ORDER resolves the anger/complaint
+        overlap -- see section 3), before fast_path/cache/LLM.
+      - New async def _finish_anger(session, text, language): rebuilds
+        session.call_state to caller_state="angry"; calls submit_
+        complaint(text) and record_anger_detected() each in their own
+        try/except (never block the reply); speaks anger_reply(); sets
+        anger_apologized=True; opens the "angry_choice" pending state.
+        Inserted immediately after _finish_complaint().
+      - _continue_pending(): new is_anger(text) interrupt-guard, checked
+        immediately after the complaint interrupt-guard, before
+        `awaiting` is even read (so anger can abandon ANY in-progress
+        flow). New "angry_choice" pending-state handler (yes/no/retry),
+        modelled byte-for-byte on "unverifiable_claim_choice".
+      - _dispatch_turn_inner(): new `if intent == "caller_angry":` branch,
+        inserted immediately after the "complaint" branch.
+
+  main_pcm.py (mechanically regenerated)
+      Regenerated via tools/make_pcm_variant.py after every main.py edit
+      above; the reasoning region between _resolve_intent() and
+      _resync_after_playback() was verified byte-identical to main.py on
+      every regeneration (asserted by the generator itself, and re-proven
+      by tests/test_anger_flow.py::TestTransportParity::test_reasoning_
+      half_is_byte_identical_between_main_and_main_pcm). Never hand-edited.
+
+  tests/test_spoken_punctuation.py
+      Added anger_reply() to the spoken-punctuation gate's exercised
+      cases (8 cases: 2 branches x 4 languages) and to the "every public
+      reply function has a case" allow-list. This was the one real
+      regression this story's own new code introduced against an existing
+      test -- see section 6.
+
+================================================================================
+3. KEY DESIGN DECISIONS (beyond what the prompt specified verbatim)
+================================================================================
+
+- Anger vs. complaint overlap ("enhance, don't compete", instruction 8):
+  implemented ENTIRELY as guard order. is_complaint(text) is checked
+  strictly before is_anger(text) in both _resolve_intent() and
+  _continue_pending(), so an utterance matching both is routed through
+  Story 2's own, completely unmodified complaint flow (one acknowledgment,
+  which already contains an apology, one record, one silent handoff).
+  agent/anger_flow.py's own guard is never even reached for that
+  utterance. Zero changes were made to agent/complaint_flow.py or
+  _finish_complaint().
+
+- Anger vs. an explicit human request: is_immediate_human_request() is
+  checked before both is_complaint() and is_anger() in _resolve_intent()'s
+  existing, unmodified guard order -- an explicit "connect me to a human"
+  wins outright over an angry-sounding utterance, the more absolute of
+  the two asks.
+
+- Why record_anger_detected() is its OWN event, not routed through
+  record_human_handoff(): unlike Story 2's complaint flow (a single,
+  silent handoff with no yes/no step), this story's own "angry_choice"
+  pending state asks a real question and, on "yes", separately calls
+  record_human_handoff("caller_angry", ...) itself (the same pattern
+  every sibling guard-offered choice already uses). Folding detection
+  into that same counter/ledger tag would double-count every angry call
+  that also said "yes", and would show a "handoff" for a caller who said
+  "no". This mirrors the existing detected-vs-escalated separation
+  record_unverifiable_claim()/record_human_handoff() already keep for
+  their own guard+choice pair.
+
+- Where the once-per-call apology flag lives: a new plain
+  session.anger_apologized boolean on the non-frozen CallSession (like
+  session.pending), not on the frozen, wholesale-rebuilt CallState.
+
+- CallState mutability: confirmed CallState is a frozen dataclass (fields
+  cannot be mutated directly), but session.call_state is a plain,
+  freely-reassignable CallSession attribute. "Activating" anger state is
+  therefore a single reassignment to a freshly built() CallState, the
+  same pattern session.pending already uses throughout this file -- no
+  new mutability mechanism was introduced.
+
+================================================================================
+4. TESTS RUN
+================================================================================
+
+Focused new suite (run first, per instruction 11's own preamble):
+  tests/test_anger_flow.py -- 332 passed, 0 failed.
+  Covers all 10 categories instruction 11 specifies: anger detection
+  (English/Hinglish-Banglish/Bengali positives, adjacent-phrase and
+  ordinary-request negatives), apology-once, speech-rate activation,
+  escalation-threshold behaviour, explicit human offer (yes/no/retry, no
+  false live-transfer promise), no-argument/no-defence (structural guard-
+  order proof + forbidden-phrase checks), context capture (verbatim
+  submit_complaint, separate audit event, no duplicate/unrelated
+  records), pending-flow interruption (booking/report/billing/doctor-
+  lookup), combined cases (anger+complaint, anger+explicit-human-request,
+  anger+ordinary-request, repeated anger), and main.py/main_pcm.py
+  transport parity.
+
+Targeted regression suites named in instruction 11:
+  tests/test_complaint_flow.py .......... PASS (all)
+  tests/test_human_fallback.py .......... 4 PRE-EXISTING failures (unrelated
+                                            -- see section 6)
+  tests/test_out_of_scope.py ............ 3 PRE-EXISTING failures (unrelated
+                                            -- see section 6)
+  tests/test_unverifiable_claim.py ...... PASS (all)
+  tests/test_spoken_punctuation.py ...... PASS (all, after the one fix
+                                            described in section 6)
+  tests/test_speak_gate.py .............. PASS (all)
+  tests/test_multilingual_templates.py .. PASS (all)
+  tests/test_reply_templates_fidelity.py  PASS (all)
+
+Full repository regression sweep (all test files, minus 4 pre-existing
+"scratch" files excluded by the suite's own naming convention and one
+file with a pre-existing collection error unrelated to this story):
+  ~6,685 tests collected; 6,549 passed; 135 failed; 1 skipped.
+  All 135 failures are PRE-EXISTING and unrelated to this story -- see
+  section 6 for the specific root causes identified, none of which touch
+  agent/anger_flow.py, agent/reply_templates.py's anger_reply(), agent/
+  outcomes.py's anger additions, or main.py's anger guard/dispatch code.
+
+================================================================================
+5. PRE-EXISTING FAILURES FOUND DURING REGRESSION (not caused by this story)
+================================================================================
+
+Investigated and root-caused each cluster before concluding it was
+pre-existing (file modification timestamps confirm none of the following
+files were touched by this story's work):
+
+a) tests/test_human_fallback.py (4 tests) and tests/test_out_of_scope.py
+   (3 tests): both files' own make_session() helpers never set
+   session.utt_seq / session.call_state / session.confirm_attempts.
+   main.py's turn_log.record(session.call_id, session.utt_seq, ...) call
+   (pre-existing code, far outside anything this story touches) then
+   raises AttributeError, which _dispatch_turn's own generic exception
+   handler catches and answers with the "system busy"/unreachable line
+   instead of the intended reply -- causing the test's own assertion to
+   fail on the wrong string. These two test files were evidently written
+   before utt_seq/call_state/confirm_attempts were added to CallSession
+   by a later story and were never updated; every newer test file's own
+   make_session() (including tests/test_complaint_flow.py, tests/
+   test_unverifiable_claim.py, and this story's own tests/
+   test_anger_flow.py) already sets all three fields correctly.
+
+b) tests/test_reference_data_cache.py, tests/test_outcome_distinction.py,
+   tests/test_near_match_offers.py, tests/test_language_detection_
+   dispatch.py, tests/test_hinglish_fidelity.py, tests/test_live_test_
+   price_lookup.py, tests/test_live_insufficient_information_demo.py,
+   tests/test_test_preparation_intent.py, tests/test_test_preparation_
+   reply.py: fail with agent.tool_contract.ToolContractError / ToolCallError
+   ("response is missing ['test_name_bn']") -- these tests' own fixture
+   dictionaries for a mocked clinic-api response predate a `test_name_bn`
+   field that agent/tool_contract.py now requires. Unrelated to anger,
+   complaint, or reply_templates.
+
+c) tests/test_speakability.py (35 tests): the two data-driven tests that
+   walk the real clinic-api/seed.py catalogue, plus one hand-written case
+   ("Cervical Smear" phrase-priority), report entries as "blocked" rather
+   than "speakable". agent/speakability.py and clinic-api/seed.py are
+   both read-only files last modified 2026-09-23, before this story's
+   work began -- confirmed pre-existing.
+
+d) tests/test_compare_options.py (4 tests): fixtures build a payload
+   shaped {"intents": [...], "direct_reply_bn": ...} (plural "intents"),
+   but agent.llm._validate() expects the "parts" key this whole codebase
+   has used for every story since Phase 1 -- a stale schema in the test
+   fixtures, unrelated to this story's one-sentence prompt edit.
+
+e) tests/test_fact_provenance.py (2 tests): one of its two assertions
+   counts every occurrence of the string "direct_reply_bn" anywhere in
+   main.py and asserts the count is exactly 1. Every guard module added
+   across this whole engagement (complaint, clinical_interpretation,
+   human_direct_request, doctor_personal_request, symptom_routing,
+   unverifiable_claim, and now anger) returns a dict literal containing
+   the key "direct_reply_bn": None, so this count was already far above 1
+   before this story (confirmed: 8 occurrences pre-existing; this story's
+   own guard is the 9th). This test was already failing on the same
+   assertion before this story's work began.
+
+f) tests/test_follow_up_resolution.py, tests/test_fact_provenance.py's
+   other assertion: same root cause as (a) -- missing session.utt_seq in
+   an older test fixture.
+
+None of the above touch agent/anger_flow.py, the new anger_reply()
+function, agent/outcomes.py's anger additions, or any of main.py's new
+anger guard/dispatch/interrupt code, and none of them were passing before
+this story's changes were made. No fix was made to any of these files --
+out of scope per "keep this implementation minimal and isolated to the
+story. Do not redesign Story 2 or unrelated escalation/TTS
+infrastructure."
+
+================================================================================
+6. THE ONE REGRESSION THIS STORY DID INTRODUCE, AND ITS FIX
+================================================================================
+
+tests/test_spoken_punctuation.py::test_the_gate_covers_every_public_reply_
+function failed once anger_reply() was added to agent/reply_templates.py:
+that test asserts every public function in reply_templates.py has at
+least one exercised case in the module's own spoken-punctuation gate, and
+a brand new public reply function will always trip it (the same
+regression the "unverifiable_claim" story hit and fixed for the identical
+reason). Fixed by adding anger_reply() to both the gate's yielded cases
+(8 cases: both branches x 4 languages) and its "exercised" allow-list, in
+tests/test_spoken_punctuation.py -- mirroring doctor_personal_request_
+reply()'s own precedent for a two-branch function. Verified: tests/
+test_spoken_punctuation.py now passes in full, including this test.
+
+================================================================================
+7. LIMITATIONS / OPEN ITEMS
+================================================================================
+
+- No live GPU/ASR/TTS/database stack was exercised (per this repository's
+  own tests/conftest.py discipline, every dispatch test monkeypatches
+  _asr/_tools/_tts/_speak directly) -- this report covers unit/dispatch-
+  level behaviour only, not an end-to-end call.
+- The large pre-existing regression backlog documented in section 5 was
+  investigated only to the depth needed to confirm it is unrelated to
+  this story; it was not fixed, per the story's own "keep this minimal"
+  instruction. It should be triaged separately.
+- escalation_threshold="low" is written onto session.call_state (so it is
+  honestly reported wherever CallState.as_dict() is logged/exported) but,
+  per the investigation's own finding and this story's instruction 3, is
+  not itself branched on anywhere -- the real AC1 behaviour is the
+  guard's own immediate-offer eligibility rule. If a future story adds a
+  real reader of escalation_threshold, this value is already correctly
+  populated for it.
+
+================================================================================
+DELIVERY
+================================================================================
+Changed/added files copied to the outputs mirror and committed to the
+user's connected folder (C:\Users\Interviewer\Desktop\ivr_back):
+  main.py, main_pcm.py, agent/anger_flow.py, agent/reply_templates.py,
+  agent/outcomes.py, agent/llm.py, tests/test_anger_flow.py,
+  tests/test_spoken_punctuation.py

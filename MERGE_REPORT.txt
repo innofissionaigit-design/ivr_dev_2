@@ -1,0 +1,205 @@
+FULL REPOSITORY MERGE REPORT - dev_sourav + dev_rajarshee -> test
+====================================================================
+Prepared for: sourav / InnoFissionAI          Repo: innofissionaigit-design/ivr_dev_2
+Base commit for all three branches: 6cbeb0b (test == main)
+
+WHY THIS IS A REPO-WIDE MERGE, NOT JUST main.py
+main.py imports from 20+ other files. Sizing every file either branch
+touches against `test` showed that most of them differ too -- main.py
+cannot run against `test` until they're merged as well. Per your
+instruction ("merge dependencies first, then merge the orchestrators that
+consume them"), this was done bottom-up: leaf modules first, then the two
+big shared files everything else calls into (reply_templates.py,
+clinic-api), then main.py and main_pcm.py last.
+
+SCOPE
+  30 files touched in total:
+    - 10 copied directly, one branch only touched them (no conflict)
+    - 10 brand-new files that exist in only one branch (no conflict)
+    - 8 real 3-way merges (agent/bn_normalize.py, agent/slot_parse.py,
+      agent/tools_client.py, agent/reply_templates.py, clinic-api/main.py,
+      clinic-api/models.py, main.py, main_pcm.py)
+    - agent/llm.py reuses the merge already done and approved earlier in
+      this conversation
+  Every other file in the repo is byte-identical across test/dev_sourav/
+  dev_rajarshee and was left untouched -- only these 30 files need to
+  replace their `test` counterparts.
+
+VERIFICATION DONE ON THE WHOLE SET
+  - python -m py_compile on all 30 .py files: all clean.
+  - No leftover git conflict markers anywhere.
+  - No duplicate top-level function/class definitions introduced by any
+    merge.
+  - Completeness check on every 3-way-merged file: every line either
+    branch added is present in the final file, except lines a conflict
+    resolution deliberately superseded (each one documented below,
+    confirmed intentional, not an accidental loss).
+  - Cross-file import check: every name main.py/main_pcm.py import from
+    agent.*/clinic_api.* resolves to an actual definition somewhere in
+    this set of 30 files or in the untouched rest of `test` -- the import
+    closure is fully satisfied.
+
+DECISIONS THAT WERE YOURS, APPLIED AS GIVEN
+  main.py and main_pcm.py had 8 real conflicts each (byte-identical to
+  each other). Your decisions from the review: C1/C2/C3/C8 keep both
+  (C3 with sourav's correction check running first); C4 hybrid (rajarshee's
+  date logic + sourav's correction marker); C5/C6 rajarshee's structure
+  with sourav's acknowledgment layered on as noted below; C7 rajarshee's
+  version (verified sourav's language fix isn't lost -- it's already
+  covered). One place I used my own judgment rather than your literal text,
+  flagged for your attention:
+
+  C5/C6 -- you proposed speaking the correction acknowledgment as its own
+  _speak() call right before _open_booking()/_next_booking_step() runs.
+  I implemented exactly that (rather than threading it into those
+  functions as an argument, which would have touched their signatures and
+  every other call site). The result: when a correction lands here, the
+  caller hears TWO short spoken lines back to back (the acknowledgment,
+  then the availability recheck or next question) instead of ONE combined
+  sentence -- every other correction spot in this file speaks them
+  together as one line. It's a real, if small, behavior difference worth
+  a listening-test check before this ships. Said differently in-file too,
+  in a MERGE NOTE comment right above the code.
+
+# Dependency-first merge log (dev_sourav + dev_rajarshee -> test)
+
+## Category A/B: one-sided files, copied directly, no conflict
+- agent/asr.py, agent/date_calc.py, agent/fast_path.py, agent/tool_contract.py,
+  agent/tool_outcome.py, agent/semantic_cache.py -> took dev_rajarshee's version
+  (dev_sourav identical to test on these).
+- agent/outcomes.py, agent/report_flow.py -> took dev_sourav's version
+  (dev_rajarshee identical to test on these).
+- New sourav-only modules (no rajarshee involvement at all), copied as-is:
+  agent/anger_flow.py, agent/clinical_safety.py, agent/complaint_flow.py,
+  agent/correction_flow.py, agent/doctor_personal_request.py,
+  agent/human_fast_path.py, agent/report_access_control.py,
+  agent/silence_flow.py, agent/symptom_routing.py, agent/unverifiable_claim.py
+- New rajarshee-only files, copied as-is: clinic-api/cancellation_rules.txt,
+  clinic-api/charging_for_cancellation.py, clinic-api/migrations.py
+- agent/llm.py: reused the merge already completed and approved earlier in
+  this session (VALID_INTENTS + JSON enum: union of both sides).
+All 22 files: python -m py_compile clean.
+
+## Category C: real 3-way merges
+
+### agent/bn_normalize.py -- DONE
+1 conflict (regex for confirmation-id speakability, e.g. "KCD-20260915-4F0C").
+Both branches independently fixed the SAME bug (the old regex stopped before
+the trailing "-<hex>" suffix clinic-api actually generates, so the suffix was
+either spoken as raw Latin script or misread as a rounded number).
+  dev_sourav:    r"\b([A-Z]{2,}[-]?\d{3,}(?:-[A-Z0-9]{2,})?)\b"
+  dev_rajarshee: r"\b([A-Z]{2,}-?\d{3,}(?:-[0-9A-Z]{2,})?)\b"
+Functionally identical (only hyphen-optional/character-class-order cosmetic
+differences). Kept dev_sourav's version + comment (fuller root-cause
+writeup/KCD-445 story); dev_rajarshee's equivalent regex is noted in a
+MERGE NOTE comment in the file rather than kept as a second, redundant line.
+Compiles clean. Completeness check: all 29 sourav-added lines present; the
+6 "missing" rajarshee lines are exactly the intentionally-dropped duplicate
+regex, documented in-file.
+
+### agent/slot_parse.py -- DONE
+0 textual conflicts -- dev_sourav's 26 new lines (base 524 -> 563) and
+dev_rajarshee's 438 new lines (base 524 -> 1037, mostly Latin-script/Hinglish
+weekday parsing and related helpers for E13-S7) land in different, disjoint
+regions of the file. Clean 3-way merge, 1076 lines. Compiles clean.
+Completeness check: 26/26 sourav lines present, 438/438 rajarshee lines
+present, 0 missing on either side.
+
+### agent/tools_client.py -- DONE
+1 conflict: both sides insert a NEW block of client methods at the same
+point (base has nothing there). dev_sourav adds `submit_complaint()`
+(complaint story); dev_rajarshee adds `find_appointments()`,
+`get_appointment_availability()`, `reschedule_appointment()`,
+`_keyed_write()` (shared idempotent-write helper), `get_cancellation_quote()`,
+`cancel_appointment()` (E4-S3/E4-S4 reschedule/cancel API client methods).
+No name collisions -> kept both, sourav's method first then rajarshee's
+block. Compiles clean. Completeness check: 13/13 sourav lines present,
+180/180 rajarshee lines present, 0 missing.
+
+### agent/reply_templates.py -- DONE (the big one, 3136 -> 4620 lines)
+1 conflict despite the size: both sides insert a new block of reply/prompt
+functions at the same point. dev_sourav adds 3 silence-flow functions
+(silence_prompt_one/two, silence_close_reply). dev_rajarshee adds 44
+functions for the reschedule (E4-S3) and cancel (E4-S4) flows
+(reschedule_prompt, reschedule_reply, cancel_prompt, cancel_reply, etc.,
+plus their supporting helpers). Checked for name collisions across both
+blocks: none. Kept both (sourav's 3 functions, then rajarshee's 44).
+Compiles clean. Completeness check: 610/610 sourav lines present, 575/575
+rajarshee lines present, 0 missing. Verified every reply/prompt function
+name main.py's C1 import block references (from both branches) is defined
+in the merged file -- all 43 checked, all present.
+
+### clinic-api/main.py -- DONE (1555 -> 2294 lines)
+1 conflict: both sides insert different new model imports at the same
+point. dev_sourav imports `ComplaintRecord`; dev_rajarshee imports
+`AppointmentChange`, `NotificationOutbox`, `AppointmentCancellation`. No
+collisions -> kept both. Rest of the file merged with 0 conflicts (the
+new complaint endpoint and the new reschedule/cancel endpoints sit in
+disjoint parts of the file). Compiles clean. Completeness check: 62/62
+sourav lines, 537/537 rajarshee lines present, 0 missing. Sanity check
+for duplicate @app route paths or duplicate function definitions
+anywhere in the merged file: none found.
+
+### clinic-api/models.py -- DONE (1266 -> 1500 lines)
+1 conflict: both sides insert new table classes at the same point.
+dev_sourav adds `ComplaintRecord`. dev_rajarshee adds the appointment-change
+history / notification-outbox / cancellation tables (`AppointmentChange`,
+`NotificationOutbox`, `AppointmentCancellation`, matching clinic-api/main.py's
+imports). No class-name collisions -> kept both. Compiles clean.
+Completeness check: 56/56 sourav lines, 104/104 rajarshee lines present, 0
+missing. No duplicate class definitions anywhere in the merged file.
+
+### main.py -- DONE (orchestrator, 4251 -> 7266 lines)
+Per the owner's explicit decisions on all 8 conflicts (see the full review
+sent earlier -- this section records what was actually applied):
+- C1 (reply_templates imports): kept both.
+- C2 (new booking-parsing helper block): kept both.
+- C3 (spontaneous-correction-detection vs offered-slot/date-candidate
+  logic): kept both, dev_sourav's correction check runs FIRST (it is
+  cue-gated so an ordinary answer falls through to dev_rajarshee's logic
+  unaffected), then dev_rajarshee's offered-slot / date-candidate /
+  wants-earliest checks.
+- C4/C5/C6 (writing the answered field, re-checking availability, asking
+  what's next): resolved as ONE hand-combined block, not three separate
+  patches -- dev_rajarshee's helper-based structure
+  (_apply_booking_date / _open_booking / _next_booking_step) is the base;
+  dev_sourav's was_correction marker and acknowledgment are layered on top
+  as their own `_speak()` call immediately before whichever of
+  dev_rajarshee's two paths runs next. NOTE: this is two short spoken
+  lines back to back, not the one-combined-sentence pattern every other
+  correction spot in this file uses -- flagged in-file with a MERGE NOTE
+  and here for a listening-test check before shipping.
+- C7 (booking given in one full sentence, multi-part path): took
+  dev_rajarshee's version wholesale. Verified dev_sourav's KCD-448 fix at
+  this spot (Bengali-only prompt bug) is not lost -- dev_rajarshee's
+  _open_booking(..., detect_language(text), ...) already threads the same
+  fix through independently.
+- C8 (_MULTI_INTENT_NEEDS_SEPARATE_FLOW): union of both sets.
+Verification: 0 leftover conflict markers. Compiles clean. No duplicate
+top-level function definitions. Completeness check: every added line from
+both branches is present in the final file EXCEPT the lines each
+resolution deliberately supersedes (dev_sourav's old prefix-based inline
+tail at C4/5/6, its old KCD-448 comment block at C7 folded into a merge
+note instead, and dev_rajarshee's old single-line C8 set reformatted into
+the union block) -- all confirmed intentional, not accidental loss.
+Cross-checked every helper name referenced from either side's new code
+(_apply_booking_date, _next_booking_step, _open_booking,
+_booking_slots_from_turn, wants_earliest, spoken_day_word,
+correction_acknowledged_reply, detect_booking_correction,
+is_clinical_interpretation, is_immediate_human_request, is_complaint,
+is_anger, is_doctor_personal_request, resolve_symptom_department,
+detect_unverifiable_claim, etc.) against the already-merged dependency
+files in this same merged_code folder -- every one resolves to an actual
+definition, so main.py's import closure is satisfied entirely within
+merged_code.
+
+### main_pcm.py -- DONE (orchestrator, 4267 -> 7281 lines)
+All 8 conflicts here are byte-for-byte identical to main.py's 8 conflicts
+(verified by direct comparison before merging) -- main_pcm.py is a ~96%
+duplicate of main.py with the PCM-audio-specific plumbing layered on, and
+both branches modified it in lockstep with main.py. Applied the exact same
+8 resolutions as main.py (see that section above for the full reasoning on
+each). Compiles clean, 0 leftover conflict markers, no duplicate top-level
+defs. Completeness check: same pattern as main.py -- all added lines from
+both branches present except the same intentionally-superseded ones (20
+sourav / 2 rajarshee, matching main.py's count exactly).

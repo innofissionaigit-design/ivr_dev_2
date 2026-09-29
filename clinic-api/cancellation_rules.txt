@@ -1,0 +1,78 @@
+#  =====================================================================
+#  CANCELLATION RULES  --  Kolkata Care Diagnostics
+#  =====================================================================
+#
+#  The phone agent reads this file EVERY time a caller cancels. Save your
+#  change and the next caller hears it. No restart is needed.
+#
+#  Lines that start with # are notes for people. The agent ignores them.
+#
+#  ---------------------------------------------------------------------
+#  1. SETTINGS  (one per line:  name = value)
+#  ---------------------------------------------------------------------
+#
+#    version         A label for this set of rules. Change it every time
+#                    you change a charge, e.g. 2026-09-19-a -> 2026-09-19-b.
+#                    It is stored with every cancellation, so you can tell
+#                    later which rules a caller was charged under.
+#
+#    effective_from  The first day these rules apply, as YYYY-MM-DD.
+#                    Before that day the agent cancels nothing by phone.
+#
+#    approved_by     The name of the person who approved these charges.
+#                    WHILE THIS IS EMPTY, PHONE CANCELLATION IS SWITCHED OFF:
+#                    callers are told nothing was cancelled and are sent
+#                    to the counter. Type your name to switch it on.
+#
+#    after_start     What happens if someone calls AFTER the appointment
+#                    time has passed. Either
+#                        after_start = not cancellable
+#                    or a charge, written like a rule below, e.g.
+#                        after_start = charge 500 taka | refund none
+#
+#  ---------------------------------------------------------------------
+#  2. RULES  (one line per time window)
+#  ---------------------------------------------------------------------
+#
+#    <from> to <to> hours | charge <amount> taka | refund <full / none / NN percent>
+#
+#    "hours" means hours BEFORE the appointment time.
+#    <from> is included, <to> is not:  "0 to 12 hours" covers 0:00 up to
+#    11:59, and a call exactly 12 hours before falls in the NEXT window.
+#    The LAST window must be open-ended:  "24 or more hours | ...".
+#
+#    The windows must start at 0 and follow each other with no gap and
+#    no overlap (0 to 12, then 12 to 24, then 24 or more).
+#
+#    charge   Whole taka only (320, not 320.50). "charge 0 taka" = free.
+#    refund   What the caller is told they are ELIGIBLE for:
+#               refund full          the whole amount
+#               refund none          nothing
+#               refund 50 percent    a part (any number from 1 to 99)
+#             The agent never says a refund amount -- only which of these.
+#
+#  If ANYTHING in this file is wrong, the agent does not guess: it
+#  cancels nothing by phone and sends the caller to the counter, and the
+#  clinic-api log says which line is wrong. To check the file yourself,
+#  from the clinic-api folder run:
+#
+#      python charging_for_cancellation.py
+#
+#  It prints what callers will hear for each window, or every problem
+#  with its line number.
+#
+#  CURRENT STATE: SWITCHED ON (2026-09-19), on Rajarshee's instruction,
+#  "for now". The charges below are still the EXAMPLE numbers: the clinic
+#  has not signed them off. Callers WILL hear these amounts, and a
+#  cancellation WILL record them. To switch phone cancellation OFF again,
+#  empty the approved_by line (leave "approved_by =") and save.
+#  =====================================================================
+
+version        = 2026-09-19-a
+effective_from = 2026-09-19
+approved_by    = Rajarshee (switched on for now, 2026-09-19 -- example charges, clinic sign-off pending)
+after_start    = not cancellable
+
+0 to 12 hours     | charge 320 taka | refund none
+12 to 24 hours    | charge 150 taka | refund 50 percent
+24 or more hours  | charge 0 taka   | refund full
