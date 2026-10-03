@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Multilingual IVR - Architecture</title><style>
+@page { size: A4 portrait; margin: 14mm 10mm; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body { font-family: "Segoe UI","Nirmala UI",Arial,sans-serif; font-size: 10pt;
+       color: #1a1a1a; margin: 0; line-height: 1.45; }
+/* 8.6pt is chosen, not guessed: the widest diagram line is 87 chars, A4 portrait
+   at 10mm margins leaves 523pt inside the <pre> padding, and Consolas advances
+   0.55em per char -- so 87 x 0.55 x 8.6 = 411pt, ~21% headroom for metric drift.
+   A pipeline 124 lines tall spans two pages at this size; readable beats
+   fitting on one page, and it breaks between stages rather than inside a box. */
+pre  { font-family: Consolas,"Cascadia Mono","Lucida Console","Nirmala UI",monospace;
+       font-size: 8.6pt; line-height: 1.15; white-space: pre; margin: 0;
+       background: #fbfbf8; border: 1px solid #ddd; border-radius: 3px;
+       padding: 7px 9px; overflow: visible; page-break-inside: auto; }
+h1 { font-size: 21pt; margin: 0 0 4px; letter-spacing: -0.3px; }
+h2 { font-size: 13pt; margin: 0 0 10px; padding-bottom: 5px;
+     border-bottom: 2px solid #1f6f6b; color: #1f6f6b; }
+h3 { font-size: 10.5pt; margin: 14px 0 5px; color: #333; }
+.sub { color: #666; font-size: 9pt; margin: 0 0 16px; }
+.meta { font-size: 8.4pt; color: #555; border-left: 3px solid #1f6f6b;
+        padding: 7px 11px; background: #f6f8f8; margin-bottom: 16px; }
+.meta b { color: #1a1a1a; }
+table { border-collapse: collapse; width: 100%; font-size: 8.4pt; margin: 8px 0 14px; }
+th,td { border: 1px solid #ccc; padding: 4px 7px; text-align: left; vertical-align: top; }
+th { background: #eef3f3; font-weight: 600; }
+td.n { text-align: right; font-family: Consolas,monospace; white-space: nowrap; }
+.good { color: #1a7f32; font-weight: 600; }
+.bad  { color: #a32020; font-weight: 600; }
+.note { font-size: 8.6pt; background: #fffdf3; border: 1px solid #e8dfae;
+        border-radius: 3px; padding: 8px 11px; margin: 10px 0; }
+.page { page-break-after: always; }
+.last { page-break-after: auto; }
+ol,ul { margin: 6px 0 10px; padding-left: 20px; }
+li { margin-bottom: 5px; }
+footer { margin-top: 18px; border-top: 1px solid #ddd; padding-top: 7px;
+         font-size: 7.6pt; color: #777; }
+code { font-family: Consolas,monospace; background: #f2f2ee; padding: 0 3px;
+       border-radius: 2px; font-size: 8.6pt; }
+</style></head><body>
+
+<div class="page">
+<h1>Multilingual IVR &mdash; Architecture</h1>
+<p class="sub">The merged system, and how it compares with the two sources it was built from.</p>
+<div class="meta">
+<b>Target</b> &nbsp;multilingual_ivr &nbsp;&middot;&nbsp;
+<b>Foundation</b> &nbsp;voicebot-main (byte-identical copy, MD5-verified; nothing removed)<br>
+<b>Behaviour merged from</b> &nbsp;merged_code 1 &nbsp;&middot;&nbsp;
+<b>Date</b> &nbsp;2026-10-01<br>
+<b>Verified state</b> &nbsp;<span class="good">3,118 tests pass &middot; 0 failures</span>
+&middot; 63 errors, every one <code>No module named 'nemo'</code> (ASR library deliberately not installed)
+</div>
+
+<h2>1. What this system is</h2>
+<p>One NVIDIA L4-class GPU runs <b>three ASR checkpoints and three TTS checkpoints
+resident at once</b> &mdash; Bengali, Hindi, English &mdash; with the language identified
+from <b>audio</b> before recognition starts. Exactly one step in a turn is a language
+model, and it only decides <i>what the caller wants</i>. Every price, date, doctor and
+confirmation number comes from the clinic database, substituted into fixed wording.</p>
+
+<p>The merge widened the <b>deterministic guard chain</b> (Stage&nbsp;5) from 3 guards to 11.
+Every new behaviour therefore reaches the caller <b>before the model runs</b>, which is why
+<code>intent_schema.py</code> and the LLM prompt could stay byte-identical and the model's
+accuracy on the existing 14 intents cannot have regressed.</p>
+
+<h3>Headline numbers</h3>
+<table>
+<tr><th>&nbsp;</th><th>merged_code 1</th><th>voicebot-main</th><th>multilingual_ivr</th></tr>
+<tr><td>Languages spoken</td><td class="n">1</td><td class="n">3</td><td class="n">3</td></tr>
+<tr><td>agent/ modules</td><td class="n">39</td><td class="n">94</td><td class="n">104</td></tr>
+<tr><td>main.py lines</td><td class="n">7,985</td><td class="n">3,641</td><td class="n">3,973</td></tr>
+<tr><td>clinic-api routes</td><td class="n">28</td><td class="n">54</td><td class="n">58</td></tr>
+<tr><td>Intents (model-visible)</td><td class="n">28</td><td class="n">14</td><td class="n">14</td></tr>
+<tr><td>Pre-model guards</td><td class="n">5</td><td class="n">3</td><td class="n">11</td></tr>
+<tr><td>Fixed phrases per language</td><td class="n">inline</td><td class="n">32</td><td class="n">40</td></tr>
+<tr><td>Test files</td><td class="n">75</td><td class="n">108</td><td class="n">120</td></tr>
+<tr><td>Tests passing</td><td class="n">&mdash;</td><td class="n">2,418</td><td class="n good">3,118</td></tr>
+<tr><td>Tests failing</td><td class="n">&mdash;</td><td class="n bad">17</td><td class="n good">0</td></tr>
+<tr><td>Errors</td><td class="n">&mdash;</td><td class="n bad">259</td><td class="n">63 (all nemo)</td></tr>
+</table>
+
+<div class="note"><b>Why a function-name comparison is misleading.</b> An inventory said 910 of
+merged_code&nbsp;1's 1,192 names were absent from the merge. Acting on that would have duplicated
+working code: ~600 of them are features <b>voicebot-main already implements under different
+names</b> (<code>slot_parse</code>&rarr;<code>intent_schema</code>,
+<code>outcomes</code>&rarr;<code>outcome_metrics</code>, and 19 more), and 53 are
+automation that was deliberately not ported. Every candidate was checked against the
+running code, not the file list.</div>
+</div>
+
+<div class="page">
+<h2>2. One caller turn, end to end &mdash; multilingual_ivr</h2>
+<pre>                                 CALLER (phone / browser)
+                                          |
+                   +----------------------+----------------------+
+                   |  :8100 main.py (WebM)   :8101 main_pcm.py (PCM, telephony base)
+                   |  3,973 lines each - byte-identical in every patched region
+                   +----------------------+----------------------+
+                                          v
++-------------------- STAGE 1 . AUDIO, LANGUAGE-AGNOSTIC ----------------------+
+|  admission.py    -&gt; caps concurrent calls (~28/process) before anything runs |
+|  pcm_buffer / vad_stream (Silero)  -&gt; &quot;has the caller stopped talking?&quot;      |
+|  audio_quality . echo_cancel . channel_quality . barge_in . playback_gate    |
+|  full_duplex     -&gt; half-duplex gate mutes mic while TTS plays               |
++--------------------------------------+---------------------------------------+
+                                       v
++---------------- STAGE 2 . LANGUAGE ID -- ON AUDIO, BEFORE ASR ---------------+
+|  lid.py   SpeechBrain VoxLingua107 . CPU ONLY . per utterance, never latched |
+|                                                                             |
+|  TRAP, measured on the pod: Indian-accented English is labelled Hindi at     |
+|  0.90-0.91 confidence. So the top label is NOT trusted alone --              |
+|  lang_select.py: any real mass on a 2nd language (&gt;=0.03) =&gt; run TWO ASRs    |
+|  and decide by DECODER AGREEMENT, not by LID&#x27;s own confidence.               |
++--------------------------------------+---------------------------------------+
+                                       v
++------------------------- STAGE 3 . ASR ROUTER -------------------------------+
+|  asr_router.py -- {lang: engine}; construction FAILS LOUDLY if any of        |
+|                   bn/hi/en has no engine (startup error, never mid-call)     |
+|                                                                             |
+|   bn --&gt; IndicConformer  (AI4Bharat NeMo fork)        in-process            |
+|   hi --&gt; IndicConformer  (same fork, hi checkpoint)   in-process            |
+|   en --&gt; FastConformer   (MAINLINE NVIDIA NeMo)       HTTP :8003, own venv   |
+|          `- forced split: the two NeMo forks cannot co-exist in one          |
+|             interpreter (mainline raises KeyError:&#x27;dir&#x27; on the Indic ckpt).  |
+|             A FILE PATH is passed, not bytes -- both share /workspace.       |
++--------------------------------------+---------------------------------------+
+                              transcript + detected_lang
+                                       v
++------------ STAGE 4 . TRANSCRIPT HYGIENE &amp; STICKY REPLY LANGUAGE -----------+
+|  transcript_rules . speech_norm . bn_normalize . confusables . code_switch   |
+|  language_policy -&gt; reply language is STICKY; only an explicit &quot;speak Hindi&quot; |
+|                     request moves it (ambient LID no longer does)           |
++--------------------------------------+---------------------------------------+
+                                       v
+############ STAGE 5 . DETERMINISTIC GUARD CHAIN -- NO MODEL RUNS HERE ########
+#  Fixed order, first match wins, each returns. Verified identical in both    #
+#  orchestrators.   [+] = added by this merge                                 #
+#                                                                             #
+#   1  emergency.py ............... possible medical emergency -&gt; handoff      #
+#   2  abuse.py ................... swearing -&gt; calm boundary (3x =&gt; close)    #
+#   3  transcript_problem ......... jumbled/empty -&gt; reask_policy              #
+#  -------------------------------------------------------------------------  #
+#   4  clinical_safety.py ..[+].... &quot;is my result dangerous&quot; -&gt; OFFER CLINICIAN#
+#   5  complaint.py ........[+].... -&gt; verbatim to DB + route to a person      #
+#   6  doctor_personal_request[+].. &quot;talk to a doctor&quot; -&gt; decline + offer appt  #
+#   7  human_request.py ........... &quot;talk to a person&quot; -&gt; immediate handoff    #
+#   8  callback_request.py .[+].... &quot;call me back&quot; -&gt; queue, never promises when#
+#   9  compare_flow.py .....[+].... &quot;which is cheaper&quot; -&gt; Decimal arithmetic   #
+#  10  doctor_list.py ......[+].... &quot;which doctors&quot; -&gt; list / by-department    #
+#  11  unverifiable_claim.py[+].... claim it cannot check -&gt; decline + offer    #
+#  -------------------------------------------------------------------------  #
+#  12  _update_caller_state -&gt; anger.py [+]                                    #
+#        sets caller_state=&quot;angry&quot; =&gt; speech_policy row that ALREADY EXISTED   #
+#        but nothing ever set: slower rate, 1 question/turn, offer_human,      #
+#        escalation_threshold=low, + trilingual single-apology acknowledgement #
+###############################################+###############################
+                       (nothing matched)        v
++------------ STAGE 6 . INTENT -- CHEAPEST TIER THAT ANSWERS WINS ------------+
+|  TIER 1  fast_path.py + fast_path_cues.py   string/entity match, NO model    |
+|          per-language cue tables . COMMIT_FLOOR 0.72 . abstains if unsure    |
+|                            | miss                                           |
+|  TIER 2  semantic_cache.py   bge-m3 embeddings via Ollama :11434             |
+|          caches the INTENT, never the answer =&gt; a changed price stays live   |
+|                            | miss                                           |
+|  TIER 3  llm.py -&gt; Qwen2.5-7B  Ollama :11434 . strict JSON mode              |
+|          +----------------------------------------------------------------+  |
+|          | THE ONLY NON-DETERMINISTIC STEP IN THE WHOLE TURN.             |  |
+|          | It picks WHAT the caller wants. It is never shown a price,     |  |
+|          | a date or a confirmation number it could restate.              |  |
+|          | Output parsed by intent_schema.py (pydantic, 14 intents) --     |  |
+|          | UNTOUCHED by this merge, so its accuracy cannot regress.       |  |
+|          +----------------------------------------------------------------+  |
+|          ~65-75% of turns never reach Tier 3                                |
++--------------------------------------+---------------------------------------+
+                                       v
++---------------- STAGE 7 . GATES BEFORE ANY ACTION OR FACT -------------------+
+|  action_gate.py  -- ONE place decides: act | ask | read back | repeat | hand  |
+|  confidence_gate . entity_confirmation . identity/security_check (2-factor)  |
+|  speaker_change  -&gt; notices a different voice after verification             |
++--------------------------------------+---------------------------------------+
+                                       v
++=============== STAGE 8 . SOURCE OF TRUTH -- clinic-api :8080 ===============+
+|  FastAPI + SQLite . 58 routes (54 + 4 added) . live lookup, NEVER cached     |
+|  tools_client.py validates every answer against api_models.py (pydantic)     |
+|  money parsed with parse_float=str =&gt; &quot;450.00&quot; never becomes &quot;450.0&quot;         |
+|                                                                             |
+|  [+] POST /api/v1/complaints          [+] GET /api/v1/departments           |
+|  [+] GET  /api/v1/doctors             [+] GET /api/v1/doctors/by-department  |
+|  [FIX] idempotency.py __signature__ -- the app could not even IMPORT before  |
++--------------------------------------+---------------------------------------+
+                                 verified fact
+                                       v
++--------------- STAGE 9 . REPLY ASSEMBLY -- TEMPLATE SUBSTITUTION -----------+
+|  reply_templates.py (bn, 560 ln) --dispatch--&gt; reply_templates_i18n (hi/en)  |
+|  phrases.py  40 fixed non-factual lines x bn/hi/en, coverage pinned by tests |
+|  verbalize() . pronunciation lexicon . spoken_text_lint (artefact RATCHET)   |
+|  persona.py  register . no hedging . NO REASSURANCE . sentence-length caps   |
+|              (bn 15 / hi 18 / en 20 words)                                  |
+|  apology.py  AT MOST ONE apology per spoken reply                           |
++--------------------------------------+---------------------------------------+
+                                       v
++------------------------- STAGE 10 . TTS ROUTER ------------------------------+
+|  tts_router.py -&gt; tts_server.py :8002 -- ONE coqui-tts process, ALL 3 voices |
+|  AI4Bharat Indic-TTS (FastPitch + HiFi-GAN) ships bn/hi/en in one format,    |
+|  so unlike ASR no second TTS stack is needed for English.                    |
+|  clause_split -&gt; short clauses, streamed . prewarmed phrase cache            |
++--------------------------------------+---------------------------------------+
+                                       v
++----------- STAGE 11 . RECORD (counts and ids only, never free text) --------+
+|  call_record . call_score (anger_turns[+], clinical_questions[+],            |
+|  complaint_filed[+]) . outcome_metrics . latency_metrics . call_summary      |
+|  EXCEPTION, by design: the complaints table holds the caller&#x27;s VERBATIM      |
+|  words -- one narrow-access store, so logs stay text-free.                   |
++--------------------------------------+---------------------------------------+
+                                       v
+                                     CALLER</pre>
+</div>
+
+<div class="page">
+<h2>3. Three-way comparison</h2>
+<pre>         merged_code 1                voicebot-main              multilingual_ivr
+         (Bengali only)               (trilingual base)          (= base + merge)
+===============================================================================
+LANGUAGE
+  audio LID         none                SpeechBrain, CPU          same
+  ASR               1 x Bengali         3 routed (bn/hi/en)       same
+  TTS               1 x Bengali         3 voices, 1 process       same
+  lang detection    from TRANSCRIPT     from AUDIO, pre-ASR       same
+  reply languages   bn only             bn + hi + en              same
+
+STRUCTURE
+  agent/ modules    39                  94                        104  (+10)
+  main.py           7,985 lines         3,641 lines               3,973 (+332)
+  logic lives in    main.py + one       ~94 small modules         same, + 10
+                    *_flow.py per story behind a gate layer       more guards
+  reply_templates   4,849 ln (bn only)  454 ln + i18n pair        560 ln + i18n
+  phrase table      inline per function 32 keys x 3 langs         40 keys x 3
+
+INTENT
+  intents           28                  14 (pydantic Literal)     14 UNCHANGED
+  resolution        fast_path -&gt; cache  3 tiers + abstention      same
+                    -&gt; LLM              + decoder agreement
+  new behaviour     new intents         --                        DETERMINISTIC
+  reaches caller by                                               GUARDS, pre-model
+
+CALLER-FACING BEHAVIOUR
+  anger             yes anger_flow      NO - policy existed DEAD  YES detector wired
+  complaints        yes complaint_flow  NO                        YES + DB + endpoint
+  clinical safety   yes clinical_safety NO                        YES + Devanagari
+  doctor personal   yes                 NO                        YES
+  unverifiable      yes 4 categories    NO                        YES 2 (other 2 are
+                                                                  checkable here)
+  callback ask      yes (LLM intent)    NO - queue, no detector   YES detector added
+  doctor list       yes 423 ln extractor NO intent, NO endpoint   YES 150 ln + 3 eps
+  compare options   yes compare_flow    partial (pkg-vs-separate) YES Decimal money
+  answer ledger     yes                 NO                        code only, unwired
+  date_calc         yes code owns dates NO - model resolves dates SKIPPED (needs
+                                                                  prompt change)
+  reports + OTP     yes own design      yes own design            base kept
+  cancel charges    yes charging_for_   yes cancellation_charge() base kept
+  correction / silence / symptom / speakability / confidence / match-band /
+  turn-log          yes                 yes (own implementations) base kept
+                                        `- 21 modules NOT ported: would duplicate
+
+SAFETY / TRUTH
+  truth boundary    templates only      templates only            same
+  pre-LLM guards    5                   3                         11
+  model-written     smalltalk only      smalltalk, filtered by    same
+  text              (unfiltered)        persona+speakable+history
+  money arithmetic  Decimal             none performed            Decimal (1st use)
+
+ENGINEERING
+  clinic-api routes 28                  54                        58
+  test files        75                  108                       120
+  tests passing     --                  2,418 (17 fail/259 err)   3,118 (0 fail/63 err)
+  CI / gate         none                gate.sh (COULD NOT RUN)   gate.sh RUNS
+  ADR / CLAUDE.md   none                yes                       yes
+  deploy            vast.ai             RunPod, single L4         RunPod (vast NOT
+                                                                  ported, as asked)</pre>
+</div>
+
+<div class="page">
+<h2>4. Process topology &mdash; why three Python environments</h2>
+<p class="sub">Identical in voicebot-main and multilingual_ivr. merged_code&nbsp;1 had one environment and one language.</p>
+<pre>+- /workspace/venv -- AI4Bharat NeMo FORK -----------+   +- ollama (no venv) ------+
+|                                                    |   | :11434 own binary      |
+|  :8100 main.py      :8101 main_pcm.py              |--&gt;|  qwen2.5:7b  intent    |
+|        orchestrator       orchestrator (telephony) |   |  bge-m3      cache     |
+|                                                    |   | installed to           |
+|  bn ASR  in-process    hi ASR  in-process          |   | /workspace/bin --      |
+|                                                    |   | official installer     |
+|  :8080 clinic-api  FastAPI + SQLite                |   | writes /usr/local,     |
+|        the ONLY source of any price/date/doctor    |   | wiped on restart       |
++-----------+-----------------------+----------------+   +------------------------+
+            | HTTP, WAV path only   |
+            v                       v
++- /workspace/venv-en-nemo --+  +- /workspace/tts_venv ------------+
+|  MAINLINE NVIDIA NeMo      |  |  coqui-tts                      |
+|  :8003 english_asr_server  |  |  :8002 tts_server - bn + hi + en |
+|        en ASR FastConformer|  |        ONE process, all 3 voices |
++----------------------------+  +---------------------------------+
+
+THE ISOLATION IS FORCED, NOT STYLISTIC:
+  * IndicConformer (bn/hi) loads ONLY under AI4Bharat&#x27;s NeMo fork;
+    mainline raises  KeyError: &#x27;dir&#x27;  on that checkpoint.
+  * FastConformer (en) needs MAINLINE NeMo -- the two forks cannot both be
+    importable in one interpreter. Hence English ASR is a 4th process.
+  * coqui-tts needs huggingface_hub&gt;=0.34; the AI4Bharat fork imports
+    ModelFilter, REMOVED in 0.24. No single version satisfies both.
+  =&gt; No version pair satisfies all three. Separate venvs, native processes,
+     no Docker.</pre>
+
+<h2 style="margin-top:20px">5. The merge as a delta</h2>
+<pre>voicebot-main -------------------------------------------&gt; multilingual_ivr
+
+  agent/           94 modules  --[+10 new]--------------&gt;  104
+                                  anger, complaint, clinical_safety,
+                                  doctor_personal_request, unverifiable_claim,
+                                  callback_request, callback_config,
+                                  doctor_list, compare_flow, answer_ledger
+
+  main.py          3,641 ln    --[+332]----------------&gt;   3,973
+  main_pcm.py      3,651 ln    --[+332]----------------&gt;   3,983
+                                  11 imports . 3 session fields
+                                  2 slot_answer entries . 8 guard blocks
+                                  . 1 helper
+
+  phrases.py       32 keys x3  --[+8 keys x3]----------&gt;   40 keys x3
+  clinic-api       54 routes   --[+4]------------------&gt;   58
+  models.py                    --[+ComplaintRecord]---&gt;   new complaints table
+  idempotency.py   BROKEN      --[__signature__ fix]--&gt;   app imports (62 routes)
+
+  tests            108 files   --[+12]-----------------&gt;  120
+                   2,418 pass  -------------------------&gt;  3,118 pass
+                   17 fail     -------------------------&gt;  0 fail
+                   259 error   -------------------------&gt;  63 error (all &#x27;nemo&#x27;)
+
+  intent_schema.py 14 intents  --[UNTOUCHED]-----------&gt;   14 intents
+  llm.py prompt                --[UNTOUCHED]-----------&gt;   unchanged
+         `- so Qwen&#x27;s accuracy on the existing intents cannot have regressed</pre>
+</div>
+
+<div class="last">
+<h2>6. What the diagrams are really saying</h2>
+
+<h3>The language layer is entirely voicebot-main's, untouched</h3>
+<p>LID-before-ASR, the two-decoder disambiguation for accented English, three routed
+engines, one TTS process for all three voices. The merge added nothing here and broke
+nothing here. merged_code&nbsp;1 had none of it &mdash; it detected language from the
+Bengali <i>transcript</i>, which stops working the moment audio must be routed to one of
+three engines, because there is no transcript yet at the point the decision is needed.</p>
+
+<h3>The merge is a widening of Stage 5, not a redesign</h3>
+<p>Eight new guards sit in the deterministic chain ahead of the model. Two orderings are
+load-bearing and are asserted in tests rather than left as comments:</p>
+<ul>
+<li><b>clinical before complaint</b> &mdash; "I want to file a complaint, is my result
+dangerous" takes the clinical path; the health question must not go unanswered, and that
+path reaches a person too.</li>
+<li><b>complaint before the request-for-a-person</b> &mdash; a deliberate divergence from
+merged_code&nbsp;1. Exactly one utterance collides: "I want to speak to someone about a
+complaint". Under the original order it is routed as a bare person-request and
+<b>the complaint is never recorded</b> &mdash; the call still looks fine, which is why it
+was worth changing.</li>
+</ul>
+
+<h3>merged_code 1's shape did not survive, deliberately</h3>
+<p>One 7,985-line <code>main.py</code> with a <code>*_flow.py</code> per story became
+detectors feeding voicebot-main's existing gate, policy and template machinery. Two
+concrete consequences:</p>
+<ul>
+<li><b>Anger cost ~150 lines instead of 220.</b> voicebot-main already contained a complete,
+trilingual <code>"angry"</code> speech policy and acknowledgement &mdash; and
+<b>nothing ever set it</b>. A grep returned three definition sites and nothing else. The
+feature existed, in three languages, and was unreachable. Only the detector was missing.</li>
+<li><b>The doctor list cost ~150 lines instead of 423.</b> The original carried its own
+department-name extractor &mdash; plural detection, Bengali case endings, fuzzy scoring with
+its own floor and margin. All of it was a text matcher in <code>agent/</code> guessing at a
+name it had no list to check itself against. The new endpoint matches the caller's words
+against the real department table in both directions, so the clinic's own data decides and
+no extractor is needed.</li>
+</ul>
+
+<h3>Known limits, stated plainly</h3>
+<ul>
+<li><b>No Hindi or Bengali audio has gone through any of the new paths.</b> The code paths
+are tested offline; the voices are not. Every Devanagari phrase list was written for this
+merge and needs a native speaker's review.</li>
+<li><b>Department names are Latin-only</b> in the schema, so a Bengali or Hindi reply names
+a department in a script that voice drops. Pre-existing &mdash;
+<code>reply_templates.py:390</code> already does this &mdash; and the fix is localised
+department-name columns.</li>
+<li><b>answer_ledger is code only.</b> Wiring it needs a signature change across 12 call
+sites and 9 test files, which belongs in its own review.</li>
+<li><b>date_calc was skipped.</b> It would move calendar arithmetic out of the 7B model,
+which is a real truth-boundary win, but its design needs a new prompt slot
+(<code>date_expr</code>) and the prompt was out of scope.</li>
+</ul>
+
+<footer>
+multilingual_ivr &middot; architecture reference &middot; generated 2026-10-01 &middot;
+companion to merge_report.md &middot; diagrams reflect verified code, not intent
+</footer>
+</div>
+
+</body></html>

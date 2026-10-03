@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+static/fallback_audio/*.wav
+
+# scripts/gate.sh run artifacts -- machine-generated evidence, regenerated
+# on every run; the point of gate-report.md is to be PASTED into a PR
+# description, not committed as a file.
+gate-report.json
+gate-report.md
+.pytest_cache/
+

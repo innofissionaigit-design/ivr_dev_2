@@ -1,0 +1,85 @@
+# Continuous integration: the same checks scripts/gate.sh runs, on every push and pull request.
+#
+#   static   format, lint, the two structural rules, the tuple/list scan, mypy over agent/ (strict on 38 modules), and "main_pcm.py is what the generator produces from main.py".
+#   tests    the whole test suite, in 8 parallel shards (about 5 minutes). tests/test_smoke.py is left out: it needs the
+#            live pod.
+#   audit    known-vulnerability scan of the pinned dependencies. INFORMATIONAL for now: torch 2.1.0 (28 advisories) and
+#            fastapi 0.104.1 are pinned to what the speech stack on the pod needs, so it reports and does not block.
+#
+# NOT verified by running on GitHub from this repository's history: it has only been run step by step on a developer machine
+# (every command below passes there, in a clean virtual environment holding only the packages installed here). The first run
+# on GitHub is the real test of this file.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt fastapi httpx sqlalchemy pydantic numpy
+      - name: "Format"
+        run: ruff format --check agent tools clinic-api tests scripts main.py
+      - name: "Lint"
+        run: ruff check agent tools clinic-api tests scripts main.py
+      - name: "Structural rules (no orchestrator import in agent/, no vendor SDK outside providers/)"
+        run: python scripts/check_boundaries.py
+      - name: "Tuple / list / default-argument traps"
+        run: python tools/hygiene_scan.py
+      - name: "Typing: mypy over all of agent/ (strict flags on the modules listed in pyproject.toml, plain checking on the rest)"
+        run: mypy agent
+      - name: "main_pcm.py is generated from main.py"
+        run: |
+          python tools/make_pcm_variant.py
+          git diff --exit-code main_pcm.py
+
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt fastapi httpx sqlalchemy pydantic numpy
+      - name: "Tests (shard ${{ matrix.shard }} of 8)"
+        run: |
+          files=$(ls tests/test_*.py | grep -v test_smoke.py | awk -v s=${{ matrix.shard }} 'NR % 8 == s')
+          python -m pytest $files -q -p no:cacheprovider -W ignore
+
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      - name: "Known vulnerabilities in the pinned dependencies"
+        # uvicorn[standard] is unpinned in requirements.txt (the pod's own copy is what runs), so it cannot be audited by
+        # version and is left out of the scan; every other line is a pinned requirement.
+        run: |
+          grep -vE '^\s*(#|$)|^uvicorn' requirements.txt > /tmp/pinned.txt
+          pip-audit --no-deps --disable-pip -r /tmp/pinned.txt

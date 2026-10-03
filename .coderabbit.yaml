@@ -1,0 +1,58 @@
+# CodeRabbit configuration. Reviews every pull request (any base branch) and
+# reminds the reviewer of this repository's non-negotiable rules -- the same
+# ones CLAUDE.md states -- so a finding is judged against them, not against
+# generic style.
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - ".*"
+  path_filters:
+    - "!**/*.wav"
+    - "!static/fallback_audio/**"
+    - "!**/*.lock"
+  path_instructions:
+    - path: "agent/**"
+      instructions: |
+        Truth boundary: the LLM may decide what the caller wants; it may never decide what is
+        true. Every price, date, time and confirmation number must be a template substitution
+        from a verified system response, never model-generated text.
+        One-import rule: nothing in agent/ may import main.py or main_pcm.py.
+        No vendor SDK outside providers/.
+        Thresholds are labelled MEASURED or REASONED; flag any REASONED number presented as
+        measured.
+    - path: "main.py"
+      instructions: |
+        main_pcm.py is GENERATED from this file by tools/make_pcm_variant.py; never ask for
+        edits to main_pcm.py directly. This file cannot be imported off-pod (torchaudio), so
+        scrutinise it carefully: undefined names, awaits missing, and turn-serialisation
+        (dispatch_lock) hazards.
+    - path: "main_pcm.py"
+      instructions: "Generated file. Review main.py instead; do not suggest edits here."
+    - path: "clinic-api/**"
+      instructions: |
+        Must work on both SQLite (pilot) and PostgreSQL (DATABASE_URL). Flag SQLite-only SQL,
+        integer literals as BOOLEAN defaults, and read-then-write races. Every schema change
+        to an existing table needs an ALTER-based migration in booking_migrate.py /
+        enquiry_migrate.py, run before the first ORM query on that table.
+    - path: "tests/**"
+      instructions: |
+        Tests must never be weakened to make a check pass. Flag tests that cannot fail, that
+        assert on their own fixtures, or that depend on the current date without controlling it.
+    - path: "agent/reply_templates*.py"
+      instructions: |
+        Spoken text carries no colons or brackets (agent/spoken_text_lint.py ratchet). Every
+        reply function must exist for bn, hi and en.
+
+chat:
+  auto_reply: true

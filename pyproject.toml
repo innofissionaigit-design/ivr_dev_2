@@ -1,0 +1,115 @@
+# Central project and tool configuration (PEP 518/621). Dependencies stay in requirements.txt because this service runs
+# on top of a shared pod environment (see the header of requirements.txt); the developer tools are in requirements-dev.txt
+# and mirrored under [dependency-groups] so `pip install --group dev` works on a recent pip.
+
+[project]
+name = "kolkata-care-voice-agent"
+version = "0.0.0"
+description = "Voice agent for a diagnostic clinic (Bengali, Hindi, English)"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "hypothesis>=6.100",
+    "pip-audit>=2.7",
+]
+
+# ----------------------------------------------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+# main_pcm.py is GENERATED from main.py by tools/make_pcm_variant.py; static/ is the browser client.
+extend-exclude = ["main_pcm.py", "static"]
+
+[tool.ruff.lint]
+# A deliberately modest set that catches real defects: pyflakes (F), the import/syntax errors of pycodestyle (E4/E7/E9),
+# import order (I), bugbear (B) and pyupgrade (UP). Widen it as the codebase is brought up to it, not before.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+ignore = [
+    "B008",  # FastAPI's Depends()/Query() in argument defaults is the framework's documented idiom
+    "B905",  # zip(strict=...) -- enable once each zip has been checked for unequal lengths
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests and tools put the repo on sys.path and then import from it (E402), import pytest fixtures by name so pytest can
+# see them (F811 at the use, F401 at the import), and use one-line setups (E702). Removing the sys.path lines
+# needs `pythonpath` in pytest.ini to be relied on everywhere; tracked, not done.
+"tests/*" = ["E402", "F811", "E702", "B023", "B007", "E741"]
+"tools/*" = ["E402", "E702", "B023", "B007", "E741"]
+"clinic-api/*" = ["E402"]
+"scripts/*" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ----------------------------------------------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"                    # what CI runs; numpy 2.5 type stubs need >= 3.12 to parse
+ignore_missing_imports = true        # the pod-only libraries (torch, nemo, speechbrain, ...) have no stubs here
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = false
+no_implicit_optional = true
+check_untyped_defs = true
+
+# Strict, module by module: every module listed here passes the flags below and must keep passing (CI runs `mypy agent`). A
+# module joins the list when its functions are fully annotated; the modules not listed are still checked, without these flags.
+[[tool.mypy.overrides]]
+module = [
+    "agent.abuse",
+    "agent.acknowledgement",
+    "agent.action_gate",
+    "agent.api_models",
+    "agent.apology",
+    "agent.asr_manifest",
+    "agent.asr_metrics",
+    "agent.attention",
+    "agent.barge_in",
+    "agent.call_end",
+    "agent.call_score",
+    "agent.call_summary",
+    "agent.catalogue_forms",
+    "agent.clause_split",
+    "agent.code_switch",
+    "agent.confidence_gate",
+    "agent.confusables",
+    "agent.disclosure",
+    "agent.echo_cancel",
+    "agent.emergency",
+    "agent.filler",
+    "agent.history_intent",
+    "agent.human_request",
+    "agent.intent_schema",
+    "agent.language_policy",
+    "agent.language_switch",
+    "agent.lay_terms",
+    "agent.level",
+    "agent.nbest_rescore",
+    "agent.persona",
+    "agent.phonetic_match",
+    "agent.phrase_proximity",
+    "agent.phrases",
+    "agent.playback_gate",
+    "agent.reask_policy",
+    "agent.sample_wording",
+    "agent.slot_grouping",
+    "agent.speech_norm",
+    "agent.spoken_codes",
+    "agent.spoken_text_lint",
+    "agent.telephony_augment",
+    "agent.topic_flow",
+    "agent.transcript_rules",
+    "agent.turn_ack",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_any_generics = true
+warn_return_any = true
+no_implicit_reexport = true
+
+# pytest is configured in pytest.ini (markers and asyncio mode); it takes precedence over this file.

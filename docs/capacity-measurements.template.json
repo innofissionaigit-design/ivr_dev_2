@@ -1,0 +1,7 @@
+{
+  "_readme": "Fill the three MEASURED values from the bake-off on the target GPU (Blueprint Appendix E), then: python tools/capacity_model.py --measured docs/capacity-measurements.template.json. null = not measured; the report then says UNDETERMINED instead of guessing. Replace any REASONED assumption in tools/capacity_model.py default_inputs() by adding its name here.",
+  "asr_rtf": null,
+  "tts_x_realtime": null,
+  "llm_tokens_per_s": null,
+  "llm_on_gpu": 0
+}
