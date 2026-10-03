@@ -26,6 +26,10 @@ from agent.api_models import (
     FaqAnswer,
     FindAnswer,
     FoundAnswer,
+    HomeCollectionEligibilityMultiAnswer,
+    HomeCollectionPaymentPolicyAnswer,
+    HomeCollectionQuoteAnswer,
+    HomeCollectionSlotsAnswer,
     IdentifyAnswer,
     LookupAnswer,
     PrepAnswer,
@@ -539,6 +543,133 @@ class ClinicToolsClient:
         confirmation_id has already been resolved."""
         return await self._get(
             f"/api/v1/bookings/{confirmation_id}/tests", {}, "booking_test_names"
+        )
+
+    # =========================================================================
+    # ADDED BY SOURAV: home-collection full flow (KCD-387 full flow). Previously this client had
+    # NO method at all calling the home-collection backend -- the eligibility endpoint existed in
+    # clinic-api but nothing in the agent ever reached it (the architecture investigation's own
+    # central finding). These methods are the fix for that specific gap, plus the new slot/quote/
+    # payment-policy/booking endpoints the full-flow story needs. Hold-then-confirm mirrors
+    # hold_slot/confirm_booking's own two-phase shape above (KCD-376), applied to a different
+    # resource (a home-collection slot, not a doctor's time).
+    # =========================================================================
+    async def home_collection_eligibility(self, test_name: str, postal_code: str) -> dict:
+        # ADDED BY SOURAV: call the existing home-collection eligibility service instead of
+        # duplicating eligibility rules in the agent.
+        return await self._get(
+            "/api/v1/home-collection/eligibility",
+            {"test_name": test_name, "postal_code": postal_code},
+            "home_collection_eligibility",
+            FoundAnswer,
+        )
+
+    async def home_collection_eligibility_multi(self, test_names: list[str], postal_code: str) -> dict:
+        # ADDED BY SOURAV: CASE 3 of the story -- every requested/booked test's eligibility,
+        # evaluated and returned individually, never merged or silently reduced to one.
+        try:
+            r = await self._client.get(
+                "/api/v1/home-collection/eligibility-multi",
+                params={"test_names": test_names, "postal_code": postal_code},
+            )
+            r.raise_for_status()
+            return validated(HomeCollectionEligibilityMultiAnswer, r.json(), "home_collection_eligibility_multi")
+        except (httpx.HTTPError, ValueError) as e:
+            raise ToolCallError(f"home_collection_eligibility_multi({test_names!r}): {e}") from e
+
+    async def home_collection_slots(self, postal_code: str, date: str) -> dict:
+        # ADDED BY SOURAV: real DB-backed slot availability for a caller's date question --
+        # never a calculated/estimated window.
+        return await self._get(
+            "/api/v1/home-collection/slots",
+            {"postal_code": postal_code, "date": date},
+            "home_collection_slots",
+            HomeCollectionSlotsAnswer,
+        )
+
+    async def home_collection_quote(self, test_names: list[str], postal_code: str) -> dict:
+        # ADDED BY SOURAV: the deterministic test-price + home-collection-charge + total
+        # breakdown -- the agent only ever formats these numbers, never computes them.
+        try:
+            r = await self._client.get(
+                "/api/v1/home-collection/quote", params={"test_names": test_names, "postal_code": postal_code}
+            )
+            r.raise_for_status()
+            return validated(HomeCollectionQuoteAnswer, r.json(), "home_collection_quote")
+        except (httpx.HTTPError, ValueError) as e:
+            raise ToolCallError(f"home_collection_quote({test_names!r}): {e}") from e
+
+    async def home_collection_payment_policy(self, lang: str = "bn") -> dict:
+        # ADDED BY SOURAV: the real, versioned payment policy -- never a string the agent invents.
+        return await self._get(
+            "/api/v1/home-collection/payment-policy",
+            {"lang": lang},
+            "home_collection_payment_policy",
+            HomeCollectionPaymentPolicyAnswer,
+        )
+
+    async def home_collection_hold(
+        self, slot_id: int, caller_phone: str | None = None, call_id: str | None = None
+    ) -> dict:
+        # ADDED BY SOURAV: claim one unit of real capacity before asking the caller to confirm,
+        # so two simultaneous callers can never both book the same capacity (KCD-376-style hold).
+        return await self._post(
+            "/api/v1/home-collection/hold",
+            {"slot_id": slot_id, "caller_phone": caller_phone, "call_id": call_id},
+            "home_collection_hold",
+            SuccessAnswer,
+        )
+
+    async def home_collection_release_hold(self, hold_token: str) -> dict:
+        # ADDED BY SOURAV: the caller changed their mind before confirming -- free the capacity
+        # immediately rather than waiting out the hold's TTL.
+        return await self._post(
+            "/api/v1/home-collection/release-hold", {"hold_token": hold_token}, "home_collection_release_hold",
+            SuccessAnswer,
+        )
+
+    async def home_collection_book(
+        self,
+        hold_token: str,
+        test_names: list[str],
+        postal_code: str,
+        patient_name: str,
+        phone: str,
+        caller_phone: str | None,
+        address_line: str,
+        locality: str = "",
+        city: str = "",
+        state: str = "",
+        landmark: str = "",
+        patient_id: int | None = None,
+    ) -> dict:
+        # ADDED BY SOURAV: the actual, persistent home-collection booking transaction -- never
+        # created before this call, and never faked in session memory only.
+        body = {
+            "hold_token": hold_token,
+            "test_names": test_names,
+            "postal_code": postal_code,
+            "patient_name": patient_name,
+            "phone": phone,
+            "caller_phone": caller_phone,
+            "address_line": address_line,
+            "locality": locality,
+            "city": city,
+            "state": state,
+            "landmark": landmark,
+            "patient_id": patient_id,
+        }
+        return await self._post("/api/v1/home-collection/book", body, "home_collection_book", SuccessAnswer)
+
+    async def home_collection_booking_status(self, booking_reference: str) -> dict:
+        return await self._get(
+            f"/api/v1/home-collection/booking/{booking_reference}", {}, "home_collection_booking_status", FoundAnswer
+        )
+
+    async def home_collection_cancel(self, booking_reference: str) -> dict:
+        return await self._post(
+            "/api/v1/home-collection/cancel", {"booking_reference": booking_reference}, "home_collection_cancel",
+            SuccessAnswer,
         )
 
     async def write_call_event(

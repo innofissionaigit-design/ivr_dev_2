@@ -24,6 +24,10 @@ import agent_messages as am
 import booking_service as bs
 import enquiry_service as eq
 import gazetteer as gz
+# ADDED BY SOURAV: the full home-collection visit flow (slots/hold/confirm/booking/assignment) --
+# see home_collection_service.py's own module docstring for why this is a separate service module
+# from booking_service.py/enquiry_service.py rather than folded into either.
+import home_collection_service as hcs
 import patient_context as pc
 import registry as reg
 from db import SessionLocal, get_db
@@ -145,6 +149,16 @@ def _ensure_seeded():
 
         logging.getLogger("clinic-api").info("enquiry facts backfill: %s", backfill_enquiry_facts(db))
         logging.getLogger("clinic-api").info("enquiry demo data: %s", seed_enquiry_demo_data(db))
+
+        # ADDED BY SOURAV: home-collection slots/collectors/payment-policy are operational data,
+        # not catalogue data -- seeded here, every boot, same idempotent-insert discipline as the
+        # enquiry demo data just above, and derived from HomeCollectionCoverage's own serviceable
+        # rows rather than a second hard-coded postal-code list.
+        from home_collection_migrate import seed_home_collection_operational_data
+
+        logging.getLogger("clinic-api").info(
+            "home collection operational data: %s", seed_home_collection_operational_data(db)
+        )
     finally:
         db.close()
 
@@ -1280,6 +1294,147 @@ def home_collection_endpoint(test_name: str = Query(...), postal_code: str = Que
     if not t:
         return {"found": False, "query": test_name}
     return eq.home_collection_eligibility(db, t.id, postal_code)
+
+
+# =============================================================================
+# ADDED BY SOURAV: home-collection full flow -- multi-test eligibility, real slot
+# availability/hold/confirm, a deterministic quote, the payment policy, and the actual
+# booking/cancellation transaction. See home_collection_service.py for the business logic;
+# every endpoint here only resolves names/does request-shape validation and calls it.
+# =============================================================================
+
+
+def _resolve_test_ids(db: Session, test_names: list[str]) -> tuple[list[int], list[str]]:
+    """ADDED BY SOURAV: the same exact/near-exact test-name resolution every other endpoint in
+    this file already uses (_find_test) -- never a second, competing matcher for home collection.
+    Returns (resolved lab_test ids, names that did not resolve to any test)."""
+    ids, not_found = [], []
+    for name in test_names:
+        t = _find_test(db, name)
+        if t:
+            ids.append(t.id)
+        else:
+            not_found.append(name)
+    return ids, not_found
+
+
+@app.get("/api/v1/home-collection/eligibility-multi")
+def home_collection_eligibility_multi_endpoint(
+    test_names: list[str] = Query(...), postal_code: str = Query(...), db: Session = Depends(get_db)
+):
+    # ADDED BY SOURAV: CASE 3 of the story (several booked/requested tests) needs every test's
+    # eligibility reported individually -- never merged, never one silently chosen.
+    ids, not_found = _resolve_test_ids(db, test_names)
+    return {"found": True, "results": hcs.multi_test_eligibility(db, ids, postal_code), "not_found": not_found}
+
+
+@app.get("/api/v1/home-collection/slots")
+def home_collection_slots_endpoint(
+    postal_code: str = Query(...), date: str = Query(...), db: Session = Depends(get_db)
+):
+    # ADDED BY SOURAV: real, DB-backed slot availability -- never a calculated/estimated window.
+    return {"found": True, "slots": hcs.available_slots(db, postal_code, date)}
+
+
+class HomeCollectionHoldRequest(BaseModel):
+    slot_id: int
+    caller_phone: str | None = None
+    call_id: str | None = None
+
+
+@app.post("/api/v1/home-collection/hold")
+@idempotent("home_collection.hold")
+def home_collection_hold_endpoint(req: HomeCollectionHoldRequest, db: Session = Depends(get_db)):
+    # ADDED BY SOURAV: the same hold-then-confirm two-phase pattern booking_service.py already
+    # uses for doctor slots (KCD-376), so two simultaneous callers can never both confirm the
+    # same capacity unit.
+    return hcs.hold_home_collection_slot(db, req.slot_id, req.caller_phone, req.call_id)
+
+
+class HomeCollectionReleaseHoldRequest(BaseModel):
+    hold_token: str
+
+
+@app.post("/api/v1/home-collection/release-hold")
+@idempotent("home_collection.release_hold")
+def home_collection_release_hold_endpoint(req: HomeCollectionReleaseHoldRequest, db: Session = Depends(get_db)):
+    # ADDED BY SOURAV: a caller who changes their mind must not permanently consume capacity.
+    return hcs.release_home_collection_hold(db, req.hold_token)
+
+
+@app.get("/api/v1/home-collection/quote")
+def home_collection_quote_endpoint(
+    test_names: list[str] = Query(...), postal_code: str = Query(...), db: Session = Depends(get_db)
+):
+    # ADDED BY SOURAV: the deterministic test-price + home-collection-charge + total breakdown,
+    # computed here, never by the agent or a reply template.
+    ids, not_found = _resolve_test_ids(db, test_names)
+    quote = hcs.quote_home_collection(db, ids, postal_code)
+    quote["not_found"] = not_found
+    return quote
+
+
+@app.get("/api/v1/home-collection/payment-policy")
+def home_collection_payment_policy_endpoint(lang: str = Query("bn"), db: Session = Depends(get_db)):
+    # ADDED BY SOURAV: the real, versioned payment policy (never a string literal in the agent).
+    return hcs.payment_policy_reply_dict(db, lang)
+
+
+class HomeCollectionBookRequest(BaseModel):
+    hold_token: str
+    test_names: list[str]
+    postal_code: str
+    patient_name: str
+    phone: str
+    caller_phone: str | None = None
+    address_line: str
+    locality: str = ""
+    city: str = ""
+    state: str = ""
+    landmark: str = ""
+    patient_id: int | None = None
+
+
+@app.post("/api/v1/home-collection/book")
+@idempotent("home_collection.book")
+def home_collection_book_endpoint(req: HomeCollectionBookRequest, db: Session = Depends(get_db)):
+    # ADDED BY SOURAV: the actual, persistent home-collection booking transaction. A retried
+    # confirm (same Idempotency-Key header) is handled by @idempotent above -- see
+    # home_collection_service.create_home_collection_booking's own docstring for why this
+    # function is not independently idempotent as well.
+    ids, not_found = _resolve_test_ids(db, req.test_names)
+    if not_found:
+        return {"success": False, "reason": "test_not_found", "not_found": not_found}
+    return hcs.create_home_collection_booking(
+        db,
+        hold_token=req.hold_token,
+        lab_test_ids=ids,
+        postal_code=req.postal_code,
+        patient_name=req.patient_name,
+        phone=req.phone,
+        caller_phone=req.caller_phone,
+        address_line=req.address_line,
+        locality=req.locality,
+        city=req.city,
+        state=req.state,
+        landmark=req.landmark,
+        patient_id=req.patient_id,
+    )
+
+
+@app.get("/api/v1/home-collection/booking/{booking_reference}")
+def home_collection_booking_status_endpoint(booking_reference: str, db: Session = Depends(get_db)):
+    return hcs.get_home_collection_booking(db, booking_reference)
+
+
+class HomeCollectionCancelRequest(BaseModel):
+    booking_reference: str
+
+
+@app.post("/api/v1/home-collection/cancel")
+@idempotent("home_collection.cancel")
+def home_collection_cancel_endpoint(req: HomeCollectionCancelRequest, db: Session = Depends(get_db)):
+    return hcs.cancel_home_collection_booking(db, req.booking_reference)
 
 
 @app.get("/api/v1/insurance/coverage")

@@ -110,6 +110,11 @@ MIN_TURNS_FOR_GAP = 20
 
 _RE_WS = re.compile(r"\s+")
 _RE_PUNCT = re.compile(r"[।?!,.;:'\"()\-]+")
+# ADDED BY SOURAV: a standalone 6-digit run is read as "the caller gave a pincode" for the
+# home_collection-actionable guard below -- same "a run of exactly 6 digits, not a substring of a
+# longer one" discipline as agent/intent_schema.py's own postal_code normaliser, so a 7-digit
+# number (a phone fragment, say) is correctly NOT read as a PIN code here either.
+_RE_DIGIT_RUN = re.compile(r"\d+")
 
 
 def _normalize(text: str) -> str:
@@ -431,6 +436,17 @@ class FastPath:
         other, _form2, other_score = self.catalogue.match(body, "test", lang, COMMIT_FLOOR, skip_name=first)
         return other is not None and first_score - other_score < AMBIGUITY_MARGIN
 
+    def _home_collection_is_actionable(self, text: str, lang: str) -> bool:
+        # ADDED BY SOURAV: KCD-387 full flow. Two independent, cheap signals -- a standalone 6-digit
+        # PIN (floor=0.0 below the test check is about SPECIFICITY, not confidence, so no commit
+        # floor applies to the digit check) or a test name matched at the same COMMIT_FLOOR the
+        # rate/prep branches above already use. Either one means the caller is not asking a generic
+        # "do you offer this" question.
+        if any(len(run) == 6 for run in _RE_DIGIT_RUN.findall(text)):
+            return True
+        name, _form, score = self.catalogue.match(text, "test", lang, COMMIT_FLOOR)
+        return bool(name and score >= COMMIT_FLOOR)
+
     def _names_nothing(self, text: str, table: cues.CueTable) -> bool:
         """True when, once the rate/preparation cue phrases are taken out, everything left is a little function word or
         a pointing word ("the same", "that", "test"): the caller asked about the topic, they did not name a test. One
@@ -562,6 +578,16 @@ class FastPath:
         # rate/prep/availability question -- those already returned above.
         faq_topic, faq_form, faq_score = self.catalogue.match(text, "faq", lang, FAQ_COMMIT_FLOOR)
         if faq_topic and faq_score >= FAQ_COMMIT_FLOOR:
+            # ADDED BY SOURAV: KCD-387 full flow. "home_collection" is the one FAQ topic that now has
+            # a real, actionable intent sitting behind it (agent/llm.py's "home_collection" intent) --
+            # a caller who named a specific test or gave a pincode is not asking "do you offer this",
+            # they are trying to USE it, and must reach that full flow instead of this fixed,
+            # context-free FAQ sentence (the gap the KCD-387 architecture investigation's own "FINAL
+            # RULE" worked example exists to close). Every other FAQ topic is unaffected -- none of
+            # them has a second, deeper intent competing for the same words.
+            if faq_topic == "home_collection" and self._home_collection_is_actionable(text, lang):
+                self._abstain("home_collection_actionable", "clinic_faq", lang)
+                return None
             self._serve("clinic_faq", lang)
             logger.info("fast path: clinic_faq %r (%.2f) [%s] from %r", faq_topic, faq_score, lang, transcript)
             return FastPathResult("clinic_faq", _empty_slots(faq_topic=faq_topic), faq_score, matched_form=faq_form)

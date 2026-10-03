@@ -137,6 +137,35 @@ class VerifyAnswer(_Answer):
     locked: StrictBool | None = None
 
 
+# ADDED BY SOURAV: response shapes for the home-collection full flow (clinic-api/main.py's
+# /api/v1/home-collection/* endpoints) -- same discipline as every model above: require the one
+# field the agent branches on, type the fields a reply template reads, allow everything else.
+class HomeCollectionEligibilityMultiAnswer(_Answer):
+    found: StrictBool
+    results: list[dict[str, Any]] = []
+    not_found: list[str] = []
+
+
+class HomeCollectionSlotsAnswer(_Answer):
+    found: StrictBool
+    slots: list[dict[str, Any]] = []
+
+
+class HomeCollectionQuoteAnswer(FoundAnswer):
+    quote_available: StrictBool | None = None
+    per_test: list[dict[str, Any]] | None = None
+    eligible_tests: list[str] | None = None
+    test_charges_inr: Number | None = None
+    home_collection_charge_inr: Number | None = None
+    total_inr: Number | None = None
+    not_found: list[str] | None = None
+
+
+class HomeCollectionPaymentPolicyAnswer(FoundAnswer):
+    policy: str | None = None
+    description: str | None = None
+
+
 def validated(model: type[BaseModel], payload: Any, what: str) -> dict[str, Any]:
     """`payload` checked against `model`, as the dict of the keys the API actually sent. Raises ApiShapeError (a
     ValueError) with the field names that were wrong -- never the values, which may be personal."""

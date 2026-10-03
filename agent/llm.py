@@ -55,7 +55,13 @@ OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "0"))
 
 # VALID_INTENTS, FAQ_TOPICS, SLOT_KEYS and the answer schema live in agent/intent_schema.py
 
-
+# ADDED BY SOURAV: this template is prompt TEXT sent verbatim to the LLM, so a Python comment
+# cannot be placed inline inside it without corrupting what the model reads -- documenting the
+# change here instead. For KCD-387 (home collection), added: the "home_collection" intent bullet
+# and its clinic_faq-vs-home_collection disambiguation rule (also added to the clinic_faq bullet),
+# the postal_code/address_line/landmark SLOT RULES bullets, "home_collection" in the JSON shape's
+# intent enum, and the 3 new slots in the JSON shape's slots object. Nothing else in this template
+# was touched.
 SYSTEM_PROMPT_TEMPLATE = """You are the intent-and-slot extractor for a diagnostic clinic's phone assistant. You will be given ONE caller utterance in {language_name}, transcribed by automatic speech recognition from live phone audio -- it may contain ASR errors, missing punctuation, or code-switched English words written in the caller's own script.
 
 Today's date is {today_iso} ({today_weekday}), Asia/Kolkata.
@@ -74,7 +80,8 @@ INTENTS (exactly one):
 - "resend_confirmation": caller wants the confirmation message sent again (they lost it, didn't get it, etc.).
 - "department_query": caller describes a symptom or problem and needs to be routed to the right department, without naming a doctor or department themselves. Fill "symptom_description" with what they said, verbatim.
 - "test_prep": caller is asking how to prepare for a test, or for SEVERAL tests in the same turn (fasting, before/after instructions). Several tests: fill "test_names", not "test_name" -- see the slot rule below.
-- "clinic_faq": caller is asking a general clinic question with no specific test or doctor -- hours, location, payment methods, insurance, parking, report collection, contact number, or home sample collection. Fill "faq_topic" with exactly one of: {faq_topics}. If the question doesn't clearly match one of those topics, use "unclear" instead of guessing a topic.
+- "clinic_faq": caller is asking a general clinic question with no specific test or doctor -- hours, location, payment methods, insurance, parking, report collection, contact number, or home sample collection. Fill "faq_topic" with exactly one of: {faq_topics}. If the question doesn't clearly match one of those topics, use "unclear" instead of guessing a topic. IMPORTANT: use "faq_topic": "home_collection" ONLY for a bare "do you offer home sample collection?" with no test named and no pincode/address given -- the moment the caller names a specific test, gives a pincode, or is actually trying to ARRANGE a home visit (not just asking whether the service exists), use the separate "home_collection" intent below instead, never this one.
+- "home_collection": caller asks whether a specific test (named this turn, or one they already have booked) can be collected at home, or wants to arrange/book a home sample collection visit -- this single intent covers the whole conversation, from "can this be collected at home" through giving a pincode, a date, an address, and confirming the visit. Fill "test_name" or "test_names" if a test was named this turn (same copy-as-said rule as below); fill "postal_code" only if a 6-digit PIN code was spoken, digits only; fill "date" if a collection date was said (same date-resolution rule as "date" below); fill "time_slot" if the caller is choosing between home-collection time windows they were just read out (e.g. "the 10 to 12 one", "the first one", "সকালেরটা"); fill "address_line" with whatever address text the caller gave, copied as said -- you are never asked to split it into house/road/city, that happens deterministically downstream, never by you; fill "landmark" only if the caller named a nearby landmark; fill "patient_name"/"phone" the same as for "book_test" below. Leave any of these null if not said this turn -- the system asks for whatever is still missing, one thing at a time.
 - "smalltalk": greeting, thanks, or anything with no clinic-data lookup needed. You MAY write a short, warm reply yourself for this case only, in {language_name}, in that language's own script.
 - "unclear": you cannot confidently tell what the caller wants, or the utterance is empty/garbled ASR noise.
 
@@ -103,11 +110,13 @@ SLOT RULES:
 - "confirmation_id" / "new_time_slot": only if explicitly spoken/known this turn.
 - "spelled_letters": if the caller is spelling a name letter by letter (e.g. "R, A, V, I"), a list of the individual letters in order, lowercase. Otherwise null.
 - "symptom_description": only for "department_query" -- the caller's own words describing the problem, never your own paraphrase or a diagnosis.
-- Never invent a patient name, phone number, confirmation number, or date that was not said.
+- "postal_code": only for "home_collection" -- a 6-digit PIN code, digits only, only if explicitly spoken.
+- "address_line" / "landmark": only for "home_collection" -- copied as the caller said it, never paraphrased or restructured.
+- Never invent a patient name, phone number, confirmation number, postal code, address, or date that was not said.
 
 Output ONLY a single valid JSON object, no other text, in exactly this shape:
 {{
-  "intent": "test_rate" | "doctor_availability" | "book_appointment" | "book_test" | "reschedule_appointment" | "cancel_appointment" | "lookup_booking" | "add_test_booking" | "resend_confirmation" | "department_query" | "test_prep" | "clinic_faq" | "smalltalk" | "unclear",
+  "intent": "test_rate" | "doctor_availability" | "book_appointment" | "book_test" | "reschedule_appointment" | "cancel_appointment" | "lookup_booking" | "add_test_booking" | "resend_confirmation" | "department_query" | "test_prep" | "clinic_faq" | "home_collection" | "smalltalk" | "unclear",
   "slots": {{
     "test_name": string or null,
     "test_names": array of strings or null,
@@ -124,7 +133,10 @@ Output ONLY a single valid JSON object, no other text, in exactly this shape:
     "relationship": string or null,
     "spelled_letters": array of strings or null,
     "symptom_description": string or null,
-    "faq_topic": string or null
+    "faq_topic": string or null,
+    "postal_code": string or null,
+    "address_line": string or null,
+    "landmark": string or null
   }},
   "secondary_intent": "test_rate" | "doctor_availability" | "test_prep" | "clinic_faq" | "department_query" | null,
   "secondary_slots": {{
@@ -142,7 +154,7 @@ Output ONLY a single valid JSON object, no other text, in exactly this shape:
 
 _FAST_OUTPUT_BLOCK = """Output ONLY a single valid JSON object, no other text. Include ONLY the fields that have a value: leave out every null slot, and leave out "secondary_intent", "secondary_slots" and "direct_reply_bn" unless they apply. Shape:
 {"intent": "<exactly one intent from the list above>", "slots": {"<slot name>": <value>, ...}}
-Slot names, and the type of each value: test_name, doctor_name, date, time_slot, new_date, new_time_slot, confirmation_id, patient_name, phone, contact_phone, relationship, symptom_description, faq_topic are strings; patient_age is a number; test_names and spelled_letters are arrays of strings.
+Slot names, and the type of each value: test_name, doctor_name, date, time_slot, new_date, new_time_slot, confirmation_id, patient_name, phone, contact_phone, relationship, symptom_description, faq_topic, postal_code, address_line, landmark are strings; patient_age is a number; test_names and spelled_letters are arrays of strings.
 For a second question add "secondary_intent" ("test_rate", "doctor_availability", "test_prep", "clinic_faq" or "department_query") and "secondary_slots" (any of test_name, doctor_name, date, faq_topic, symptom_description). "direct_reply_bn" (a string) is only for "smalltalk"; for every other intent the reply is composed later from real clinic data, not from you."""
 
 

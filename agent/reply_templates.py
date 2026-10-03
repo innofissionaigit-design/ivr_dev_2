@@ -16,6 +16,7 @@ direct_reply_bn -- there is no fact to get wrong in "নমস্কার" or "
 from __future__ import annotations
 
 from agent import reply_templates_i18n as _i18n
+from agent.home_collection_flow import MAX_SLOTS_READ_ALOUD
 from agent.sample_wording import sample_sentence
 
 
@@ -65,6 +66,14 @@ def missing_slot_prompt(intent: str, missing: str, lang: str = "bn") -> str:
         ("add_test_booking", "confirmation_id"): "আপনার কনফার্মেশন নম্বরটা বলবেন?",
         ("add_test_booking", "test_name"): "কোন টেস্টটা যোগ করতে চান?",
         ("lookup_booking", "phone"): "যে নম্বর থেকে বুক করেছিলেন সেটা বলবেন?",
+        # ADDED BY SOURAV: KCD-387 full flow -- one prompt per still-missing fact in the home
+        # collection flow, same "one question per missing slot" shape as every entry above.
+        ("home_collection", "test_name"): "কোন টেস্টটা বাড়িতে এসে করানোর কথা জিজ্ঞেস করছেন, একটু বলবেন?",
+        ("home_collection", "postal_code"): "আপনার এলাকার ৬ সংখ্যার পিনকোডটা বলবেন?",
+        ("home_collection", "date"): "কোন দিন বাড়িতে এসে স্যাম্পল নিতে হবে?",
+        ("home_collection", "address_line"): "পুরো ঠিকানাটা বলবেন -- বাড়ি নম্বর, রাস্তা, এলাকা, শহর সমেত?",
+        ("home_collection", "patient_name"): "রোগীর নামটা বলবেন?",
+        ("home_collection", "phone"): "একটা ফোন নম্বর দেবেন, যাতে বুকিং-এর তথ্য পাঠাতে পারি?",
     }
     return prompts.get((intent, missing), "দুঃখিত, একটু স্পষ্ট করে বলবেন?")
 
@@ -601,3 +610,158 @@ def compare_options_reply(cmp: dict, name_a: str, name_b: str, lang: str = "bn")
         more = name_a if cmp["more_tests_side"] == "a" else name_b
         line += f"{more}-এ {cmp['test_count_delta']}টা টেস্ট বেশি আছে। "
     return line + "কোনটা করাতে চান?"
+
+
+# ============================================== KCD-387 full flow: "Caller asks whether a test can
+# be collected at home" -- see agent/home_collection_flow.py's own module docstring for why this
+# story carries its own cross-turn state instead of reusing BookingState. Every function below only
+# formats a fact a real clinic-api response already carries (a price, a slot time, a booking
+# reference, a collector's name) -- never invents, estimates, or calculates one; see
+# home_collection_service.py's own docstring for where each of those numbers actually comes from.
+
+
+def home_collection_eligibility_reply(result: dict, lang: str = "bn") -> str:
+    """`result` is GET .../home-collection/eligibility-multi's own shape. EVERY requested test is
+    reported -- eligible ones named together, then each ineligible/not-covered/not-found one with
+    its own reason -- never merged into a single yes/no (section 8's "never silently choose one
+    test" rule, the same one multi_test_eligibility() itself is built around)."""
+    if lang != "bn":
+        return _i18n.home_collection_eligibility_reply(result, lang)
+    rows = result.get("results") or []
+    not_found = result.get("not_found") or []
+    eligible = [r for r in rows if r.get("found") and r.get("eligible")]
+    ineligible = [r for r in rows if r.get("found") and not r.get("eligible")]
+    parts = []
+    if eligible:
+        names = ", ".join(r.get("test_name") or "" for r in eligible)
+        parts.append(f"{names} -- এই টেস্ট(গুলো) বাড়িতে এসে করানো যাবে।")
+    for r in ineligible:
+        name = r.get("test_name") or ""
+        if r.get("reason") == "area_not_covered":
+            parts.append(f"{name} টেস্টের জন্য আপনার এলাকায় এখনো বাড়িতে এসে স্যাম্পল নেওয়ার সুবিধা নেই।")
+        else:
+            parts.append(f"{name} টেস্টটা বাড়িতে এসে করানো যায় না, ল্যাবেই আসতে হবে।")
+    for name in not_found:
+        parts.append(f"'{name}' নামে কোনো টেস্ট আমাদের তালিকায় পেলাম না।")
+    if not parts:
+        parts.append("দুঃখিত, এই টেস্ট(গুলো)-র তথ্য এই মুহূর্তে দেখতে পারছি না।")
+    return " ".join(parts)
+
+
+def home_collection_slots_reply(slots: list[dict], lang: str = "bn") -> str:
+    if lang != "bn":
+        return _i18n.home_collection_slots_reply(slots, lang)
+    if not slots:
+        return "দুঃখিত, ওই দিনে কোনো স্লট ফাঁকা নেই। অন্য কোনো দিন বলবেন?"
+    shown = slots[:MAX_SLOTS_READ_ALOUD]
+    if len(shown) == 1:
+        s = shown[0]
+        return f"{s['date']} তারিখে {s['start_time']} থেকে {s['end_time']}-এর মধ্যে স্লট ফাঁকা আছে। এটা রাখব?"
+    windows = ", ".join(f"{s['start_time']} থেকে {s['end_time']}" for s in shown)
+    return f"{shown[0]['date']} তারিখে এই সময়গুলো ফাঁকা আছে -- {windows}। কোনটা চান?"
+
+
+def home_collection_hold_failed_reply(result: dict, lang: str = "bn") -> str:
+    if lang != "bn":
+        return _i18n.home_collection_hold_failed_reply(result, lang)
+    if result.get("reason") == "slot_full":
+        return "দুঃখিত, ওই সময়টা এর মধ্যে ভর্তি হয়ে গেছে। অন্য একটা সময় বলবেন?"
+    return "দুঃখিত, সময়টা ধরে রাখা গেল না। আবার চেষ্টা করি?"
+
+
+def home_collection_quote_reply(quote: dict, payment_policy_text: str | None, lang: str = "bn") -> str:
+    """The deterministic Test1/Test2/.../home-collection-charge/Total breakdown (section 17),
+    followed by the real payment policy (section 18) and the "shall I proceed?" gate (section 19) --
+    every number here is a straight substitution from `quote` (clinic-api's
+    home_collection_service.quote_home_collection, never recomputed here)."""
+    if lang != "bn":
+        return _i18n.home_collection_quote_reply(quote, payment_policy_text, lang)
+    if not quote.get("quote_available"):
+        return "দুঃখিত, এই টেস্ট(গুলো)-র জন্য এখন দাম হিসেব করা যাচ্ছে না।"
+    lines = [f"{r.get('test_name')} {r.get('rate_inr')} টাকা" for r in (quote.get("per_test") or []) if r.get("eligible")]
+    breakdown = ", ".join(lines)
+    charge = quote.get("home_collection_charge_inr") or 0
+    total = quote.get("total_inr") or 0
+    reply = f"{breakdown}, এবং বাড়িতে এসে নেওয়ার জন্য {charge} টাকা -- সব মিলিয়ে মোট {total} টাকা।"
+    if payment_policy_text:
+        reply += f" {payment_policy_text}"
+    return reply + " এগিয়ে যাব?"
+
+
+def home_collection_stored_address_offer(address: str, lang: str = "bn") -> str:
+    """Section 21/KCD-499: a stored address is OFFERED, never silently applied -- same
+    confirm-before-use discipline as main.py's own _offer_preferences."""
+    if lang != "bn":
+        return _i18n.home_collection_stored_address_offer(address, lang)
+    return f"আগের বার দেওয়া এই ঠিকানাতেই পাঠাব -- {address}? নাকি নতুন ঠিকানা দেবেন?"
+
+
+def home_collection_address_pincode_mismatch_reply(address_pin: str, given_pin: str, lang: str = "bn") -> str:
+    """Section 22: never guess which of the two pincodes is right -- say what was heard and ask
+    again, the same honest-conflict discipline as agent/reply_templates.booking_reply's own
+    "slot_taken"/"doctor_ambiguous" branches."""
+    if lang != "bn":
+        return _i18n.home_collection_address_pincode_mismatch_reply(address_pin, given_pin, lang)
+    return (
+        f"আপনার ঠিকানায় {address_pin} পিনকোড শুনলাম, কিন্তু আগে আপনি {given_pin} বলেছিলেন -- দুটো আলাদা। "
+        "ঠিকানাটা আর একবার বলবেন?"
+    )
+
+
+def home_collection_address_confirm_reply(address: str, lang: str = "bn") -> str:
+    """Section 23: read the address back BEFORE anything is written, same "readback before
+    commit" discipline as booking_confirmation_readback above."""
+    if lang != "bn":
+        return _i18n.home_collection_address_confirm_reply(address, lang)
+    return f"ঠিকানাটা শুনলাম -- {address}। এটা ঠিক আছে তো?"
+
+
+def home_collection_final_confirm_reply(summary: dict, lang: str = "bn") -> str:
+    """Section 25's last gate before the real booking write: the full summary, read back once
+    more with the slot, address and total all together, so a caller who has been answering one
+    question at a time hears the whole picture before committing."""
+    if lang != "bn":
+        return _i18n.home_collection_final_confirm_reply(summary, lang)
+    # ADDED BY SOURAV: split across 4 short sentences, not 1 long run-on -- persona.violations()'s
+    # own per-language MAX_SENTENCE_WORDS cap (bn: 15) exists so a caller hears this read-back in
+    # digestible pieces, not a single breathless clause.
+    tests = ", ".join(summary.get("eligible_tests") or [])
+    return (
+        f"তাহলে {tests} -- {summary.get('date')} তারিখে, সময় {summary.get('start_time')} থেকে "
+        f"{summary.get('end_time')}-এর মধ্যে বাড়িতে এসে স্যাম্পল নেওয়া হবে। "
+        f"ঠিকানা {summary.get('address')}। "
+        f"মোট {summary.get('total_inr')} টাকা। এটা কনফার্ম করব?"
+    )
+
+
+def home_collection_booking_result_reply(result: dict, lang: str = "bn") -> str:
+    """Section 25/26/27: a real, persisted booking only -- `result` is clinic-api's own
+    create_home_collection_booking()/_booking_dict() shape. A collector's name is spoken ONLY when
+    `collector_name` is actually set (a real assignment exists); otherwise the caller is told
+    staff will confirm who comes, exactly section 26's own "never invent a collector name" rule --
+    never "Rahul will come tomorrow" on a booking nobody has actually assigned."""
+    if lang != "bn":
+        return _i18n.home_collection_booking_result_reply(result, lang)
+    if not result.get("success"):
+        reason = result.get("reason")
+        if reason == "hold_expired":
+            return "দুঃখিত, সময়টা ধরে রাখা যায়নি, একটু দেরি হয়ে গেছে। আবার চেষ্টা করি?"
+        if reason in ("no_eligible_test", "test_not_found"):
+            return "দুঃখিত, এই টেস্ট(গুলো)-র জন্য বাড়িতে এসে বুকিং করা গেল না।"
+        return "দুঃখিত, বুকিং করা গেল না। একটু পরে আবার চেষ্টা করুন, অথবা কাউন্টারে যোগাযোগ করুন।"
+    collector = result.get("collector_name")
+    assignment_line = (
+        f" {collector} আসবেন।" if collector else " কে আসবেন, সেটা আমাদের স্টাফ পরে কনফার্ম করে জানিয়ে দেবে।"
+    )
+    return (
+        f"আপনার বাড়িতে এসে স্যাম্পল নেওয়ার বুকিং কনফার্ম হয়েছে। "
+        f"{result.get('date')} তারিখে, সময় {result.get('start_time')} থেকে {result.get('end_time')}-এর মধ্যে, "
+        f"ঠিকানা {result.get('address_line')}-এ।{assignment_line} "
+        f"মোট {result.get('total_inr')} টাকা। কনফার্মেশন নম্বর {result.get('booking_reference')}।"
+    )
+
+
+def home_collection_cancelled_reply(lang: str = "bn") -> str:
+    if lang != "bn":
+        return _i18n.home_collection_cancelled_reply(lang)
+    return "ঠিক আছে, বুকিং করা হলো না। আর কিছু সাহায্য করতে পারি?"

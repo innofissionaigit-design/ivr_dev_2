@@ -87,6 +87,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import abuse, action_gate, anger, call_end, slot_grouping, topic_flow
+from agent import home_collection_flow as hcflow  # ADDED BY SOURAV: KCD-387 full flow
 from agent import entity_confirmation as entity_text
 from agent import history_templates as history_text
 from agent import messages as agent_messages
@@ -198,6 +199,16 @@ from agent.reply_templates import (
     conflict_reply,
     department_route_reply,
     doctor_availability_reply,
+    home_collection_address_confirm_reply,
+    home_collection_address_pincode_mismatch_reply,
+    home_collection_booking_result_reply,
+    home_collection_cancelled_reply,
+    home_collection_eligibility_reply,
+    home_collection_final_confirm_reply,
+    home_collection_hold_failed_reply,
+    home_collection_quote_reply,
+    home_collection_slots_reply,
+    home_collection_stored_address_offer,
     insufficient_information_reply,
     lookup_reply,
     merged_test_prep_reply,
@@ -1076,6 +1087,19 @@ class CallSession:
         # recency window agent/enquiry_followup.py already uses for a single test name (FOLLOWUP_MAX_GAP).
         self.last_resolved_prep_tests: tuple[str, ...] | None = None
         self.last_resolved_prep_turn = 0
+        # ADDED BY SOURAV: KCD-387 full flow -- the in-progress home-collection enquiry/booking for
+        # this call, if any. Mirrors self.booking's "one at a time, most recent words win"
+        # convention (see its own comment above), but is deliberately NOT integrated with KCD-104's
+        # suspend/resume machinery (self.suspended/self.awaiting_resume) -- this story does not
+        # change what happens when an appointment/test booking is interrupted, and does not need to
+        # participate in that system to satisfy its own requirements. See agent/home_collection_flow.py.
+        self.home_collection: hcflow.HomeCollectionState | None = None
+        # The same KCD-382b "are you already booked for this?" yes/no gate and digits-only phone
+        # follow-up as test_prep_registration_asked/awaiting_test_prep_* above, applied to the home-
+        # collection flow's own test-identification step -- never a second, competing implementation
+        # of the same idea.
+        self.awaiting_home_collection_registration_answer = False
+        self.awaiting_home_collection_booking_phone = False
         # KCD-499: stored preferences, offered after the answer and applied only if the caller says yes.
         self.pending_pref = None
         self.awaiting_pref_answer = False
@@ -1962,6 +1986,371 @@ async def _handle_booking_prep_lookup(session: CallSession, phone: str, lang: st
         await _speak_single_test_prep(session, test_names[0], lang, "", {})
 
 
+# ============================================================================= KCD-387 full flow
+# "Caller asks whether a test can be collected at home" -- see agent/home_collection_flow.py's own
+# module docstring for why this story keeps its own cross-turn state (HomeCollectionState) rather
+# than reusing BookingState, and clinic-api/home_collection_service.py's docstring for where every
+# fact spoken below actually comes from (never this file, never the model). Deliberately NOT
+# integrated with KCD-104's suspend/resume machinery (self.booking/self.suspended) -- this flow runs
+# independently of an appointment/test booking in progress, the same way the KCD-382b test-prep
+# flow a few functions above does not touch that machinery either.
+
+
+def _enter_home_collection(session: CallSession) -> hcflow.HomeCollectionState:
+    # ADDED BY SOURAV: same "one at a time, a stale one is simply replaced" rule as _enter_task
+    # above, applied to this independent flow.
+    st = session.home_collection
+    if st is None or st.is_stale():
+        st = hcflow.new_state()
+        session.home_collection = st
+    return st
+
+
+async def _home_collection_lookup_by_phone(session: CallSession, phone: str, lang: str) -> bool:
+    # ADDED BY SOURAV: CASE 2 of the story ("I already have a booking") -- the exact same
+    # search_bookings/booking_test_names infrastructure _handle_booking_prep_lookup above already
+    # uses for KCD-382b, including its own several-bookings-never-bookings[0] rule (KCD-497), never
+    # a second lookup implementation. Returns True when it spoke a reply and the turn is finished
+    # (nothing found, or several bookings needing disambiguation); False when it resolved the
+    # test name(s) onto `st` and the caller-facing flow should continue in THIS turn.
+    st = _enter_home_collection(session)
+    try:
+        found = await _tools.search_bookings(phone, phone=phone)
+    except ToolCallError as e:
+        logger.warning("[%s] home-collection booking search failed: %s", session.call_id, e)
+        await _speak(session, phrase("tool_failure", lang), lang)
+        return True
+    matches = [m for m in (found.get("matches") or []) if m.get("kind") == "test_booking"]
+    if not matches:
+        await _speak(session, phrase("test_prep_no_booking_found", lang), lang)
+        await _speak(session, missing_slot_prompt("home_collection", "test_name", lang), lang)
+        return True
+    if len(matches) > 1:
+        await _speak(session, multiple_test_bookings_reply(matches, lang), lang)
+        return True
+    confirmation_id = matches[0]["confirmation_id"]
+    try:
+        tests_result = await _tools.booking_test_names(confirmation_id)
+    except ToolCallError as e:
+        logger.warning("[%s] booking_test_names failed for %s: %s", session.call_id, confirmation_id, e)
+        await _speak(session, phrase("tool_failure", lang), lang)
+        return True
+    test_names = [n for n in (tests_result.get("test_names") or []) if n]
+    if not test_names:
+        await _speak(session, phrase("test_prep_no_booking_found", lang), lang)
+        await _speak(session, missing_slot_prompt("home_collection", "test_name", lang), lang)
+        return True
+    hcflow.merge_test_names(st, test_names)
+    st.from_booking, st.confirmation_id = True, confirmation_id
+    st.phone = st.phone or phone
+    return False
+
+
+async def _release_home_collection_hold_if_any(session: CallSession) -> None:
+    # ADDED BY SOURAV: section 14/30 -- a caller abandoning the flow, correcting the pincode after
+    # already holding a slot, or declining at either confirmation gate must not permanently consume
+    # real capacity. Freeing it immediately (rather than only relying on the hold's own TTL) is the
+    # same "release, don't just let it time out" discipline section 30 asks for.
+    st = session.home_collection
+    if st is None or not st.hold_token:
+        return
+    token, st.hold_token = st.hold_token, None
+    try:
+        await _tools.home_collection_release_hold(token)
+    except ToolCallError as e:
+        logger.warning("[%s] home-collection release-hold failed (token already expiring): %s", session.call_id, e)
+
+
+async def _advance_home_collection(session: CallSession, lang: str) -> None:
+    # ADDED BY SOURAV: the "do everything automatic this turn, then ask for exactly the one thing
+    # still needed" shape the book_appointment dispatch branch already uses -- driven by what is
+    # actually filled in on `st`, not a strict stage enum, so information given out of order or
+    # several turns apart is never rejected. Handles sections 6-19 (test ID through the "proceed?"
+    # gate); _continue_home_collection_after_proceed below picks up from an explicit yes.
+    st = session.home_collection
+    assert st is not None
+    parts: list[str] = []
+
+    # ---- sections 6/7: which test(s) ----
+    if not st.test_names:
+        if not st.registration_asked:
+            st.registration_asked = True
+            session.awaiting_home_collection_registration_answer = True
+            await _speak(session, phrase("test_prep_ask_registered", lang), lang)
+            return
+        await _speak(session, missing_slot_prompt("home_collection", "test_name", lang), lang)
+        return
+
+    # ---- section 9: the pincode, never inferred from phone/SIM/language/accent ----
+    if not st.postal_code:
+        await _speak(session, missing_slot_prompt("home_collection", "postal_code", lang), lang)
+        return
+
+    # ---- sections 8/9/10: eligibility AND serviceability together, from the one real DB-backed
+    # check (enquiry_service.home_collection_eligibility) -- never a separate coarse area guess, and
+    # section 10 is satisfied simply by there being no such guess anywhere in this flow.
+    if not st.eligibility:
+        try:
+            result = await _tools.home_collection_eligibility_multi(st.test_names, st.postal_code)
+        except ToolCallError:
+            await _speak(session, phrase("tool_failure", lang), lang)
+            return
+        st.eligibility = result.get("results") or []
+        st.not_found_tests = result.get("not_found") or []
+        st.eligible_tests = [r["test_name"] for r in st.eligibility if r.get("found") and r.get("eligible")]
+        parts.append(home_collection_eligibility_reply(result, lang))
+        if not st.eligible_tests:
+            session.home_collection = None  # nothing eligible/serviceable -- nothing left to continue
+            await _speak(session, " ".join(parts), lang)
+            return
+        st.touch()
+
+    # ---- section 11: the collection date ----
+    if not st.date:
+        parts.append(missing_slot_prompt("home_collection", "date", lang))
+        await _speak(session, " ".join(parts), lang)
+        return
+
+    # ---- sections 12/13: real, DB-backed slots for that date/pincode ----
+    if not st.chosen_slot:
+        if not st.slots_offered:
+            try:
+                slots_result = await _tools.home_collection_slots(st.postal_code, st.date)
+            except ToolCallError:
+                await _speak(session, phrase("tool_failure", lang), lang)
+                return
+            st.slots_offered = slots_result.get("slots") or []
+            if not st.slots_offered:
+                st.date = None  # asked again below, next turn, for a different day
+                parts.append(home_collection_slots_reply([], lang))
+                await _speak(session, " ".join(parts), lang)
+                return
+            if len(st.slots_offered) == 1:
+                st.chosen_slot = st.slots_offered[0]  # only one option: nothing to ask, section 14 still holds it below
+            else:
+                parts.append(home_collection_slots_reply(st.slots_offered, lang))
+                st.stage = hcflow.STAGE_CHOOSE_SLOT
+                await _speak(session, " ".join(parts), lang)
+                return
+        else:
+            # Offered earlier, still unresolved (the choose-slot interception fell through to a
+            # fresh turn that said something else) -- read the options out again rather than stall.
+            parts.append(home_collection_slots_reply(st.slots_offered, lang))
+            st.stage = hcflow.STAGE_CHOOSE_SLOT
+            await _speak(session, " ".join(parts), lang)
+            return
+
+    # ---- sections 12/14: claim real capacity before asking the caller anything further ----
+    if not st.hold_token:
+        try:
+            hold = await _tools.home_collection_hold(st.chosen_slot["slot_id"], _caller_phone(session), session.call_id)
+        except ToolCallError:
+            await _speak(session, phrase("tool_failure", lang), lang)
+            return
+        if not hold.get("success"):
+            parts.append(home_collection_hold_failed_reply(hold, lang))
+            st.chosen_slot, st.slots_offered, st.date = None, [], None
+            await _speak(session, " ".join(parts), lang)
+            return
+        st.hold_token = hold["hold_token"]
+
+    # ---- sections 15/16/17/18/19: the deterministic quote, the real payment policy, "proceed?" ----
+    if st.quote is None:
+        try:
+            quote = await _tools.home_collection_quote(st.eligible_tests, st.postal_code)
+        except ToolCallError:
+            await _speak(session, phrase("tool_failure", lang), lang)
+            return
+        st.quote = quote
+        try:
+            policy = await _tools.home_collection_payment_policy(lang)
+        except ToolCallError:
+            policy = {}
+        st.payment_policy_text = policy.get("description") if policy.get("found") else None
+        parts.append(home_collection_quote_reply(quote, st.payment_policy_text, lang))
+        st.stage = hcflow.STAGE_AWAITING_PROCEED
+        await _speak(session, " ".join(parts), lang)
+        return
+
+    # Everything through the quote is already known and "proceed?" is either still pending (the
+    # early interception in _dispatch_turn owns that yes/no) or was just answered -- continue.
+    await _continue_home_collection_after_proceed(session, lang)
+
+
+async def _continue_home_collection_after_proceed(session: CallSession, lang: str) -> None:
+    # ADDED BY SOURAV: sections 20-24 -- patient contact details, then the address (offered from
+    # storage, or captured fresh), then its readback/confirmation. Reached only after an explicit
+    # "yes" to the sections 15-19 quote/proceed question (never before -- section 19's own rule).
+    st = session.home_collection
+    assert st is not None
+
+    # ---- section 20: who the booking is for / where to reach them. This codebase has no PIN/OTP
+    # verification gate on a NEW appointment or test booking today (book_appointment/book_test only
+    # ever require patient_name+phone) -- home collection holds to that exact, already-shipped
+    # standard rather than inventing a stricter, inconsistent one for this story alone.
+    if not st.patient_name:
+        await _speak(session, missing_slot_prompt("home_collection", "patient_name", lang), lang)
+        return
+    if not st.phone:
+        await _speak(session, missing_slot_prompt("home_collection", "phone", lang), lang)
+        return
+
+    # ---- sections 21/24: a stored address is OFFERED, once, never silently applied (KCD-499's own
+    # confirm-before-use discipline, reused via the same get_preferences call _offer_preferences
+    # already makes, not a second implementation of it) ----
+    if not st.address_line and not st.stored_address_offered:
+        st.stored_address_offered = True
+        ident = session.identity
+        stored = None
+        if _tools is not None and ident.patient_ref is not None:
+            try:
+                prefs = await _tools.get_preferences(int(ident.patient_ref), _caller_phone(session))
+                stored = (prefs.get("preferences") or {}).get("collection_address")
+            except (ToolCallError, ValueError, TypeError):
+                stored = None
+        if stored:
+            st.stored_address_text = stored
+            st.stage = hcflow.STAGE_OFFER_STORED_ADDRESS
+            await _speak(session, home_collection_stored_address_offer(stored, lang), lang)
+            return
+        # No stored address on file: fall straight through to asking for one fresh, below.
+
+    # ---- sections 21/22: a fresh address, captured as one spoken field (never an invented
+    # house/road/locality NLP parser -- section 21's own "don't build one" rule) ----
+    missing = hcflow.missing_address_fields(st)
+    if missing:
+        st.stage = hcflow.STAGE_COLLECT_ADDRESS
+        await _speak(session, missing_slot_prompt("home_collection", "address_line", lang), lang)
+        return
+    conflict_pin = hcflow.address_postal_code_conflict(st)
+    if conflict_pin:
+        st.address_line = ""  # never guess which of the two pincodes is right
+        st.stage = hcflow.STAGE_COLLECT_ADDRESS
+        await _speak(session, home_collection_address_pincode_mismatch_reply(conflict_pin, st.postal_code, lang), lang)
+        return
+
+    # ---- section 23: read it back, ask for explicit confirmation before anything is written ----
+    st.stage = hcflow.STAGE_CONFIRM_ADDRESS
+    await _speak(session, home_collection_address_confirm_reply(hcflow.address_display(st), lang), lang)
+
+
+def _home_collection_final_summary(st: hcflow.HomeCollectionState) -> dict:
+    # ADDED BY SOURAV: one place building the dict both the final-confirm readback and (after a
+    # real booking write) the result reply format -- never two different summaries of the same facts.
+    return {
+        "eligible_tests": st.eligible_tests,
+        "date": st.chosen_slot.get("date") if st.chosen_slot else st.date,
+        "start_time": st.chosen_slot.get("start_time") if st.chosen_slot else None,
+        "end_time": st.chosen_slot.get("end_time") if st.chosen_slot else None,
+        "address": hcflow.address_display(st),
+        "total_inr": (st.quote or {}).get("total_inr"),
+    }
+
+
+async def _book_home_collection(session: CallSession, lang: str) -> None:
+    # ADDED BY SOURAV: section 25 -- the one place this whole flow actually writes a real,
+    # persistent booking. Reached only from the final-confirm "yes" (see
+    # _handle_home_collection_confirmation_turn), never earlier.
+    st = session.home_collection
+    assert st is not None
+    patient_id = None
+    ident = session.identity
+    if ident.patient_ref is not None:
+        try:
+            patient_id = int(ident.patient_ref)
+        except (TypeError, ValueError):
+            patient_id = None
+    try:
+        result = await _tools.home_collection_book(
+            hold_token=st.hold_token,
+            test_names=st.eligible_tests,
+            postal_code=st.postal_code,
+            patient_name=st.patient_name,
+            phone=st.phone,
+            caller_phone=st.caller_phone,
+            address_line=st.address_line,
+            locality=st.locality,
+            city=st.city,
+            state=st.state,
+            landmark=st.landmark,
+            patient_id=patient_id,
+        )
+    except ToolCallError as e:
+        logger.error("[%s] home-collection booking failed: %s", session.call_id, e)
+        await _speak(session, phrase("tool_failure", lang), lang, fallback_reason="tool_failure")
+        session.home_collection = None
+        return
+    st.hold_token = None  # consumed by the booking write either way -- never released again after this
+    st.booking_result = result
+    await _speak(session, home_collection_booking_result_reply(result, lang), lang)
+    session.home_collection = None
+
+
+async def _handle_home_collection_confirmation_turn(session: CallSession, text: str, lang: str) -> bool:
+    # ADDED BY SOURAV: the ONE place every yes/no (or slot-choice) gate in this flow is decided --
+    # deterministically, no LLM round trip, the exact same reasoning agent/booking_flow.classify_yes_no's
+    # own docstring gives for why a booking confirmation is never left to the model. Returns False
+    # when the turn did not answer the pending gate at all, so main.py's caller falls through and
+    # handles it as an ordinary fresh turn (the gate stays pending, same as _handle_booking_confirmation_turn).
+    st = session.home_collection
+    assert st is not None
+
+    if st.stage == hcflow.STAGE_CHOOSE_SLOT:
+        chosen = hcflow.resolve_slot_choice(st.slots_offered, text, None, lang)
+        if chosen is None:
+            return False
+        st.chosen_slot, st.slots_offered = chosen, []
+        st.touch()
+        await _advance_home_collection(session, lang)
+        return True
+
+    answer = classify_yes_no(text, lang)
+    if answer is None:
+        return False
+
+    if st.stage == hcflow.STAGE_AWAITING_PROCEED:
+        if answer == "no":
+            await _release_home_collection_hold_if_any(session)
+            session.home_collection = None
+            await _speak(session, home_collection_cancelled_reply(lang), lang)
+            return True
+        st.touch()
+        await _continue_home_collection_after_proceed(session, lang)
+        return True
+
+    if st.stage == hcflow.STAGE_OFFER_STORED_ADDRESS:
+        if answer == "yes":
+            st.address_line = st.stored_address_text or ""
+            st.using_stored_address = True
+        # "no": fall through to collecting a fresh address below, same turn.
+        st.touch()
+        await _continue_home_collection_after_proceed(session, lang)
+        return True
+
+    if st.stage == hcflow.STAGE_CONFIRM_ADDRESS:
+        if answer == "no":
+            st.address_line, st.using_stored_address, st.stored_address_offered = "", False, True
+            st.stage = hcflow.STAGE_COLLECT_ADDRESS
+            await _speak(session, missing_slot_prompt("home_collection", "address_line", lang), lang)
+            return True
+        st.stage = hcflow.STAGE_FINAL_CONFIRM
+        await _speak(
+            session, home_collection_final_confirm_reply(_home_collection_final_summary(st), lang), lang
+        )
+        return True
+
+    if st.stage == hcflow.STAGE_FINAL_CONFIRM:
+        if answer == "no":
+            await _release_home_collection_hold_if_any(session)
+            session.home_collection = None
+            await _speak(session, home_collection_cancelled_reply(lang), lang)
+            return True
+        await _book_home_collection(session, lang)
+        return True
+
+    return False
+
+
 def _mentions_abdomen(test_name: str) -> bool:
     return "abdomen" in test_name.lower()
 
@@ -2378,7 +2767,12 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
             or session.awaiting_resume
             or session.awaiting_close_answer
             or session.awaiting_test_prep_registration_answer  # KCD-382b: a bare yes/no
-            or session.awaiting_test_prep_booking_phone,  # KCD-382b: a dictated phone number
+            or session.awaiting_test_prep_booking_phone  # KCD-382b: a dictated phone number
+            or session.awaiting_home_collection_registration_answer  # ADDED BY SOURAV: KCD-387, same shape
+            or session.awaiting_home_collection_booking_phone  # ADDED BY SOURAV: KCD-387, same shape
+            # ADDED BY SOURAV: a bare "yes"/"no"/pincode/"the first one" while the home-collection
+            # flow is active is just as legitimately short as an in-progress appointment booking.
+            or (session.home_collection is not None and not session.home_collection.is_stale()),
         )  # KCD-104; "anything else?" -> a bare no: a bare yes or no to "shall I go back to it" is an answer
         if problem:
             logger.info("[%s] jumbled transcript (%s)", session.call_id, problem)
@@ -2775,6 +3169,44 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                 await _speak(session, missing_slot_prompt("test_prep", "test_name", lang), lang)
                 return
             # Neither yes nor no heard: the question lapses and this turn is handled normally.
+
+        # ADDED BY SOURAV: KCD-387 full flow -- the home-collection flow's own copy of the KCD-382b
+        # pattern just above (a bare yes/no, or a dictated phone number, answered deterministically,
+        # no LLM round trip), plus its OWN yes/no/slot-choice gates (proceed?, use the stored
+        # address?, is the address right?, final confirm?) -- see
+        # _handle_home_collection_confirmation_turn's own docstring for why these are decided here
+        # and not left to intent classification.
+        if session.awaiting_home_collection_booking_phone:
+            session.awaiting_home_collection_booking_phone = False
+            dictated = _parse_spoken_phone(text)
+            if dictated:
+                session.identity.phone = session.identity.phone or dictated
+                if not await _home_collection_lookup_by_phone(session, dictated, lang):
+                    await _advance_home_collection(session, lang)
+                return
+            # No number heard: never guess one -- the request lapses and this turn is handled normally.
+
+        if session.awaiting_home_collection_registration_answer:
+            session.awaiting_home_collection_registration_answer = False
+            reg_answer = classify_yes_no(text, lang)
+            if reg_answer == "yes":
+                session.awaiting_home_collection_booking_phone = True
+                await _speak(session, phrase("test_prep_ask_booking_phone", lang), lang)
+                return
+            if reg_answer == "no":
+                await _speak(session, missing_slot_prompt("home_collection", "test_name", lang), lang)
+                return
+            # Neither yes nor no heard: the question lapses and this turn is handled normally.
+
+        if session.home_collection is not None and session.home_collection.stage in (
+            hcflow.STAGE_AWAITING_PROCEED,
+            hcflow.STAGE_OFFER_STORED_ADDRESS,
+            hcflow.STAGE_CONFIRM_ADDRESS,
+            hcflow.STAGE_FINAL_CONFIRM,
+            hcflow.STAGE_CHOOSE_SLOT,
+        ):
+            if await _handle_home_collection_confirmation_turn(session, text, lang):
+                return
 
         confirmed_entity = False
         pending, session.pending_entity = session.pending_entity, None
@@ -3175,6 +3607,41 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                     await _speak(session, phrase("unclear", lang), lang)
                     return
                 await _finish_enquiry_turn(session, text, lang, intent, slots, reply, data)
+
+            elif intent == "home_collection":
+                # ADDED BY SOURAV: KCD-387 full flow. Every new fact this turn gave is folded into
+                # the running state first (a later value always overwrites an earlier one -- same
+                # rule BookingState.merge_slots uses, so a caller correcting themselves mid-flow just
+                # works); THEN the flow advances as far as that lets it. Reached only on a FRESH
+                # turn classified as this intent -- the yes/no/slot-choice gates (proceed?, use the
+                # stored address?, is the address right?, final confirm?) are decided earlier, before
+                # intent classification even runs (see the early interception above).
+                st = _enter_home_collection(session)
+                hcflow.merge_test_names(st, ([slots["test_name"]] if slots.get("test_name") else []) + list(slots.get("test_names") or []))
+                changed_pincode = hcflow.merge_postal_code(st, slots.get("postal_code"))
+                if slots.get("date") and not st.date:
+                    st.date = slots["date"]
+                if slots.get("patient_name") and not st.patient_name:
+                    st.patient_name = slots["patient_name"]
+                if (slots.get("phone") or slots.get("contact_phone")) and not st.phone:
+                    st.phone = slots.get("phone") or slots.get("contact_phone")
+                if slots.get("address_line"):
+                    st.address_line = slots["address_line"]
+                if slots.get("landmark"):
+                    st.landmark = slots["landmark"]
+                st.touch()
+                if changed_pincode:
+                    # Section 22's own "never guess, re-validate" spirit applied to a correction:
+                    # everything priced/held/offered against the OLD pincode is stale and must be
+                    # recomputed against the new one, and any real capacity already held is freed
+                    # immediately rather than left to its own TTL (section 14/30).
+                    st.eligibility, st.eligible_tests, st.not_found_tests = [], [], []
+                    st.slots_offered, st.chosen_slot, st.quote, st.payment_policy_text = [], None, None, None
+                    await _release_home_collection_hold_if_any(session)
+                if st.quote is not None:
+                    await _continue_home_collection_after_proceed(session, lang)
+                else:
+                    await _advance_home_collection(session, lang)
 
         except ToolCallError as e:
             logger.error("[%s] clinic API call failed: %s", session.call_id, e)

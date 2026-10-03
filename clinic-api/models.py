@@ -882,3 +882,154 @@ class ComplaintRecord(Base):
     phone = Column(String, nullable=True)
     status = Column(String, nullable=False, default="open")  # open | acknowledged | closed
     created_at = Column(DateTime, nullable=False)
+
+
+# =============================================================================
+# KCD-387 (full flow): Home collection -- real scheduling, booking and dispatch
+# =============================================================================
+# ADDED BY SOURAV: these tables give home collection a REAL, DB-backed slot/booking/
+# assignment system of its own, instead of overloading the doctor-appointment schema
+# (DoctorSchedule/SlotLock/Appointment are all keyed to doctor_id at the schema level --
+# see DoctorSchedule's own docstring -- and a home visit has no doctor at all, so reusing
+# them would mean inventing a fake doctor, which conflates two unrelated real-world
+# resources). Everything below is a brand-new table: per this file's own established
+# convention (see enquiry_migrate.py's module docstring), a new table needs no ALTER-TABLE
+# migration at all, only Base.metadata.create_all(), already called at startup.
+
+
+class HomeCollectionSlot(Base):
+    """A home-collection visit window for one postal code on one date, with a real
+    capacity -- how many separate home visits can be dispatched in that window, never
+    assumed infinite. One row per (postal_code, date, start_time, end_time)."""
+
+    __tablename__ = "home_collection_slots"
+    id = Column(Integer, primary_key=True)
+    postal_code = Column(String, nullable=False, index=True)
+    date = Column(String, nullable=False)  # ISO yyyy-mm-dd
+    start_time = Column(String, nullable=False)  # "08:00"
+    end_time = Column(String, nullable=False)  # "10:00"
+    capacity = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("postal_code", "date", "start_time", "end_time", name="uq_home_collection_slot"),
+    )
+
+
+class HomeCollectionSlotHold(Base):
+    """ADDED BY SOURAV: the real concurrency guard for a CAPACITY (not binary) resource,
+    deliberately modelled on SlotLock's own proven design (KCD-376) rather than inventing a
+    new locking scheme: one row per UNIT of a slot's capacity, primary-keyed on
+    (slot_id, unit_index). SQLite (and any ACID engine) serializes writers and enforces that
+    key, so of any number of simultaneous callers trying the SAME unit, exactly one INSERT
+    can ever succeed -- see booking_service.hold_slot()'s identical reasoning for doctors.
+    hold_home_collection_slot() tries unit_index 0..capacity-1 in order, so "every unit taken"
+    (slot_full) is reported only once genuinely every row exists and is live."""
+
+    __tablename__ = "home_collection_slot_holds"
+    slot_id = Column(Integer, ForeignKey("home_collection_slots.id"), primary_key=True)
+    unit_index = Column(Integer, primary_key=True)
+    status = Column(String, nullable=False)  # held | confirmed
+    hold_token = Column(String, nullable=False, unique=True)
+    caller_phone = Column(String, nullable=True)
+    call_id = Column(String, nullable=True)
+    hold_expires_at = Column(DateTime, nullable=True)  # null once confirmed
+    booking_id = Column(Integer, ForeignKey("home_collection_bookings.id"), nullable=True)
+    created_at = Column(DateTime, nullable=False)
+
+
+class HomeCollectionCollector(Base):
+    """ADDED BY SOURAV: a real, persistent collector/staff record so an assignment can be a
+    genuine DB decision, never an invented name -- see home_collection_service.assign_collector().
+    `postal_codes` is "|"-joined, same convention as LabTest.aliases_bn, for the postal codes
+    this collector actually covers."""
+
+    __tablename__ = "home_collection_collectors"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    postal_codes = Column(String, nullable=False, default="")
+    active = Column(Boolean, nullable=False, default=True)
+
+
+class HomeCollectionPaymentPolicy(Base):
+    """ADDED BY SOURAV: the home-collection payment policy as VERSIONED, dated configuration --
+    never a string literal in main.py or a reply template -- mirroring CancellationPolicy's own
+    proven pattern (KCD-488) exactly, including "latest effective_from wins" semantics (see
+    booking_service.active_cancellation_policy's docstring). `policy` is one of
+    "pay_on_collection" | "pay_at_counter_later" | "prepaid_required"; this prototype's only
+    seeded row is "pay_on_collection", consistent with send_payment_link()'s own documented rule
+    that a lab test is never paid over the call."""
+
+    __tablename__ = "home_collection_payment_policies"
+    id = Column(Integer, primary_key=True)
+    version = Column(Integer, nullable=False, unique=True)
+    effective_from = Column(String, nullable=False)  # ISO yyyy-mm-dd
+    policy = Column(String, nullable=False)
+    description_bn = Column(String, nullable=False, default="")
+    description_hi = Column(String, nullable=False, default="")
+    description_en = Column(String, nullable=False, default="")
+
+
+class HomeCollectionBooking(Base):
+    """ADDED BY SOURAV: the real, persistent home-collection VISIT booking -- distinct from
+    TestBooking (which records that a lab test itself was booked/confirmed, with no concept of
+    where or how the sample is collected). Every money/date/slot/address field here is the value
+    actually used to create this booking, frozen at booking time (e.g. `home_collection_charge_inr`
+    is copied from HomeCollectionCoverage at booking time, never re-read live later, the same
+    "freeze what was actually charged" discipline as Appointment.cancellation_charge_inr)."""
+
+    __tablename__ = "home_collection_bookings"
+    id = Column(Integer, primary_key=True)
+    booking_reference = Column(String, nullable=False, unique=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=True)
+    patient_name = Column(String, nullable=False)
+    phone = Column(String, nullable=False)
+    caller_phone = Column(String, nullable=True)
+
+    date = Column(String, nullable=False)  # ISO yyyy-mm-dd
+    slot_id = Column(Integer, ForeignKey("home_collection_slots.id"), nullable=False)
+    start_time = Column(String, nullable=False)
+    end_time = Column(String, nullable=False)
+
+    address_line = Column(String, nullable=False)
+    locality = Column(String, nullable=False, default="")
+    city = Column(String, nullable=False, default="")
+    state = Column(String, nullable=False, default="")
+    pincode = Column(String, nullable=False)
+    landmark = Column(String, nullable=False, default="")
+
+    test_charges_inr = Column(Integer, nullable=False)
+    home_collection_charge_inr = Column(Integer, nullable=False)
+    total_inr = Column(Integer, nullable=False)
+
+    payment_policy = Column(String, nullable=False, default="")
+    payment_status = Column(String, nullable=False, default="pending")  # pending | paid | not_applicable
+
+    status = Column(String, nullable=False, default="confirmed")  # confirmed | cancelled
+    collector_id = Column(Integer, ForeignKey("home_collection_collectors.id"), nullable=True)
+    assignment_status = Column(String, nullable=False, default="unassigned")  # unassigned | assigned
+    # KCD-dispatch: UNASSIGNED | ASSIGNED | IN_PROGRESS | COLLECTED | CANCELLED | FAILED -- only ever
+    # set to a value a real backend event has actually produced (see home_collection_service.py).
+    dispatch_state = Column(String, nullable=False, default="UNASSIGNED")
+
+    created_at = Column(DateTime, nullable=False)
+    cancelled_at = Column(DateTime, nullable=True)
+
+    slot = relationship("HomeCollectionSlot")
+    collector = relationship("HomeCollectionCollector")
+
+
+class HomeCollectionBookingTest(Base):
+    """ADDED BY SOURAV: one row per lab test actually included in a home-collection booking,
+    mirroring TestBooking/PackageTest's own "a child row per test" convention rather than a JSON
+    blob, so the tests in a booking stay queryable. `rate_inr` is the price AT THE TIME OF BOOKING
+    (frozen, never recalculated from a later LabTest.rate_inr change) -- same reasoning as
+    Appointment.cancellation_charge_inr freezing what was actually charged."""
+
+    __tablename__ = "home_collection_booking_tests"
+    id = Column(Integer, primary_key=True)
+    booking_id = Column(Integer, ForeignKey("home_collection_bookings.id"), nullable=False, index=True)
+    lab_test_id = Column(Integer, ForeignKey("lab_tests.id"), nullable=False)
+    rate_inr = Column(Integer, nullable=False)
+
+    booking = relationship("HomeCollectionBooking", backref="tests")
+    lab_test = relationship("LabTest")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 
+from agent.home_collection_flow import MAX_SLOTS_READ_ALOUD
 from agent.sample_wording import sample_sentence
 
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
@@ -42,6 +43,13 @@ _HI_MISSING = {
     ("add_test_booking", "confirmation_id"): "आपका कन्फ़र्मेशन नंबर बताइए?",
     ("add_test_booking", "test_name"): "कौन सा टेस्ट जोड़ना चाहते हैं?",
     ("lookup_booking", "phone"): "जिस नंबर से बुक किया था वह बताइए?",
+    # ADDED BY SOURAV: KCD-387 full flow -- see reply_templates.py's own Bengali entries.
+    ("home_collection", "test_name"): "किस टेस्ट के लिए घर पर सैंपल देने की बात पूछ रहे हैं, ज़रा बताइए?",
+    ("home_collection", "postal_code"): "आपके इलाके का 6 अंकों का पिनकोड बताइए?",
+    ("home_collection", "date"): "किस दिन घर पर सैंपल लेने आना होगा?",
+    ("home_collection", "address_line"): "पूरा पता बताइए -- घर नंबर, सड़क, इलाका, शहर सहित?",
+    ("home_collection", "patient_name"): "मरीज़ का नाम बताइए?",
+    ("home_collection", "phone"): "एक फ़ोन नंबर दीजिए, ताकि बुकिंग की जानकारी भेज सकूँ?",
 }
 _HI_MISSING_DEFAULT = "माफ़ कीजिए, क्या आप थोड़ा साफ़ बोलेंगे?"
 
@@ -72,6 +80,13 @@ _EN_MISSING = {
     ("add_test_booking", "confirmation_id"): "Could you give me your confirmation number?",
     ("add_test_booking", "test_name"): "Which test would you like to add?",
     ("lookup_booking", "phone"): "Could you give me the number you booked from?",
+    # ADDED BY SOURAV: KCD-387 full flow -- see reply_templates.py's own Bengali entries.
+    ("home_collection", "test_name"): "Which test are you asking about for home collection?",
+    ("home_collection", "postal_code"): "Could you give me your area's 6-digit pincode?",
+    ("home_collection", "date"): "Which day would you like the home visit for?",
+    ("home_collection", "address_line"): "Could you give me the full address -- house number, street, area and city?",
+    ("home_collection", "patient_name"): "May I have the patient's name?",
+    ("home_collection", "phone"): "Could you give me a phone number so I can send the booking details?",
 }
 _EN_MISSING_DEFAULT = "Sorry, could you say that a little more clearly?"
 
@@ -866,3 +881,174 @@ def compare_options_reply(cmp: dict, name_a: str, name_b: str, lang: str) -> str
         more = name_a if cmp["more_tests_side"] == "a" else name_b
         line += f"{more} includes {cmp['test_count_delta']} more tests. "
     return line + "Which would you like?"
+
+
+# ============================================== KCD-387 full flow: "Caller asks whether a test can
+# be collected at home" -- Hindi/English counterparts of reply_templates.py's Bengali originals.
+# Same discipline: every number here is a straight substitution from a real clinic-api response.
+
+
+def home_collection_eligibility_reply(result: dict, lang: str) -> str:
+    hi = lang == "hi"
+    rows = result.get("results") or []
+    not_found = result.get("not_found") or []
+    eligible = [r for r in rows if r.get("found") and r.get("eligible")]
+    ineligible = [r for r in rows if r.get("found") and not r.get("eligible")]
+    parts = []
+    if eligible:
+        names = ", ".join(r.get("test_name") or "" for r in eligible)
+        parts.append(
+            f"{names} -- इन टेस्ट(ओं) के लिए घर पर सैंपल लिया जा सकता है।"
+            if hi
+            else f"{names} -- home collection is available for this/these test(s)."
+        )
+    for r in ineligible:
+        name = r.get("test_name") or ""
+        if r.get("reason") == "area_not_covered":
+            parts.append(
+                f"{name} के लिए आपके इलाके में अभी घर पर सैंपल लेने की सुविधा नहीं है।"
+                if hi
+                else f"Home collection is not yet available in your area for {name}."
+            )
+        else:
+            parts.append(
+                f"{name} टेस्ट घर पर नहीं किया जा सकता, लैब में ही आना होगा।"
+                if hi
+                else f"{name} cannot be collected at home -- it needs a lab visit."
+            )
+    for name in not_found:
+        parts.append(f"'{name}' नाम का कोई टेस्ट नहीं मिला।" if hi else f"I could not find a test called '{name}'.")
+    if not parts:
+        parts.append(
+            "माफ़ कीजिए, अभी इस टेस्ट की जानकारी नहीं दे पा रही।" if hi else "Sorry, I can't check that test right now."
+        )
+    return " ".join(parts)
+
+
+def home_collection_slots_reply(slots: list[dict], lang: str) -> str:
+    hi = lang == "hi"
+    if not slots:
+        return "माफ़ कीजिए, उस दिन कोई स्लॉट खाली नहीं है। कोई और दिन बताएँगे?" if hi else "Sorry, there's no slot free that day. Could you try another day?"
+    shown = slots[:MAX_SLOTS_READ_ALOUD]
+    if len(shown) == 1:
+        s = shown[0]
+        return (
+            f"{s['date']} को {s['start_time']} से {s['end_time']} के बीच स्लॉट खाली है। यही रखूँ?"
+            if hi
+            else f"There's a slot free on {s['date']} between {s['start_time']} and {s['end_time']}. Shall I hold that one?"
+        )
+    windows = ", ".join(f"{s['start_time']} से {s['end_time']}" if hi else f"{s['start_time']} to {s['end_time']}" for s in shown)
+    return (
+        f"{shown[0]['date']} को ये समय खाली हैं -- {windows}। कौन सा चाहिए?"
+        if hi
+        else f"These windows are free on {shown[0]['date']} -- {windows}. Which would you like?"
+    )
+
+
+def home_collection_hold_failed_reply(result: dict, lang: str) -> str:
+    hi = lang == "hi"
+    if result.get("reason") == "slot_full":
+        return "माफ़ कीजिए, वह समय अभी भर गया। कोई और समय बताएँगे?" if hi else "Sorry, that window just filled up. Could you pick another?"
+    return "माफ़ कीजिए, समय रोक नहीं पाई। फिर कोशिश करूँ?" if hi else "Sorry, I couldn't hold that slot. Shall I try again?"
+
+
+def home_collection_quote_reply(quote: dict, payment_policy_text: str | None, lang: str) -> str:
+    hi = lang == "hi"
+    if not quote.get("quote_available"):
+        return (
+            "माफ़ कीजिए, इस टेस्ट की कीमत अभी नहीं बता पा रही।" if hi else "Sorry, I can't work out the price for this right now."
+        )
+    lines = [f"{r.get('test_name')} {r.get('rate_inr')}" for r in (quote.get("per_test") or []) if r.get("eligible")]
+    breakdown = ", ".join(lines)
+    charge = quote.get("home_collection_charge_inr") or 0
+    total = quote.get("total_inr") or 0
+    if hi:
+        reply = f"{breakdown} रुपये, और घर पर सैंपल लेने के लिए {charge} रुपये -- कुल मिलाकर {total} रुपये।"
+    else:
+        reply = f"{breakdown} rupees, plus {charge} rupees for home collection -- {total} rupees in total."
+    if payment_policy_text:
+        reply += f" {payment_policy_text}"
+    return reply + (" आगे बढ़ूँ?" if hi else " Shall I go ahead?")
+
+
+def home_collection_stored_address_offer(address: str, lang: str) -> str:
+    hi = lang == "hi"
+    return (
+        f"पिछली बार दिया गया यही पता भेजूँ -- {address}? या नया पता देंगे?"
+        if hi
+        else f"Shall I use the address you gave last time -- {address}? Or would you like to give a new one?"
+    )
+
+
+def home_collection_address_pincode_mismatch_reply(address_pin: str, given_pin: str, lang: str) -> str:
+    hi = lang == "hi"
+    if hi:
+        return f"आपके पते में {address_pin} पिनकोड सुना, लेकिन पहले आपने {given_pin} बताया था -- दोनों अलग हैं। पता फिर से बताएँगे?"
+    return f"I heard pincode {address_pin} in your address, but you earlier gave {given_pin} -- those are different. Could you give me the address again?"
+
+
+def home_collection_address_confirm_reply(address: str, lang: str) -> str:
+    hi = lang == "hi"
+    return f"पता सुना -- {address}। यह सही है?" if hi else f"I heard the address as -- {address}. Is that correct?"
+
+
+def home_collection_final_confirm_reply(summary: dict, lang: str) -> str:
+    # ADDED BY SOURAV: the hi readback is split across 4 short sentences, not 1 long run-on --
+    # persona.violations()'s own per-language MAX_SENTENCE_WORDS cap (hi: 18) exists so a caller
+    # hears this read-back in digestible pieces, not a single breathless clause.
+    hi = lang == "hi"
+    tests = ", ".join(summary.get("eligible_tests") or [])
+    if hi:
+        return (
+            f"तो {tests} -- {summary.get('date')} को, समय {summary.get('start_time')} से "
+            f"{summary.get('end_time')} के बीच घर पर सैंपल लिया जाएगा। "
+            f"पता -- {summary.get('address')}। "
+            f"कुल {summary.get('total_inr')} रुपये। यह कन्फ़र्म कर दूँ?"
+        )
+    return (
+        f"So {tests} -- on {summary.get('date')}, between {summary.get('start_time')} and "
+        f"{summary.get('end_time')}, at {summary.get('address')} -- home collection, total "
+        f"{summary.get('total_inr')} rupees. Shall I confirm this?"
+    )
+
+
+def home_collection_booking_result_reply(result: dict, lang: str) -> str:
+    hi = lang == "hi"
+    if not result.get("success"):
+        reason = result.get("reason")
+        if reason == "hold_expired":
+            return (
+                "माफ़ कीजिए, समय रोक नहीं पाई, थोड़ी देर हो गई। फिर कोशिश करूँ?"
+                if hi
+                else "Sorry, the slot couldn't be held in time. Shall I try again?"
+            )
+        if reason in ("no_eligible_test", "test_not_found"):
+            return (
+                "माफ़ कीजिए, इस टेस्ट के लिए घर पर बुकिंग नहीं हो पाई।" if hi else "Sorry, I couldn't book home collection for this test."
+            )
+        return (
+            "माफ़ कीजिए, बुकिंग नहीं हो पाई। थोड़ी देर बाद फिर कोशिश करें, या काउंटर पर संपर्क करें।"
+            if hi
+            else "Sorry, the booking couldn't go through. Please try again shortly, or contact the counter."
+        )
+    collector = result.get("collector_name")
+    if hi:
+        assignment_line = f" {collector} आएँगी/आएँगे।" if collector else " कौन आएगा, यह हमारा स्टाफ़ बाद में कन्फ़र्म करेगा।"
+        return (
+            f"आपकी घर पर सैंपल लेने की बुकिंग कन्फ़र्म हो गई है। "
+            f"{result.get('date')} को, समय {result.get('start_time')} से {result.get('end_time')} के बीच, "
+            f"पता {result.get('address_line')} पर।{assignment_line} "
+            f"कुल {result.get('total_inr')} रुपये। कन्फ़र्मेशन नंबर {result.get('booking_reference')}।"
+        )
+    assignment_line = f" {collector} will come." if collector else " Our staff will confirm who will come."
+    return (
+        f"Your home collection booking is confirmed. On {result.get('date')}, between "
+        f"{result.get('start_time')} and {result.get('end_time')}, at {result.get('address_line')}."
+        f"{assignment_line} Total {result.get('total_inr')} rupees. Confirmation number "
+        f"{result.get('booking_reference')}."
+    )
+
+
+def home_collection_cancelled_reply(lang: str) -> str:
+    hi = lang == "hi"
+    return "ठीक है, बुकिंग नहीं की गई। कुछ और मदद चाहिए?" if hi else "Okay, no booking was made. Is there anything else I can help with?"
