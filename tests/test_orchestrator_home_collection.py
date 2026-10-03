@@ -160,7 +160,10 @@ def env(m, monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_resolve_intent", resolve)
     session = m.CallSession(FakeWS())
     session.release_gate()
-    session.disclosed_langs.add("en")
+    # ADDED BY SOURAV: KCD-387 bugfix regression needs a real Bengali turn through this same
+    # fixture (see test_a_bengali_booked_test_home_collection_question_reaches_home_collection
+    # below) -- pre-disclosing bn/hi here changes nothing for the existing English-only tests.
+    session.disclosed_langs.update({"en", "bn", "hi"})
     session.call_state = m.new_call_state()
     voice = utterance(FATHER, dur=3.0, seed=1, amp=0.3)
 
@@ -170,8 +173,10 @@ def env(m, monkeypatch, tmp_path):
     d = Driver()
     d.session, d.state, d.tools = session, state, tools
 
-    async def say(text, intent="unclear", slots=None, **extra):
+    async def say(text, intent="unclear", slots=None, lang=None, **extra):
         state["text"] = text
+        if lang is not None:  # ADDED BY SOURAV: KCD-387 bugfix -- optional, defaults to the
+            state["lang"] = lang  # fixture's existing "en", so every current call site is unchanged.
         state["data"] = {"intent": intent, "slots": dict(slots or {}), **extra}
         session.turn_epoch = session.speak_epoch
         path = _wav(tmp_path, voice, f"u{len(session.ws.texts)}.wav")
@@ -334,6 +339,44 @@ async def test_a_booked_patient_is_resolved_by_phone_without_naming_the_test_aga
     assert "pincode" in spoken.lower() or "পিনকোড" in spoken
     assert env.session.home_collection.test_names == ["Uric Acid"]
     assert env.session.home_collection.from_booking is True
+
+
+# ADDED BY SOURAV: KCD-387 bugfix regression -- a Bengali caller opening with "আমার বুকিং করা
+# টেস্টটা বাড়ি থেকে নেওয়া যাবে?" ("can my booked test be collected from home?") was being
+# misrouted into the unrelated patient-history/appointment flow, because main.py's
+# detect_history_question() (agent/history_intent.py) ran before the home-collection flow ever saw
+# the turn and its Bengali "appointments" regex matched the bare substring "আমার...বুকিং" with no
+# regard for what followed. Fixed with a narrow negative lookahead in history_intent.py. These pin
+# the fix down through the REAL orchestrator (_dispatch_turn), not just the regex in isolation.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "আমার বুকিং করা টেস্টটা বাড়ি থেকে নেওয়া যাবে?",
+        "আমার যে টেস্টটা বুক করা আছে সেটা কি বাড়ি থেকে কালেক্ট হবে?",
+    ],
+)
+async def test_a_bengali_booked_test_home_collection_question_reaches_home_collection(m, env, opening):
+    env.tools.booking_lookup_matches = [{"kind": "test_booking", "confirmation_id": "KCD-500"}]
+    env.tools.booking_test_names_by_id["KCD-500"] = ["Lipid Profile"]
+    env.tools.eligibility_by_test["Lipid Profile"] = {"eligible": True, "charge_inr": 100, "rate_inr": 650}
+    said = await env.say(opening, "home_collection", {}, lang="bn")
+    assert env.session.home_collection is not None
+    assert env.session.history_state is None  # never diverted into the history flow
+    said = await env.say("হ্যাঁ", "unclear", {}, lang="bn")
+    said = await env.say("9876500000", "unclear", {}, lang="bn")
+    assert env.session.home_collection.test_names == ["Lipid Profile"]
+    assert env.session.home_collection.from_booking is True
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_bengali_appointment_question_still_reaches_history_not_home_collection(m, env):
+    # ADDED BY SOURAV: KCD-387 bugfix regression -- the other side of the same fix: a real Bengali
+    # appointment/history question (no booked-test/home-collection context at all) must keep
+    # reaching the pre-existing history flow exactly as before.
+    said = await env.say("আমার পরের অ্যাপয়েন্টমেন্ট কবে", "appointments", {}, lang="bn")
+    assert env.session.home_collection is None
+    assert env.session.history_state == "need_phone"
 
 
 @pytest.mark.asyncio

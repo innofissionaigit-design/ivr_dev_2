@@ -1304,13 +1304,38 @@ def home_collection_endpoint(test_name: str = Query(...), postal_code: str = Que
 # =============================================================================
 
 
+def _resolve_test_for_home_collection(db: Session, name: str) -> LabTest | None:
+    # ADDED BY SOURAV: KCD-387 bugfix (TSH resolving to "Thyroid Profile (T3 T4 TSH)") -- an exact
+    # (case-insensitive, trimmed) name match always wins, even when the same query also
+    # substring-matches a different, longer test name ("tsh" is a substring of "thyroid profile
+    # (t3 t4 tsh)" too, which is exactly why _find_test's plain .contains().first() picked the
+    # wrong one). Short of an exact match, this falls back to the SAME ambiguity-aware candidate
+    # set /api/v1/tests/search already uses (_find_test_candidates, KCD-446) instead of _find_test
+    # directly: a single remaining candidate resolves exactly as before, more than one is reported
+    # as unresolved rather than silently guessed, and a name matching no candidate at all still
+    # falls through to _find_test's own looser alias/normalised-containment/phonetic tiers
+    # unchanged -- so an ordinary, unambiguous query (e.g. "CBC", "Lipid Profile") resolves exactly
+    # as it did before this fix.
+    stripped = name.strip().lower()
+    exact = next((t for t in db.query(LabTest).all() if t.name.strip().lower() == stripped), None)
+    if exact:
+        return exact
+    candidates = _find_test_candidates(db, name)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        return None  # genuinely ambiguous between real tests -- never guess which one was meant
+    return _find_test(db, name)
+
+
 def _resolve_test_ids(db: Session, test_names: list[str]) -> tuple[list[int], list[str]]:
-    """ADDED BY SOURAV: the same exact/near-exact test-name resolution every other endpoint in
-    this file already uses (_find_test) -- never a second, competing matcher for home collection.
+    """ADDED BY SOURAV: the same exact-first, ambiguity-aware test-name resolution
+    _resolve_test_for_home_collection implements (KCD-387 bugfix) -- never a second, competing
+    matcher for home collection beyond that one shared helper.
     Returns (resolved lab_test ids, names that did not resolve to any test)."""
     ids, not_found = [], []
     for name in test_names:
-        t = _find_test(db, name)
+        t = _resolve_test_for_home_collection(db, name)
         if t:
             ids.append(t.id)
         else:

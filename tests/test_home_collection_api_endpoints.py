@@ -273,3 +273,98 @@ def test_cancel_releases_the_confirmed_capacity_back_to_available(clinic_client)
         "/api/v1/home-collection/slots", params={"postal_code": pc, "date": date}
     ).json()["slots"]
     assert next(s for s in after_cancel if s["slot_id"] == slot_id)["remaining_capacity"] == before
+
+
+# ================================================================================================
+# ADDED BY SOURAV: KCD-387 bugfix regression -- a caller asking for the exact test "TSH" was being
+# silently resolved by _resolve_test_ids's old _find_test() call to "Thyroid Profile (T3 T4 TSH)"
+# instead, because "tsh" is a substring of that longer name too. These pin the fixed behavior down
+# permanently so a future change cannot quietly reintroduce the substring-wins-over-exact bug.
+# ================================================================================================
+
+
+def _test_row_by_exact_name(name: str):
+    import db as db_mod
+    import models as m
+
+    db = db_mod.SessionLocal()
+    try:
+        return db.query(m.LabTest).filter(m.LabTest.name == name).first()
+    finally:
+        db.close()
+
+
+def test_exact_tsh_resolves_to_the_tsh_test_not_the_thyroid_profile(clinic_client):
+    # ADDED BY SOURAV: KCD-387 bugfix regression -- the exact reproduction from the bug report.
+    tsh = _test_row_by_exact_name("TSH")
+    thyroid = _test_row_by_exact_name("Thyroid Profile (T3 T4 TSH)")
+    if tsh is None or thyroid is None:
+        pytest.skip("fixture assumption: seed.py no longer seeds both 'TSH' and 'Thyroid Profile (T3 T4 TSH)'")
+    pc = _serviceable_postal_code(clinic_client)
+    r = clinic_client.get(
+        "/api/v1/home-collection/eligibility-multi", params={"test_names": ["TSH"], "postal_code": pc}
+    ).json()
+    assert r["not_found"] == []
+    assert len(r["results"]) == 1
+    assert r["results"][0]["test_name"] == "TSH"
+    assert r["results"][0]["lab_test_id"] == tsh.id
+    assert r["results"][0]["lab_test_id"] != thyroid.id
+
+
+def test_exact_thyroid_profile_still_resolves_correctly(clinic_client):
+    # ADDED BY SOURAV: KCD-387 bugfix regression -- the fix must not break the longer test's own
+    # exact resolution.
+    thyroid = _test_row_by_exact_name("Thyroid Profile (T3 T4 TSH)")
+    if thyroid is None:
+        pytest.skip("fixture assumption: seed.py no longer seeds 'Thyroid Profile (T3 T4 TSH)'")
+    pc = _serviceable_postal_code(clinic_client)
+    r = clinic_client.get(
+        "/api/v1/home-collection/eligibility-multi",
+        params={"test_names": ["Thyroid Profile (T3 T4 TSH)"], "postal_code": pc},
+    ).json()
+    assert r["not_found"] == []
+    assert r["results"][0]["lab_test_id"] == thyroid.id
+
+
+def test_an_ordinary_unambiguous_substring_name_still_resolves_normally(clinic_client):
+    # ADDED BY SOURAV: KCD-387 bugfix regression -- the fix must not turn every substring match
+    # into "not found"; a name that unambiguously matches exactly one test (the ordinary case
+    # _resolve_test_ids has always handled) must still resolve exactly as before.
+    cbc = _test_row_by_exact_name("Complete Blood Count (CBC)")
+    if cbc is None:
+        pytest.skip("fixture assumption: seed.py no longer seeds 'Complete Blood Count (CBC)'")
+    pc = _serviceable_postal_code(clinic_client)
+    r = clinic_client.get(
+        "/api/v1/home-collection/eligibility-multi", params={"test_names": ["CBC"], "postal_code": pc}
+    ).json()
+    assert r["not_found"] == []
+    assert r["results"][0]["lab_test_id"] == cbc.id
+
+
+def test_an_unknown_test_name_still_resolves_to_not_found(clinic_client):
+    # ADDED BY SOURAV: KCD-387 bugfix regression -- an unresolvable name must still be reported as
+    # not_found, never fabricated, after the exact-match-first change.
+    pc = _serviceable_postal_code(clinic_client)
+    r = clinic_client.get(
+        "/api/v1/home-collection/eligibility-multi",
+        params={"test_names": ["Totally Fake Test Name"], "postal_code": pc},
+    ).json()
+    assert r["not_found"] == ["Totally Fake Test Name"]
+    assert r["results"] == []
+
+
+def test_tests_search_endpoint_behavior_is_unchanged_by_the_home_collection_fix(clinic_client):
+    # ADDED BY SOURAV: KCD-387 bugfix regression -- /api/v1/tests/search (and _find_test_candidates/
+    # _find_test themselves) are untouched by this fix; a bare "TSH" search still correctly reports
+    # the pre-existing ambiguity (KCD-446) rather than silently resolving either way, and a search
+    # for the longer name still finds it.
+    tsh = _test_row_by_exact_name("TSH")
+    thyroid = _test_row_by_exact_name("Thyroid Profile (T3 T4 TSH)")
+    if tsh is None or thyroid is None:
+        pytest.skip("fixture assumption: seed.py no longer seeds both 'TSH' and 'Thyroid Profile (T3 T4 TSH)'")
+    r = clinic_client.get("/api/v1/tests/search", params={"name": "TSH"}).json()
+    assert r.get("ambiguous") is True
+    assert set(r.get("did_you_mean") or []) == {"TSH", "Thyroid Profile (T3 T4 TSH)"}
+    r2 = clinic_client.get("/api/v1/tests/search", params={"name": "Thyroid Profile"}).json()
+    assert r2.get("found") is True
+    assert r2["test_name"] == "Thyroid Profile (T3 T4 TSH)"

@@ -58,7 +58,17 @@ _APPOINTMENTS = {
     ),
     "bn": re.compile(
         r"আমার.{0,15}(পরের |আগামী )?(অ্যাপয়েন্টমেন্ট|বুকিং|অ্যাপয়েন্টমেণ্ট).{0,20}(কবে|কখন|কি আছে|আছে কি)|"
-        r"আমার (পরের |আগামী )?(অ্যাপয়েন্টমেন্ট|বুকিং)"
+        # ADDED BY SOURAV: KCD-387 bugfix -- the bare "আমার ... বুকিং/অ্যাপয়েন্টমেন্ট" form still
+        # catches a caller directly asking about THEIR OWN appointment/booking ("আমার বুকিং",
+        # "আমার অ্যাপয়েন্টমেন্ট"), but must not swallow a sentence where "বুকিং"/"অ্যাপয়েন্টমেন্ট"
+        # is a past-participle modifier of a DIFFERENT noun that follows it -- "আমার বুকিং করা
+        # টেস্টটা বাড়ি থেকে নেওয়া যাবে?" ("can my BOOKED TEST be collected from home?") means "the
+        # test that was booked", a home-collection request, not a question about an appointment's
+        # own status. The negative lookahead excludes only that one grammatical shape (immediately
+        # followed by "করা"); a genuine "আমার বুকিং(টা) কবে"/"আমার অ্যাপয়েন্টমেন্ট আছে কি না"
+        # question (nothing following, or a question word) is unaffected -- see
+        # tests/test_bengali_history_routing.py for both sides of this line.
+        r"আমার (পরের |আগামী )?(অ্যাপয়েন্টমেন্ট|বুকিং)(?!\s*করা)"
     ),
     "hi": re.compile(
         r"(मेरा|मेरी).{0,15}(अगला |अगली |आने वाला )?(अपॉइंटमेंट|अपॉइंटमेन्ट|बुकिंग).{0,20}(कब|कब है|क्या है)|"

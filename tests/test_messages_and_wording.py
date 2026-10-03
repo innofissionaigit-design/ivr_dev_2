@@ -250,6 +250,40 @@ def test_a_test_history_question_is_still_a_test_history_question():
     assert detect_history_question("book an appointment with Dr Sen", "en") is None
 
 
+# ADDED BY SOURAV: KCD-387 bugfix regression -- a Bengali caller asking whether their BOOKED TEST
+# can be collected at home ("বুকিং করা" = "was booked", a past-participle modifier of the test that
+# follows) was being misrouted into this history/appointment flow, because the bare "আমার ...
+# বুকিং" cue had no requirement about what comes after. These pin the fix (a negative lookahead
+# excluding only "বুকিং"/"অ্যাপয়েন্টমেন্ট" immediately followed by "করা") down on both sides: the
+# home-collection sentence must now return None here, while every genuine Bengali
+# appointment/history phrasing -- including the one already in
+# test_appointment_and_medicine_questions_are_recognised above -- must keep working exactly as
+# before.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "আমার বুকিং করা টেস্টটা বাড়ি থেকে নেওয়া যাবে?",
+        "আমার যে টেস্টটা বুক করা আছে সেটা কি বাড়ি থেকে কালেক্ট হবে?",
+    ],
+)
+def test_a_booked_test_home_collection_question_is_never_misread_as_history(text):
+    assert detect_history_question(text, "bn") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "আমার পরের অ্যাপয়েন্টমেন্ট কবে",  # already covered above; repeated here as the fix's own pin
+        "আমার বুকিং",  # a bare, direct own-booking question -- nothing follows "বুকিং" at all
+        "আমার অ্যাপয়েন্টমেন্ট আছে কি না",
+        "আমার আগামী বুকিং কবে আছে",
+    ],
+)
+def test_genuine_bengali_appointment_questions_still_reach_history(text):
+    hq = detect_history_question(text, "bn")
+    assert hq is not None and hq.kind == "appointments"
+
+
 def med_event(i, name, days_ago, bn=None, hi=None):
     on = (NOW.date() - datetime.timedelta(days=days_ago)).isoformat()
     return {
