@@ -143,6 +143,27 @@ def test_classify_yes_no_across_languages():
     assert classify_yes_no("what did you say", "en") is None
 
 
+def test_classify_yes_no_recognises_the_romanised_affirmatives_kcd_382b_added():
+    # KCD-382b follow-up: a caller answering the registered/booking question in
+    # Romanised speech ("haan", "ha", "hae") must be read as "yes", using this
+    # codebase's OWN existing romanisation of हाँ/হ্যাঁ (see agent/clinical_safety.py's
+    # "sirf haan ya na bolo" / "shudhu hae ba na bolun") -- not a new transliteration
+    # scheme. Proven directly against classify_yes_no, not just through the
+    # registered/booking flow, so this stays a regression test of the word list
+    # itself.
+    assert classify_yes_no("haan", "hi") == "yes"
+    assert classify_yes_no("ha", "hi") == "yes"
+    assert classify_yes_no("hae", "bn") == "yes"
+    # Existing native-script and English affirmatives are unaffected (no regression):
+    assert classify_yes_no("हाँ", "hi") == "yes"
+    assert classify_yes_no("হ্যাঁ", "bn") == "yes"
+    assert classify_yes_no("yes", "en") == "yes"
+    # Existing negatives, native-script, are unaffected (no regression):
+    assert classify_yes_no("नहीं", "hi") == "no"
+    assert classify_yes_no("না", "bn") == "no"
+    assert classify_yes_no("no", "en") == "no"
+
+
 def test_classify_yes_no_checks_no_before_yes_for_negated_correct():
     # "that's not correct" contains "correct" (a yes-word) but must read as no.
     assert classify_yes_no("that's not correct", "en") == "no"

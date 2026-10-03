@@ -194,8 +194,15 @@ def reopen_for_correction(state: BookingState, field_name: str, value: str) -> N
 # --------------------------------------------------- deterministic yes/no
 
 _YES_WORDS = {
-    "bn": ("হ্যাঁ", "হ্যা", "ঠিক আছে", "ওকে", "কনফার্ম", "হবে", "বুক করুন"),
-    "hi": ("हाँ", "हां", "ठीक है", "ओके", "कन्फर्म", "बुक कर दीजिए"),
+    # KCD-382b follow-up fix: "haan"/"ha"/"hae" are this codebase's OWN existing
+    # romanised spellings for these words -- not invented here. See
+    # agent/clinical_safety.py's own phrase lists ("sirf haan ya na bolo", "shudhu
+    # hae ba na bolun"), which already romanise हाँ as "haan" and হ্যাঁ as "hae".
+    # Added only so a caller who answers the KCD-382b registered/booking question in
+    # Romanised speech is recognised, without a second transliteration scheme: a
+    # token-exact match through this SAME word list, same as every entry above it.
+    "bn": ("হ্যাঁ", "হ্যা", "ঠিক আছে", "ওকে", "কনফার্ম", "হবে", "বুক করুন", "hae"),
+    "hi": ("हाँ", "हां", "ठीक है", "ओके", "कन्फर्म", "बुक कर दीजिए", "haan", "ha"),
     "en": ("yes", "yeah", "yep", "confirm", "ok", "okay", "correct", "right", "sure"),
 }
 # "cancel"/"ক্যানসেল"/"বাতিল"/"कैंसल"/"रद्द" are deliberately NOT here.
